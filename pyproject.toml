@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inboxanchor"
+version = "0.1.0"
+description = "Safety-first inbox intelligence and workflow automation."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "fastapi>=0.111,<1.0",
+  "streamlit>=1.44,<2.0",
+  "sqlalchemy>=2.0,<3.0",
+  "pydantic>=2.7,<3.0",
+  "uvicorn>=0.30,<1.0",
+  "httpx>=0.27,<1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2,<9.0",
+  "ruff>=0.6,<1.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["inboxanchor*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
