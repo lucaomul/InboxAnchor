@@ -50,7 +50,7 @@ inboxanchor/
   models/         Pydantic models for email, providers, policy, auth, and run results
 tests/            Offline test suite for engine, auth, providers, API, dashboard helpers, and fallbacks
 docs/             Gmail setup and internal engineering prompts
-frontend/         Imported TanStack/React product UI, Lovable metadata, and modern component system
+frontend/         TanStack/React product UI, frontend routes, and modern component system
 ```
 
 ### Core Components
