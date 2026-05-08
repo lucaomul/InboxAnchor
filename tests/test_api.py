@@ -5,6 +5,7 @@ from typing import Optional
 from fastapi.testclient import TestClient
 
 import inboxanchor.api.main as api_main
+import inboxanchor.api.v1.routers.auth as auth_router
 import inboxanchor.api.v1.routers.oauth as oauth_router
 from inboxanchor.api.main import app
 
@@ -16,6 +17,19 @@ def test_api_health():
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+
+
+def test_cors_preflight_allows_local_frontend_origin():
+    response = client.options(
+        "/ops/overview",
+        headers={
+            "Origin": "http://127.0.0.1:4173",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:4173"
 
 
 def test_auth_signup_login_me_and_logout_flow():
@@ -397,3 +411,153 @@ def test_gmail_oauth_callback_updates_provider_state(monkeypatch, tmp_path):
     assert connection.status_code == 200
     assert connection.json()["status"] == "connected"
     assert connection.json()["sync_enabled"] is True
+
+
+def test_frontend_compat_endpoints_expose_react_contract():
+    emails_response = client.get("/emails")
+    classifications_response = client.get("/classifications")
+    recommendations_response = client.get("/recommendations")
+    digest_response = client.get("/digest")
+    webhook_health_response = client.get("/health/webhook")
+
+    assert emails_response.status_code == 200
+    emails_payload = emails_response.json()
+    assert emails_payload["total"] >= len(emails_payload["emails"]) > 0
+    first_email = emails_payload["emails"][0]
+    assert {"id", "threadId", "sender", "subject", "receivedAt", "hasAttachments"} <= set(
+        first_email.keys()
+    )
+
+    assert classifications_response.status_code == 200
+    classifications = classifications_response.json()
+    assert first_email["id"] in classifications
+    assert classifications[first_email["id"]]["priority"] in {"critical", "high", "medium", "low"}
+
+    assert recommendations_response.status_code == 200
+    recommendation = recommendations_response.json()[0]
+    assert {"emailId", "recommendedAction", "status", "requiresApproval", "proposedLabels"} <= set(
+        recommendation.keys()
+    )
+
+    actions_response = client.get(f"/emails/{first_email['id']}/actions")
+    assert actions_response.status_code == 200
+    assert isinstance(actions_response.json(), list)
+
+    assert digest_response.status_code == 200
+    assert digest_response.json()["totalUnread"] >= 1
+
+    assert webhook_health_response.status_code == 200
+    assert webhook_health_response.json()["status"] == "healthy"
+
+
+def test_frontend_apply_and_block_routes_update_recommendation_state():
+    recommendations = client.get("/recommendations").json()
+    safe = next(item for item in recommendations if item["status"] == "safe")
+    review = next(item for item in recommendations if item["status"] == "requires_approval")
+
+    apply_response = client.post(
+        f"/recommendations/{safe['emailId']}/apply",
+        json={"action": safe["recommendedAction"]},
+    )
+    assert apply_response.status_code == 200
+    emails_after_apply = client.get("/emails").json()["emails"]
+    assert safe["emailId"] not in [item["id"] for item in emails_after_apply]
+
+    block_response = client.post(
+        f"/recommendations/{review['emailId']}/block",
+        json={"action": review["recommendedAction"]},
+    )
+    assert block_response.status_code == 200
+    recommendations_after_block = client.get("/recommendations").json()
+    blocked_item = next(
+        item
+        for item in recommendations_after_block
+        if item["emailId"] == review["emailId"]
+    )
+    assert blocked_item["status"] == "blocked"
+
+
+def test_frontend_ops_workflows_expose_mailbox_upgrade_features():
+    overview_response = client.get("/ops/overview")
+    assert overview_response.status_code == 200
+    overview = overview_response.json()
+    assert overview["workflows"]
+    assert overview["unreadCount"] >= 1
+
+    scan_response = client.post("/ops/scan", json={"force_refresh": True})
+    assert scan_response.status_code == 200
+    assert scan_response.json()["runId"]
+
+    auto_label_response = client.post("/ops/auto-label", json={"force_refresh": True})
+    assert auto_label_response.status_code == 200
+    assert auto_label_response.json()["count"] >= 1
+    assert auto_label_response.json()["overview"]["provider"] == overview["provider"]
+
+    safe_cleanup_response = client.post("/ops/safe-cleanup", json={"force_refresh": True})
+    assert safe_cleanup_response.status_code == 200
+    assert safe_cleanup_response.json()["overview"]["safeCleanupCount"] >= 0
+
+    full_anchor_response = client.post("/ops/full-anchor", json={"force_refresh": True})
+    assert full_anchor_response.status_code == 200
+    payload = full_anchor_response.json()
+    assert payload["labelsApplied"] >= 0
+    assert payload["cleanupApplied"] >= 0
+    assert payload["overview"]["provider"] == overview["provider"]
+
+
+def test_frontend_gmail_auth_routes_issue_local_session(monkeypatch, tmp_path):
+    credentials_path = tmp_path / "credentials.json"
+    token_path = tmp_path / "token.json"
+    credentials_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(auth_router.SETTINGS, "gmail_credentials_path", str(credentials_path))
+    monkeypatch.setattr(auth_router.SETTINGS, "gmail_token_path", str(token_path))
+    monkeypatch.setattr(
+        auth_router.SETTINGS,
+        "gmail_redirect_uri",
+        "http://localhost:3000/login",
+    )
+    monkeypatch.setattr(
+        auth_router,
+        "build_authorization_url",
+        lambda *args, **kwargs: ("https://accounts.google.com/o/oauth2/test", "state-123"),
+    )
+    monkeypatch.setattr(
+        auth_router,
+        "exchange_code_for_token",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        auth_router,
+        "_fetch_google_email",
+        lambda credentials: "gmail.user@example.com",
+    )
+
+    auth_url_response = client.get(
+        "/auth/gmail/url",
+        headers={"Referer": "http://localhost:3000/login"},
+    )
+    assert auth_url_response.status_code == 200
+    assert auth_url_response.json()["auth_url"].startswith("https://accounts.google.com/")
+
+    callback_response = client.post(
+        "/auth/gmail/callback",
+        json={"code": "demo-code"},
+        headers={"Referer": "http://localhost:3000/login?code=demo-code"},
+    )
+    assert callback_response.status_code == 200
+    payload = callback_response.json()
+    assert payload["email"] == "gmail.user@example.com"
+    assert payload["access_token"]
+
+    me_response = client.get(
+        "/auth/me",
+        headers={"Authorization": f"Bearer {payload['access_token']}"},
+    )
+    assert me_response.status_code == 200
+    assert me_response.json()["authenticated"] is True
+    assert me_response.json()["user"]["email"] == "gmail.user@example.com"
+
+    connection_response = client.get("/providers/gmail/connection")
+    assert connection_response.status_code == 200
+    assert connection_response.json()["status"] == "connected"

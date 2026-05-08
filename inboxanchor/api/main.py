@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from inboxanchor.api.v1.routers.auth import router as auth_router
+from inboxanchor.api.v1.routers.frontend import router as frontend_router
 from inboxanchor.api.v1.routers.oauth import router as oauth_router
 from inboxanchor.api.v1.routers.webhooks import router as webhook_router
 from inboxanchor.bootstrap import InboxAnchorService, list_provider_profiles
@@ -91,7 +94,29 @@ def get_service() -> InboxAnchorService:
     return InboxAnchorService()
 
 
+def _cors_origins() -> list[str]:
+    configured = os.getenv("INBOXANCHOR_CORS_ORIGINS", "").strip()
+    if configured:
+        return [origin.strip() for origin in configured.split(",") if origin.strip()]
+    return [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
+
+
 app = FastAPI(title="InboxAnchor", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.include_router(frontend_router)
 app.include_router(auth_router)
 app.include_router(oauth_router)
 app.include_router(webhook_router)

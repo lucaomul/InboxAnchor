@@ -123,6 +123,36 @@ class AuthService:
             raise AuthError("This account is disabled.", status_code=403)
         return self._issue_session(user)
 
+    def authenticate_or_register_oauth(
+        self,
+        *,
+        email: str,
+        full_name: Optional[str] = None,
+    ) -> AuthSession:
+        normalized_email = _normalize_email(email)
+        user = self.session.scalar(
+            select(AccountUserORM).where(AccountUserORM.email == normalized_email)
+        )
+        if user is None:
+            inferred_name = (
+                (full_name or normalized_email.split("@", 1)[0]).strip()
+                or "InboxAnchor User"
+            )
+            user = AccountUserORM(
+                email=normalized_email,
+                full_name=inferred_name,
+                password_hash=hash_password(secrets.token_urlsafe(24)),
+                plan="founder",
+            )
+            self.session.add(user)
+            self.session.flush()
+        elif full_name and full_name.strip() and user.full_name != full_name.strip():
+            user.full_name = full_name.strip()
+
+        if not user.is_active:
+            raise AuthError("This account is disabled.", status_code=403)
+        return self._issue_session(user)
+
     def get_session(self, token: str) -> Optional[AuthSession]:
         if not token:
             return None

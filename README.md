@@ -14,6 +14,7 @@ InboxAnchor is a safety-first inbox triage system for overloaded email accounts.
 - Persists triage runs, recommendations, audit history, provider state, and workspace settings
 - Supports bulk lane actions, operator playbooks, focus views, follow-up radar, and reminder center workflows in the dashboard
 - Exposes a FastAPI backend and a Streamlit workspace on top of the same core engine
+- Includes a full React frontend in `frontend/` with a premium command center, welcome/auth flow, inbox workspace, and settings surface wired to the FastAPI backend
 
 ## Architecture
 
@@ -49,6 +50,7 @@ inboxanchor/
   models/         Pydantic models for email, providers, policy, auth, and run results
 tests/            Offline test suite for engine, auth, providers, API, dashboard helpers, and fallbacks
 docs/             Gmail setup and internal engineering prompts
+frontend/         Imported TanStack/React product UI, Lovable metadata, and modern component system
 ```
 
 ### Core Components
@@ -65,6 +67,8 @@ docs/             Gmail setup and internal engineering prompts
   Account registration, password verification, session issuance, and logout.
 - `inboxanchor/app/dashboard.py`
   Account-aware operations workspace with playbooks, focus inbox, approval center, and run explorer.
+- `frontend/`
+  React product shell with a mailbox command center, welcome/login experience, inbox workspace, settings flow, and modern UI primitives wired to the current FastAPI backend.
 
 ## Safety Design
 
@@ -181,6 +185,24 @@ docker compose up --build
 
 - API: [http://localhost:8000](http://localhost:8000)
 - Dashboard: [http://localhost:8501](http://localhost:8501)
+
+### React Frontend
+
+The repository now also contains a product-style frontend import in `frontend/`.
+
+Typical local run:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Important:
+
+- this frontend started from the separate `lucaomul/inbox-assistant` codebase
+- the visual shell, routes, and components are now in-repo and adapted to the InboxAnchor FastAPI backend
+- the React app now serves as the premium product shell, while the Streamlit workspace remains available for Python-native operations and admin flows
 
 ## Authentication
 

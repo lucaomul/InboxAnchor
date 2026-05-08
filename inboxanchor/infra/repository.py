@@ -140,6 +140,13 @@ class InboxRepository:
         run = self.session.get(TriageRunORM, run_id)
         return run.raw_payload if run else None
 
+    def get_latest_run_id(self, provider: Optional[str] = None) -> Optional[str]:
+        query = self.session.query(TriageRunORM)
+        if provider:
+            query = query.filter(TriageRunORM.provider == provider)
+        row = query.order_by(TriageRunORM.started_at.desc()).first()
+        return row.run_id if row else None
+
     def list_runs(self, limit: int = 25) -> list[dict]:
         rows = (
             self.session.query(TriageRunORM)
@@ -417,6 +424,44 @@ class InboxRepository:
             for email, classification in rows
         ]
 
+    def get_run_email_detail(self, run_id: str, email_id: str) -> Optional[dict]:
+        row = (
+            self.session.query(EmailRecordORM, ClassificationORM)
+            .join(
+                ClassificationORM,
+                and_(
+                    ClassificationORM.run_id == EmailRecordORM.run_id,
+                    ClassificationORM.email_id == EmailRecordORM.email_id,
+                ),
+            )
+            .filter(
+                EmailRecordORM.run_id == run_id,
+                EmailRecordORM.email_id == email_id,
+            )
+            .first()
+        )
+        if row is None:
+            return None
+        email, classification = row
+        return {
+            "email_id": email.email_id,
+            "thread_id": email.thread_id,
+            "sender": email.sender,
+            "subject": email.subject,
+            "snippet": email.snippet,
+            "body_preview": email.body_preview,
+            "received_at": email.received_at.isoformat(),
+            "labels": email.labels,
+            "has_attachments": email.has_attachments,
+            "unread": email.unread,
+            "classification": {
+                "category": classification.category,
+                "priority": classification.priority,
+                "confidence": classification.confidence,
+                "reason": classification.reason,
+            },
+        }
+
     def count_run_email_details(
         self,
         run_id: str,
@@ -533,6 +578,79 @@ class InboxRepository:
                 },
             }
             for recommendation, email, classification in rows
+        ]
+
+    def get_run_recommendation_detail(self, run_id: str, email_id: str) -> Optional[dict]:
+        row = (
+            self.session.query(RecommendationORM, EmailRecordORM, ClassificationORM)
+            .join(
+                EmailRecordORM,
+                and_(
+                    EmailRecordORM.run_id == RecommendationORM.run_id,
+                    EmailRecordORM.email_id == RecommendationORM.email_id,
+                ),
+            )
+            .join(
+                ClassificationORM,
+                and_(
+                    ClassificationORM.run_id == RecommendationORM.run_id,
+                    ClassificationORM.email_id == RecommendationORM.email_id,
+                ),
+            )
+            .filter(
+                RecommendationORM.run_id == run_id,
+                RecommendationORM.email_id == email_id,
+            )
+            .order_by(RecommendationORM.confidence.desc())
+            .first()
+        )
+        if row is None:
+            return None
+        recommendation, email, classification = row
+        return {
+            "email_id": recommendation.email_id,
+            "recommended_action": recommendation.recommended_action,
+            "reason": recommendation.reason,
+            "confidence": recommendation.confidence,
+            "status": recommendation.status,
+            "requires_approval": recommendation.requires_approval,
+            "blocked_reason": recommendation.blocked_reason,
+            "proposed_labels": recommendation.proposed_labels,
+            "email": {
+                "sender": email.sender,
+                "subject": email.subject,
+                "received_at": email.received_at.isoformat(),
+                "has_attachments": email.has_attachments,
+                "snippet": email.snippet,
+                "body_preview": email.body_preview,
+                "labels": email.labels,
+                "thread_id": email.thread_id,
+                "unread": email.unread,
+            },
+            "classification": {
+                "category": classification.category,
+                "priority": classification.priority,
+                "confidence": classification.confidence,
+                "reason": classification.reason,
+            },
+        }
+
+    def list_action_items_for_email(self, run_id: str, email_id: str) -> list[dict]:
+        rows = (
+            self.session.query(ActionItemORM)
+            .filter(ActionItemORM.run_id == run_id, ActionItemORM.email_id == email_id)
+            .order_by(ActionItemORM.id.asc())
+            .all()
+        )
+        return [
+            {
+                "email_id": row.email_id,
+                "action_type": row.action_type,
+                "description": row.description,
+                "due_hint": row.due_hint,
+                "requires_reply": row.requires_reply,
+            }
+            for row in rows
         ]
 
     def build_execution_result(self, run_id: str, email_ids: list[str]) -> TriageRunResult:
