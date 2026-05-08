@@ -8,6 +8,7 @@ from fastapi import APIRouter, Header, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from inboxanchor.api.v1.routers.frontend import mark_frontend_provider_dirty
 from inboxanchor.config.settings import SETTINGS
 from inboxanchor.connectors.gmail_transport import GMAIL_MODIFY_SCOPE
 from inboxanchor.connectors.oauth_flow import build_authorization_url, exchange_code_for_token
@@ -16,6 +17,7 @@ from inboxanchor.infra.database import session_scope
 from inboxanchor.infra.repository import InboxRepository
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+GMAIL_PKCE_REGISTRY: dict[str, dict[str, str]] = {}
 
 
 class SignupRequest(BaseModel):
@@ -69,9 +71,9 @@ def _resolve_frontend_redirect_uri(request: Request) -> str:
         parsed = urlparse(candidate)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             continue
-        path = parsed.path or "/login"
-        if header_name == "origin":
-            path = "/login"
+        # Keep the OAuth callback path stable across every frontend surface so
+        # Google Cloud only needs one local redirect URI per origin.
+        path = "/login"
         cleaned = parsed._replace(path=path, query="", fragment="")
         resolved = urlunparse(cleaned)
         sanitized = _sanitize_redirect_uri(resolved)
@@ -92,6 +94,15 @@ def _fetch_google_email(credentials) -> str:
     service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
     profile = service.users().getProfile(userId="me").execute()
     return str(profile.get("emailAddress", "")).strip().lower()
+
+
+def _normalize_auth_url_result(result) -> tuple[str, str, Optional[str]]:
+    if isinstance(result, tuple):
+        if len(result) == 3:
+            return result[0], result[1], result[2]
+        if len(result) == 2:
+            return result[0], result[1], None
+    raise ValueError("Unexpected authorization URL result payload.")
 
 
 @router.post("/signup")
@@ -182,11 +193,18 @@ def gmail_auth_url(request: Request):
         )
 
     try:
-        auth_url, state = build_authorization_url(
+        auth_url, state, code_verifier = _normalize_auth_url_result(
+            build_authorization_url(
             str(credentials_path),
             [GMAIL_MODIFY_SCOPE],
             redirect_uri=_resolve_frontend_redirect_uri(request),
         )
+        )
+        if code_verifier:
+            GMAIL_PKCE_REGISTRY[state] = {
+                "redirect_uri": _resolve_frontend_redirect_uri(request),
+                "code_verifier": code_verifier,
+            }
     except Exception as error:
         return JSONResponse(
             status_code=400,
@@ -214,6 +232,12 @@ def gmail_auth_callback(payload: GmailCodeExchangeRequest, request: Request):
         )
 
     redirect_uri = payload.redirect_uri or _resolve_frontend_redirect_uri(request)
+    code_verifier = None
+    if payload.state:
+        pending = GMAIL_PKCE_REGISTRY.pop(payload.state, None)
+        if pending:
+            redirect_uri = pending.get("redirect_uri", redirect_uri)
+            code_verifier = pending.get("code_verifier")
 
     try:
         credentials = exchange_code_for_token(
@@ -223,6 +247,7 @@ def gmail_auth_callback(payload: GmailCodeExchangeRequest, request: Request):
             code=payload.code,
             redirect_uri=redirect_uri,
             state=payload.state,
+            code_verifier=code_verifier,
         )
         email = _fetch_google_email(credentials)
         if not email:
@@ -250,6 +275,7 @@ def gmail_auth_callback(payload: GmailCodeExchangeRequest, request: Request):
             repository.save_workspace_settings(
                 settings.model_copy(update={"preferred_provider": "gmail"})
             )
+        mark_frontend_provider_dirty("gmail")
     except AuthError as error:
         return JSONResponse(
             status_code=error.status_code,

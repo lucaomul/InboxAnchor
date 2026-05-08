@@ -3,9 +3,11 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
+import { StickmanLoader } from "@/components/StickmenAnimations";
 import { useAuth } from "@/hooks/use-auth";
 import {
   useOpsOverview,
+  useOpsProgress,
   useRunAutoLabel,
   useRunFullAnchorWorkflow,
   useRunOpsScan,
@@ -15,6 +17,7 @@ import { useTheme } from "@/hooks/use-theme";
 import {
   Activity,
   Anchor,
+  AlertTriangle,
   ArrowRight,
   Inbox,
   Layers3,
@@ -59,17 +62,32 @@ const CATEGORY_LABELS: Record<string, string> = {
 function CommandCenter() {
   const { email: userEmail, logout } = useAuth();
   const { theme, setTheme, themes } = useTheme();
-  const { data: overview, isLoading } = useOpsOverview();
+  const { data: overview, isLoading, isError, error } = useOpsOverview();
   const scanMutation = useRunOpsScan();
   const autoLabelMutation = useRunAutoLabel();
   const cleanupMutation = useRunSafeCleanupWorkflow();
   const fullAnchorMutation = useRunFullAnchorWorkflow();
+  const overviewError = error instanceof Error ? error.message : "InboxAnchor could not load the live mailbox overview yet.";
 
   const busy =
     scanMutation.isPending ||
     autoLabelMutation.isPending ||
     cleanupMutation.isPending ||
     fullAnchorMutation.isPending;
+  const { data: progress } = useOpsProgress(isLoading || busy);
+  const showLoader =
+    isLoading ||
+    busy ||
+    progress?.status === "running" ||
+    overview?.providerStatus === "checking";
+  const progressStats = progress
+    ? [
+        { label: "Emails read", value: progress.read_count },
+        { label: "Processed", value: progress.processed_count },
+        { label: "Actions", value: progress.action_item_count },
+        { label: "Suggestions", value: progress.recommendation_count },
+      ]
+    : [];
 
   const metricCards = overview
     ? [
@@ -202,6 +220,22 @@ function CommandCenter() {
                     Refresh unread scan
                   </Button>
                 </div>
+                {showLoader && (
+                  <div className="rounded-2xl border border-border bg-background/70 p-4">
+                    <StickmanLoader
+                      playful
+                      stage={progress?.stage ? `Stage: ${progress.stage}` : undefined}
+                      stats={progressStats}
+                      message={
+                        progress?.target_count
+                          ? `Mapping the unread working set. ${progress.processed_count} of ${progress.target_count} emails have been processed so far.`
+                          : overview?.providerStatus === "checking"
+                            ? "Connecting the live mailbox and preparing the unread scan."
+                          : "Mapping your mailbox. Use W, S, the arrow keys, or space while the unread cache settles."
+                      }
+                    />
+                  </div>
+                )}
               </div>
             </div>
 
@@ -216,6 +250,28 @@ function CommandCenter() {
                     </div>
                   ))}
             </div>
+            {isError && (
+              <div className="mt-5 rounded-2xl border border-amber-500/30 bg-amber-500/5 p-4">
+                <div className="flex items-start gap-3">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 text-amber-500" />
+                  <div className="space-y-2">
+                    <p className="text-sm font-medium text-foreground">
+                      Gmail connected, but the live unread scan did not finish.
+                    </p>
+                    <p className="text-sm leading-6 text-muted-foreground">{overviewError}</p>
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      This usually means the backend could not reach the live provider yet. Keep
+                      the API URL pointed at the running backend, then retry a fresh unread scan.
+                    </p>
+                    <div className="pt-1">
+                      <Button onClick={() => scanMutation.mutate()} disabled={busy}>
+                        {scanMutation.isPending ? "Retrying..." : "Retry unread scan"}
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="rounded-2xl border border-border bg-card p-6">
@@ -324,7 +380,16 @@ function CommandCenter() {
             </p>
             <div className="mt-5 space-y-3">
               {isLoading
-                ? [1, 2, 3, 4, 5].map((i) => <Skeleton key={i} className="h-12 rounded-xl" />)
+                ? (
+                    <div className="rounded-2xl border border-dashed border-border bg-background/70 p-4">
+                      <StickmanLoader
+                        playful
+                        stage={progress?.stage ? `Stage: ${progress.stage}` : undefined}
+                        stats={progressStats}
+                        message="Jump over email piles while InboxAnchor prepares the mailbox map."
+                      />
+                    </div>
+                  )
                 : Object.entries(overview?.categoryCounts || {}).map(([key, value]) => (
                     <div
                       key={key}

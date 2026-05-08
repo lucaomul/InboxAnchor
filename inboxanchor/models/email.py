@@ -54,10 +54,17 @@ class EmailMessage(BaseModel):
     subject: str
     snippet: str
     body_preview: str
+    body_full: str = ""
     received_at: datetime
     labels: list[str] = Field(default_factory=list)
     has_attachments: bool = False
     unread: bool = True
+
+    def content_for_processing(self, *, max_chars: Optional[int] = None) -> str:
+        text = (self.body_full or self.body_preview or self.snippet).strip()
+        if max_chars is not None and len(text) > max_chars:
+            return text[:max_chars]
+        return text
 
 
 class EmailThread(BaseModel):

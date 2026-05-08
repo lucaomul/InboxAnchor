@@ -9,10 +9,13 @@ export interface EmailMessage {
   sender: string;
   subject: string;
   snippet: string;
+  bodyPreview?: string;
+  bodyFull?: string;
   receivedAt: string;
   labels: string[];
   hasAttachments: boolean;
   unread: boolean;
+  classification?: EmailClassification;
 }
 
 export interface EmailClassification {

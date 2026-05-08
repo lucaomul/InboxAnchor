@@ -10,6 +10,7 @@ from email.utils import parsedate_to_datetime
 from html import unescape
 from pathlib import Path
 from typing import Iterable, Optional
+from urllib.parse import quote
 
 from inboxanchor.connectors.gmail_client import GmailTransport
 from inboxanchor.connectors.oauth_flow import get_credentials
@@ -18,6 +19,7 @@ from inboxanchor.models import EmailMessage
 logger = logging.getLogger(__name__)
 
 GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
+GMAIL_API_BASE_URL = "https://gmail.googleapis.com/gmail/v1"
 
 
 class GoogleAPITransport(GmailTransport):
@@ -29,15 +31,34 @@ class GoogleAPITransport(GmailTransport):
         scopes: Optional[Iterable[str]] = None,
         user_id: str = "me",
         service=None,
+        session=None,
     ):
         self.credentials_path = str(Path(credentials_path).expanduser())
         self.token_path = str(Path(token_path).expanduser())
         self.scopes = list(scopes or [GMAIL_MODIFY_SCOPE])
         self.user_id = user_id
         self._service = service
+        self._session = session
         self._page_tokens: dict[int, Optional[str]] = {0: None}
         self._label_cache: dict[str, str] = {}
         self._last_history_id: Optional[str] = None
+
+    def _build_session(self):
+        if self._session is not None:
+            return self._session
+
+        try:
+            from google.auth.transport.requests import AuthorizedSession
+        except ImportError as error:  # pragma: no cover - optional dependency
+            raise ImportError(
+                "Google API client dependencies are missing. Install "
+                "'google-api-python-client', 'google-auth', and "
+                "'google-auth-oauthlib' to enable live Gmail transport."
+            ) from error
+
+        creds = get_credentials(self.credentials_path, self.token_path, self.scopes)
+        self._session = AuthorizedSession(creds)
+        return self._session
 
     def _build_service(self):
         if self._service is not None:
@@ -56,7 +77,7 @@ class GoogleAPITransport(GmailTransport):
         self._service = build("gmail", "v1", credentials=creds, cache_discovery=False)
         return self._service
 
-    def _execute(self, request):
+    def _execute_legacy(self, request):
         delay = 1.0
         for attempt in range(1, 6):
             try:
@@ -77,35 +98,125 @@ class GoogleAPITransport(GmailTransport):
                 time.sleep(delay)
                 delay = min(delay * 2, 16.0)
 
+    def _gmail_resource_url(self, resource: str) -> str:
+        user_id = quote(self.user_id, safe="")
+        return f"{GMAIL_API_BASE_URL}/users/{user_id}/{resource.lstrip('/')}"
+
+    def _request_json(
+        self,
+        method: str,
+        resource: str,
+        *,
+        params: Optional[dict] = None,
+        json_body: Optional[dict] = None,
+    ) -> dict:
+        session = self._build_session()
+        url = self._gmail_resource_url(resource)
+        delay = 1.0
+
+        for attempt in range(1, 6):
+            try:
+                response = session.request(
+                    method,
+                    url,
+                    params=params,
+                    json=json_body,
+                    timeout=30,
+                )
+            except Exception:
+                if attempt >= 5:
+                    raise
+                logger.warning(
+                    "Retrying Gmail API call after transport failure",
+                    extra={
+                        "attempt": attempt,
+                        "delay_seconds": delay,
+                        "resource": resource,
+                    },
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, 16.0)
+                continue
+
+            if response.status_code in {429, 500, 502, 503, 504} and attempt < 5:
+                logger.warning(
+                    "Retrying Gmail API call after transient HTTP failure",
+                    extra={
+                        "attempt": attempt,
+                        "status_code": response.status_code,
+                        "delay_seconds": delay,
+                        "resource": resource,
+                    },
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, 16.0)
+                continue
+
+            response.raise_for_status()
+            if not response.content:
+                return {}
+            return response.json()
+
+        return {}
+
     def _list_message_refs(self, *, limit: int, page_token: Optional[str] = None) -> dict:
-        service = self._build_service()
-        request = service.users().messages().list(
-            userId=self.user_id,
-            q="is:unread",
-            maxResults=min(limit, 500),
-            pageToken=page_token,
-            includeSpamTrash=False,
+        if self._service is not None:
+            service = self._build_service()
+            request = service.users().messages().list(
+                userId=self.user_id,
+                q="is:unread",
+                maxResults=min(limit, 500),
+                pageToken=page_token,
+                includeSpamTrash=False,
+            )
+            return self._execute_legacy(request)
+
+        return self._request_json(
+            "GET",
+            "messages",
+            params={
+                "q": "is:unread",
+                "maxResults": min(limit, 500),
+                "pageToken": page_token,
+                "includeSpamTrash": "false",
+            },
         )
-        return self._execute(request)
 
     def _fetch_message_resource(self, email_id: str) -> dict:
-        service = self._build_service()
-        request = service.users().messages().get(
-            userId=self.user_id,
-            id=email_id,
-            format="full",
+        if self._service is not None:
+            service = self._build_service()
+            request = service.users().messages().get(
+                userId=self.user_id,
+                id=email_id,
+                format="full",
+            )
+            return self._execute_legacy(request)
+
+        return self._request_json(
+            "GET",
+            f"messages/{quote(email_id, safe='')}",
+            params={"format": "full"},
         )
-        return self._execute(request)
 
     def _fetch_message_metadata_resource(self, email_id: str) -> dict:
-        service = self._build_service()
-        request = service.users().messages().get(
-            userId=self.user_id,
-            id=email_id,
-            format="metadata",
-            metadataHeaders=["From", "To", "Subject", "Date", "Message-ID"],
+        if self._service is not None:
+            service = self._build_service()
+            request = service.users().messages().get(
+                userId=self.user_id,
+                id=email_id,
+                format="metadata",
+                metadataHeaders=["From", "To", "Subject", "Date", "Message-ID"],
+            )
+            return self._execute_legacy(request)
+
+        return self._request_json(
+            "GET",
+            f"messages/{quote(email_id, safe='')}",
+            params={
+                "format": "metadata",
+                "metadataHeaders": ["From", "To", "Subject", "Date", "Message-ID"],
+            },
         )
-        return self._execute(request)
 
     def _decode_body_data(self, data: str) -> str:
         if not data:
@@ -177,6 +288,7 @@ class GoogleAPITransport(GmailTransport):
             subject=headers.get("subject", ""),
             snippet=message.get("snippet", ""),
             body_preview=(body or message.get("snippet", ""))[:500],
+            body_full=body or message.get("snippet", ""),
             received_at=self._parse_received_at(headers.get("date", "")),
             labels=labels,
             has_attachments=self._has_attachments(payload),
@@ -216,6 +328,8 @@ class GoogleAPITransport(GmailTransport):
         page_token = self._page_tokens.get(offset)
         if offset and offset not in self._page_tokens:
             page_token = self._prime_page_token(limit=limit, offset=offset)
+        elif offset and page_token is None:
+            return []
         response = self._list_message_refs(limit=limit, page_token=page_token)
         refs = response.get("messages", []) or []
         self._page_tokens[offset + len(refs)] = response.get("nextPageToken")
@@ -229,56 +343,91 @@ class GoogleAPITransport(GmailTransport):
         return self._extract_best_body(message.get("payload", {}))
 
     def mark_read(self, email_ids: list[str]) -> None:
-        service = self._build_service()
         for email_id in email_ids:
-            request = service.users().messages().modify(
-                userId=self.user_id,
-                id=email_id,
-                body={"removeLabelIds": ["UNREAD"]},
-            )
-            self._execute(request)
+            if self._service is not None:
+                service = self._build_service()
+                request = service.users().messages().modify(
+                    userId=self.user_id,
+                    id=email_id,
+                    body={"removeLabelIds": ["UNREAD"]},
+                )
+                self._execute_legacy(request)
+            else:
+                self._request_json(
+                    "POST",
+                    f"messages/{quote(email_id, safe='')}/modify",
+                    json_body={"removeLabelIds": ["UNREAD"]},
+                )
 
     def archive(self, email_ids: list[str]) -> None:
-        service = self._build_service()
         for email_id in email_ids:
-            request = service.users().messages().modify(
-                userId=self.user_id,
-                id=email_id,
-                body={"removeLabelIds": ["INBOX"]},
-            )
-            self._execute(request)
+            if self._service is not None:
+                service = self._build_service()
+                request = service.users().messages().modify(
+                    userId=self.user_id,
+                    id=email_id,
+                    body={"removeLabelIds": ["INBOX"]},
+                )
+                self._execute_legacy(request)
+            else:
+                self._request_json(
+                    "POST",
+                    f"messages/{quote(email_id, safe='')}/modify",
+                    json_body={"removeLabelIds": ["INBOX"]},
+                )
 
     def trash(self, email_ids: list[str]) -> None:
-        service = self._build_service()
         for email_id in email_ids:
-            request = service.users().messages().trash(userId=self.user_id, id=email_id)
-            self._execute(request)
+            if self._service is not None:
+                service = self._build_service()
+                request = service.users().messages().trash(userId=self.user_id, id=email_id)
+                self._execute_legacy(request)
+            else:
+                self._request_json(
+                    "POST",
+                    f"messages/{quote(email_id, safe='')}/trash",
+                )
 
     def _label_name_to_id(self, label_name: str) -> str:
         if label_name in self._label_cache:
             return self._label_cache[label_name]
 
-        service = self._build_service()
-        labels = self._execute(service.users().labels().list(userId=self.user_id)).get(
-            "labels",
-            [],
-        )
+        if self._service is not None:
+            service = self._build_service()
+            labels = self._execute_legacy(service.users().labels().list(userId=self.user_id)).get(
+                "labels",
+                [],
+            )
+        else:
+            labels = self._request_json("GET", "labels").get("labels", [])
         for item in labels:
             self._label_cache[item["name"]] = item["id"]
 
         if label_name in self._label_cache:
             return self._label_cache[label_name]
 
-        created = self._execute(
-            service.users().labels().create(
-                userId=self.user_id,
-                body={
+        if self._service is not None:
+            service = self._build_service()
+            created = self._execute_legacy(
+                service.users().labels().create(
+                    userId=self.user_id,
+                    body={
+                        "name": label_name,
+                        "messageListVisibility": "show",
+                        "labelListVisibility": "labelShow",
+                    },
+                )
+            )
+        else:
+            created = self._request_json(
+                "POST",
+                "labels",
+                json_body={
                     "name": label_name,
                     "messageListVisibility": "show",
                     "labelListVisibility": "labelShow",
                 },
             )
-        )
         self._label_cache[label_name] = created["id"]
         return created["id"]
 
@@ -286,14 +435,21 @@ class GoogleAPITransport(GmailTransport):
         if not labels:
             return
         label_ids = [self._label_name_to_id(label) for label in labels]
-        service = self._build_service()
         for email_id in email_ids:
-            request = service.users().messages().modify(
-                userId=self.user_id,
-                id=email_id,
-                body={"addLabelIds": label_ids},
-            )
-            self._execute(request)
+            if self._service is not None:
+                service = self._build_service()
+                request = service.users().messages().modify(
+                    userId=self.user_id,
+                    id=email_id,
+                    body={"addLabelIds": label_ids},
+                )
+                self._execute_legacy(request)
+            else:
+                self._request_json(
+                    "POST",
+                    f"messages/{quote(email_id, safe='')}/modify",
+                    json_body={"addLabelIds": label_ids},
+                )
 
     def list_changed_message_ids(
         self,
@@ -308,14 +464,31 @@ class GoogleAPITransport(GmailTransport):
         last_history_id = start_history_id
 
         while len(collected) < max_results:
-            request = service.users().history().list(
-                userId=self.user_id,
-                startHistoryId=start_history_id,
-                pageToken=page_token,
-                maxResults=min(max_results, 500),
-                historyTypes=["messageAdded", "labelAdded", "labelRemoved"],
-            )
-            response = self._execute(request)
+            if self._service is not None:
+                service = self._build_service()
+                request = service.users().history().list(
+                    userId=self.user_id,
+                    startHistoryId=start_history_id,
+                    pageToken=page_token,
+                    maxResults=min(max_results, 500),
+                    historyTypes=["messageAdded", "labelAdded", "labelRemoved"],
+                )
+                response = self._execute_legacy(request)
+            else:
+                response = self._request_json(
+                    "GET",
+                    "history",
+                    params={
+                        "startHistoryId": start_history_id,
+                        "pageToken": page_token,
+                        "maxResults": min(max_results, 500),
+                        "historyTypes": [
+                            "messageAdded",
+                            "labelAdded",
+                            "labelRemoved",
+                        ],
+                    },
+                )
             last_history_id = response.get("historyId", last_history_id)
             for record in response.get("history", []) or []:
                 for bucket in ("messagesAdded", "messages", "labelsAdded", "labelsRemoved"):
@@ -363,7 +536,10 @@ class GoogleAPITransport(GmailTransport):
     def get_incremental_checkpoint(self) -> Optional[str]:
         if self._last_history_id:
             return self._last_history_id
-        service = self._build_service()
-        profile = self._execute(service.users().getProfile(userId=self.user_id))
+        if self._service is not None:
+            service = self._build_service()
+            profile = self._execute_legacy(service.users().getProfile(userId=self.user_id))
+        else:
+            profile = self._request_json("GET", "profile")
         self._last_history_id = profile.get("historyId")
         return self._last_history_id

@@ -2,6 +2,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
   fetchOpsOverview,
+  fetchOpsProgress,
+  getApiUrl,
   runAutoLabel,
   runFullAnchorWorkflow,
   runOpsScan,
@@ -12,6 +14,7 @@ function useInvalidateWorkspace() {
   const qc = useQueryClient();
   return () => {
     qc.invalidateQueries({ queryKey: ["opsOverview"] });
+    qc.invalidateQueries({ queryKey: ["opsProgress"] });
     qc.invalidateQueries({ queryKey: ["emails"] });
     qc.invalidateQueries({ queryKey: ["classifications"] });
     qc.invalidateQueries({ queryKey: ["recommendations"] });
@@ -19,12 +22,38 @@ function useInvalidateWorkspace() {
   };
 }
 
+function isApiConfigured() {
+  return typeof window !== "undefined" && !!getApiUrl();
+}
+
 export function useOpsOverview() {
   return useQuery({
     queryKey: ["opsOverview"],
-    queryFn: fetchOpsOverview,
+    queryFn: async () => {
+      if (!isApiConfigured()) {
+        return null;
+      }
+      return fetchOpsOverview();
+    },
+    enabled: isApiConfigured(),
     staleTime: 15_000,
     refetchInterval: 30_000,
+  });
+}
+
+export function useOpsProgress(enabled: boolean = true) {
+  return useQuery({
+    queryKey: ["opsProgress"],
+    queryFn: async () => {
+      if (!isApiConfigured()) {
+        return null;
+      }
+      return fetchOpsProgress();
+    },
+    enabled: isApiConfigured() && enabled,
+    refetchInterval: (query) =>
+      query.state.data && query.state.data.status === "running" ? 1_000 : 3_000,
+    staleTime: 500,
   });
 }
 

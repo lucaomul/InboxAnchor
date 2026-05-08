@@ -69,3 +69,17 @@ def test_classifier_skips_llm_for_high_confidence_newsletter():
 
     assert result.category == "newsletter"
     assert llm.calls == 0
+
+
+def test_classifier_skips_llm_for_confident_urgent_case():
+    email = build_demo_emails()[2]
+    llm = StubLLMClient(
+        LLMResult(content="{}", provider="openai", model="gpt-4o-mini", latency_ms=10)
+    )
+    agent = ClassifierAgent(llm_client=llm)
+
+    result = agent.classify(email)
+
+    assert result.category == "urgent"
+    assert result.priority == "critical"
+    assert llm.calls == 0

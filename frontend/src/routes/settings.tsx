@@ -5,10 +5,13 @@ import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
 import {
+  activateGmailWorkspace,
   fetchProviderConnection,
+  fetchWorkspaceSettings,
   getApiUrl,
   getGmailAuthUrl,
   setApiUrl,
+  saveWorkspaceSettings,
   setAuthSession,
   saveProviderConnection,
   exchangeGmailCode,
@@ -37,6 +40,8 @@ function SettingsPage() {
   const [webhookStatus, setWebhookStatus] = useState<string | null>(null);
   const [webhookLoading, setWebhookLoading] = useState(false);
   const [webhookDetails, setWebhookDetails] = useState<{ uptime: number; clients: number; lastEvent: string | null } | null>(null);
+  const frontendLoginRedirect =
+    typeof window === "undefined" ? "http://127.0.0.1:4173/login" : `${window.location.origin}/login`;
 
   useEffect(() => {
     const currentApiUrl = getApiUrl();
@@ -51,11 +56,13 @@ function SettingsPage() {
     if (typeof window === "undefined") return;
     const params = new URLSearchParams(window.location.search);
     const code = params.get("code");
+    const state = params.get("state");
     if (code) {
       setGmailLoading(true);
-      exchangeGmailCode(code)
-        .then((res) => {
+      exchangeGmailCode(code, state, `${window.location.origin}/login`)
+        .then(async (res) => {
           setAuthSession(res.access_token, res.email);
+          await activateGmailWorkspace(res.email);
           setGmailConnected(true);
           setGmailAccountHint(res.email);
           // Clean up URL
@@ -135,6 +142,7 @@ function SettingsPage() {
     setGmailLoading(true);
     setGmailError("");
     try {
+      const workspace = await fetchWorkspaceSettings();
       await saveProviderConnection("gmail", {
         provider: "gmail",
         status: "configured",
@@ -144,6 +152,12 @@ function SettingsPage() {
         last_tested_at: null,
         notes: "Disconnected from the InboxAnchor frontend settings workspace.",
       });
+      if (workspace.preferred_provider === "gmail") {
+        await saveWorkspaceSettings({
+          ...workspace,
+          preferred_provider: "fake",
+        });
+      }
       setGmailConnected(false);
       setGmailAccountHint("");
       toast.success("Gmail provider disconnected");
@@ -180,7 +194,7 @@ function SettingsPage() {
               <Input
                 value={apiUrl}
                 onChange={(e) => setApiUrlState(e.target.value)}
-                placeholder="https://your-api.example.com"
+                placeholder="http://127.0.0.1:8000"
                 className="flex-1"
               />
               <Button onClick={handleSaveApi} size="sm">
@@ -193,6 +207,11 @@ function SettingsPage() {
                 )}
               </Button>
             </div>
+            <p className="text-[11px] leading-5 text-muted-foreground">
+              For local development, prefer <span className="font-medium text-foreground">http://127.0.0.1:8000</span>.
+              Some browsers resolve <span className="font-medium text-foreground">localhost</span> differently and can miss a
+              backend that is only bound to IPv4.
+            </p>
             {apiError && (
               <p className="text-xs text-destructive flex items-center gap-1">
                 <AlertCircle className="w-3 h-3 shrink-0" /> {apiError}
@@ -250,6 +269,17 @@ function SettingsPage() {
             <p className="text-xs text-muted-foreground">
               Connect your Gmail account to allow InboxAnchor to read, label, and triage the live inbox through Google OAuth.
             </p>
+            <div className="rounded-md border border-border bg-secondary/30 p-3">
+              <p className="text-xs leading-5 text-muted-foreground">
+                Before you connect Gmail:
+              </p>
+              <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                1. Set <span className="font-medium text-foreground">GMAIL_CREDENTIALS_PATH</span> on the backend.
+              </p>
+              <p className="text-xs leading-5 text-muted-foreground">
+                2. Add <span className="font-medium text-foreground">{frontendLoginRedirect}</span> as an authorized redirect URI in Google Cloud if you are using this React frontend.
+              </p>
+            </div>
 
             {gmailError && (
               <div className="rounded-md bg-destructive/10 border border-destructive/30 p-3">

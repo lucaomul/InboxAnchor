@@ -63,6 +63,8 @@ class SummarizerAgent:
             high_priority_count=high_priority_count,
             top_senders=top_senders,
         )
+        if total_unread <= 2 and high_priority_count == 0:
+            return fallback
         llm_result = self.llm_client.complete(
             self._build_prompt(
                 total_unread=total_unread,

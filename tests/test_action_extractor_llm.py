@@ -17,7 +17,16 @@ class StubLLMClient:
 
 
 def test_action_extractor_uses_llm_for_richer_emails():
-    email = build_demo_emails()[4]
+    email = build_demo_emails()[4].model_copy(
+        update={
+            "body_full": (
+                "We're interested in a partnership and would love to schedule a meeting next week. "
+                "Please review the draft agenda, confirm your availability, and let us know "
+                "if your legal "
+                "team wants to review the draft commercial terms before the call."
+            )
+        }
+    )
     llm = StubLLMClient(
         LLMResult(
             content=(
@@ -73,3 +82,16 @@ def test_action_extractor_skips_llm_for_short_preview():
 
     assert llm.calls == 0
     assert any(item.action_type == "reply_needed" for item in items)
+
+
+def test_action_extractor_skips_llm_for_automated_newsletter():
+    email = build_demo_emails()[1]
+    llm = StubLLMClient(
+        LLMResult(content="[]", provider="openai", model="gpt-4o-mini", latency_ms=10)
+    )
+    agent = ActionExtractorAgent(llm_client=llm)
+
+    items = agent.extract(email)
+
+    assert items == []
+    assert llm.calls == 0

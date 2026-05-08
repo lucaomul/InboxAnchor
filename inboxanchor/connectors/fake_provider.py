@@ -39,7 +39,7 @@ class FakeEmailProvider(EmailProvider):
         return deepcopy(self._emails[email_id])
 
     def fetch_email_body(self, email_id: str) -> str:
-        return self._emails[email_id].body_preview
+        return self._emails[email_id].body_full or self._emails[email_id].body_preview
 
     def batch_mark_as_read(
         self,

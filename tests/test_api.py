@@ -1,11 +1,16 @@
 import base64
 import json
+import threading
+import time
+from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Optional
 
 from fastapi.testclient import TestClient
 
 import inboxanchor.api.main as api_main
 import inboxanchor.api.v1.routers.auth as auth_router
+import inboxanchor.api.v1.routers.frontend as frontend_router
 import inboxanchor.api.v1.routers.oauth as oauth_router
 from inboxanchor.api.main import app
 
@@ -30,6 +35,19 @@ def test_cors_preflight_allows_local_frontend_origin():
 
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:4173"
+
+
+def test_cors_preflight_allows_react_frontend_dev_origin():
+    response = client.options(
+        "/ops/overview",
+        headers={
+            "Origin": "http://localhost:8080",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:8080"
 
 
 def test_auth_signup_login_me_and_logout_flow():
@@ -382,7 +400,11 @@ def test_gmail_oauth_start_returns_authorization_url(monkeypatch, tmp_path):
     monkeypatch.setattr(
         oauth_router,
         "build_authorization_url",
-        lambda *args, **kwargs: ("https://accounts.google.com/test-auth", "state-123"),
+        lambda *args, **kwargs: (
+            "https://accounts.google.com/test-auth",
+            "state-123",
+            "verifier-123",
+        ),
     )
 
     response = client.get("/oauth/gmail/start")
@@ -397,11 +419,16 @@ def test_gmail_oauth_callback_updates_provider_state(monkeypatch, tmp_path):
     credentials_path.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(oauth_router.SETTINGS, "gmail_credentials_path", str(credentials_path))
     monkeypatch.setattr(oauth_router.SETTINGS, "gmail_token_path", str(token_path))
+    oauth_payload: dict[str, str | None] = {}
     monkeypatch.setattr(
         oauth_router,
         "exchange_code_for_token",
-        lambda *args, **kwargs: object(),
+        lambda *args, **kwargs: oauth_payload.update(
+            {"state": kwargs.get("state"), "code_verifier": kwargs.get("code_verifier")}
+        )
+        or object(),
     )
+    oauth_router.GMAIL_PKCE_REGISTRY["demo"] = "oauth-verifier"
 
     response = client.get("/oauth/gmail/callback", params={"code": "demo-code", "state": "demo"})
     connection = client.get("/providers/gmail/connection")
@@ -410,10 +437,18 @@ def test_gmail_oauth_callback_updates_provider_state(monkeypatch, tmp_path):
     assert "Gmail connected successfully" in response.text
     assert connection.status_code == 200
     assert connection.json()["status"] == "connected"
+    assert oauth_payload["state"] == "demo"
+    assert oauth_payload["code_verifier"] == "oauth-verifier"
     assert connection.json()["sync_enabled"] is True
 
 
 def test_frontend_compat_endpoints_expose_react_contract():
+    frontend_router.FRONTEND_RUN_CACHE.clear()
+    frontend_router.FRONTEND_SERVICE_CACHE.clear()
+    frontend_router.FRONTEND_BLOCK_REGISTRY.clear()
+    frontend_router.FRONTEND_FORCE_REFRESH_PROVIDERS.clear()
+    frontend_router.FRONTEND_PROVIDER_ERRORS.clear()
+
     emails_response = client.get("/emails")
     classifications_response = client.get("/classifications")
     recommendations_response = client.get("/recommendations")
@@ -424,9 +459,17 @@ def test_frontend_compat_endpoints_expose_react_contract():
     emails_payload = emails_response.json()
     assert emails_payload["total"] >= len(emails_payload["emails"]) > 0
     first_email = emails_payload["emails"][0]
-    assert {"id", "threadId", "sender", "subject", "receivedAt", "hasAttachments"} <= set(
-        first_email.keys()
-    )
+    assert {
+        "id",
+        "threadId",
+        "sender",
+        "subject",
+        "bodyPreview",
+        "bodyFull",
+        "receivedAt",
+        "hasAttachments",
+    } <= set(first_email.keys())
+    assert first_email["bodyFull"]
 
     assert classifications_response.status_code == 200
     classifications = classifications_response.json()
@@ -477,6 +520,45 @@ def test_frontend_apply_and_block_routes_update_recommendation_state():
     assert blocked_item["status"] == "blocked"
 
 
+def test_frontend_emails_include_classification_and_apply_server_side_filters():
+    all_emails_response = client.get("/emails", params={"limit": 10})
+    assert all_emails_response.status_code == 200
+    all_payload = all_emails_response.json()
+    assert all_payload["emails"]
+    assert "classification" in all_payload["emails"][0]
+    subject_tokens = [
+        token.strip(".,:;!?()[]{}").lower()
+        for token in all_payload["emails"][0]["subject"].split()
+        if len(token.strip(".,:;!?()[]{}")) >= 4
+    ]
+    search_term = (
+        subject_tokens[0]
+        if subject_tokens
+        else all_payload["emails"][0]["sender"].split("@")[0]
+    )
+
+    filtered_response = client.get("/emails", params={"q": search_term, "limit": 10})
+    assert filtered_response.status_code == 200
+    filtered_payload = filtered_response.json()
+    assert filtered_payload["total"] >= 1
+    assert all(
+        search_term in f"{item['subject']} {item['snippet']} {item['sender']}".lower()
+        for item in filtered_payload["emails"]
+    )
+
+
+def test_frontend_recommendations_can_scope_to_one_email():
+    recommendations = client.get("/recommendations").json()
+    target_email_id = recommendations[0]["emailId"]
+
+    scoped_response = client.get("/recommendations", params={"email_id": target_email_id})
+
+    assert scoped_response.status_code == 200
+    scoped_payload = scoped_response.json()
+    assert len(scoped_payload) == 1
+    assert scoped_payload[0]["emailId"] == target_email_id
+
+
 def test_frontend_ops_workflows_expose_mailbox_upgrade_features():
     overview_response = client.get("/ops/overview")
     assert overview_response.status_code == 200
@@ -505,6 +587,240 @@ def test_frontend_ops_workflows_expose_mailbox_upgrade_features():
     assert payload["overview"]["provider"] == overview["provider"]
 
 
+def test_frontend_ops_overview_surfaces_live_provider_fetch_failure(monkeypatch):
+    frontend_router.FRONTEND_RUN_CACHE.clear()
+    frontend_router.FRONTEND_SERVICE_CACHE.clear()
+    frontend_router.FRONTEND_BLOCK_REGISTRY.clear()
+    frontend_router.FRONTEND_FORCE_REFRESH_PROVIDERS.clear()
+    frontend_router.FRONTEND_PROVIDER_ERRORS.clear()
+
+    class FailingEngine:
+        def run(self, **kwargs):
+            raise RuntimeError("Unable to find the server at gmail.googleapis.com")
+
+    class FailingService:
+        def __init__(self):
+            self.engine = FailingEngine()
+
+        def load_provider_connection(self, provider_name):
+            return SimpleNamespace(sync_enabled=True)
+
+    monkeypatch.setattr(
+        frontend_router,
+        "_service_for_provider",
+        lambda provider_name: FailingService(),
+    )
+
+    response = client.get("/ops/overview", params={"provider": "gmail"})
+
+    assert response.status_code == 502
+    assert "could not reach gmail.googleapis.com" in response.json()["detail"]
+
+
+def test_frontend_initial_live_run_bootstraps_with_smaller_limit(monkeypatch):
+    frontend_router.FRONTEND_RUN_CACHE.clear()
+    frontend_router.FRONTEND_SERVICE_CACHE.clear()
+    frontend_router.FRONTEND_BLOCK_REGISTRY.clear()
+    frontend_router.FRONTEND_FORCE_REFRESH_PROVIDERS.clear()
+    frontend_router.FRONTEND_PROVIDER_ERRORS.clear()
+
+    captured: dict[str, int] = {}
+
+    class BootEngine:
+        def run(self, **kwargs):
+            captured.update(
+                {
+                    "limit": kwargs["limit"],
+                    "batch_size": kwargs["batch_size"],
+                    "email_preview_limit": kwargs["email_preview_limit"],
+                    "recommendation_preview_limit": kwargs["recommendation_preview_limit"],
+                }
+            )
+            return SimpleNamespace(run_id="boot-gmail-run")
+
+    class BootService:
+        def __init__(self):
+            self.engine = BootEngine()
+
+    monkeypatch.setattr(
+        frontend_router,
+        "_service_for_provider",
+        lambda provider_name: BootService(),
+    )
+
+    run_id, provider_name = frontend_router._ensure_frontend_run(provider="gmail")
+
+    assert run_id == "boot-gmail-run"
+    assert provider_name == "gmail"
+    assert captured["limit"] == 50
+    assert captured["batch_size"] == 50
+    assert captured["email_preview_limit"] <= 80
+    assert captured["recommendation_preview_limit"] <= 120
+
+
+def test_frontend_ops_progress_reflects_registry_state():
+    frontend_router.FRONTEND_PROGRESS["gmail"] = {
+        "provider": "gmail",
+        "status": "running",
+        "stage": "triaging",
+        "target_count": 50,
+        "processed_count": 12,
+        "read_count": 16,
+        "action_item_count": 4,
+        "recommendation_count": 7,
+        "batch_count": 1,
+        "latest_subject": "Quarterly budget review",
+        "run_id": None,
+        "error": None,
+        "updated_at": "2026-05-08T19:30:00Z",
+    }
+
+    response = client.get("/ops/progress", params={"provider": "gmail"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "running"
+    assert payload["processed_count"] == 12
+    assert payload["read_count"] == 16
+    assert payload["latest_subject"] == "Quarterly budget review"
+
+
+def test_frontend_ensure_run_reuses_inflight_provider_job(monkeypatch):
+    frontend_router.FRONTEND_RUN_CACHE.clear()
+    frontend_router.FRONTEND_SERVICE_CACHE.clear()
+    frontend_router.FRONTEND_BLOCK_REGISTRY.clear()
+    frontend_router.FRONTEND_FORCE_REFRESH_PROVIDERS.clear()
+    frontend_router.FRONTEND_PROVIDER_ERRORS.clear()
+    frontend_router.FRONTEND_PROGRESS.clear()
+    frontend_router.FRONTEND_ACTIVE_RUNS.clear()
+
+    counts = {"runs": 0}
+
+    class SharedEngine:
+        def run(self, **kwargs):
+            counts["runs"] += 1
+            callback = kwargs.get("progress_callback")
+            if callback:
+                callback(
+                    {
+                        "stage": "triaging",
+                        "limit": kwargs["limit"],
+                        "processed_emails": 5,
+                        "read_count": 5,
+                        "action_item_count": 2,
+                        "recommendation_count": 5,
+                        "batch_count": 1,
+                    }
+                )
+            time.sleep(0.15)
+            return SimpleNamespace(
+                run_id="shared-gmail-run",
+                scanned_emails=5,
+                total_emails=5,
+                action_items={"email-1": []},
+                recommendations=[1, 2, 3, 4, 5],
+                batch_count=1,
+            )
+
+    class SharedService:
+        def __init__(self):
+            self.engine = SharedEngine()
+
+    monkeypatch.setattr(
+        frontend_router,
+        "_service_for_provider",
+        lambda provider_name: SharedService(),
+    )
+
+    results: list[tuple[str, str]] = []
+
+    def worker():
+        results.append(frontend_router._ensure_frontend_run(provider="gmail"))
+
+    thread_one = threading.Thread(target=worker)
+    thread_two = threading.Thread(target=worker)
+    thread_one.start()
+    thread_two.start()
+    thread_one.join(timeout=2)
+    thread_two.join(timeout=2)
+
+    assert counts["runs"] == 1
+    assert results == [("shared-gmail-run", "gmail"), ("shared-gmail-run", "gmail")]
+
+
+def test_frontend_zero_live_run_triggers_fresh_refresh(monkeypatch):
+    frontend_router.FRONTEND_RUN_CACHE.clear()
+    frontend_router.FRONTEND_SERVICE_CACHE.clear()
+    frontend_router.FRONTEND_BLOCK_REGISTRY.clear()
+    frontend_router.FRONTEND_FORCE_REFRESH_PROVIDERS.clear()
+    frontend_router.FRONTEND_PROVIDER_ERRORS.clear()
+    frontend_router.FRONTEND_PROGRESS.clear()
+    frontend_router.FRONTEND_ACTIVE_RUNS.clear()
+
+    class ZeroRunRepository:
+        def __init__(self, session):
+            self.session = session
+
+        def get_run(self, run_id):
+            return {"run_id": run_id}
+
+        def get_latest_run_id(self, provider_name):
+            assert provider_name == "gmail"
+            return "zero-run"
+
+        def count_run_email_details(self, run_id, **kwargs):
+            del kwargs
+            assert run_id == "zero-run"
+            return 0
+
+    class ProbeProvider:
+        provider_name = "gmail"
+
+        def list_unread(self, limit=50, include_body=True):
+            del limit, include_body
+            return [SimpleNamespace(id="msg-live")]
+
+    class RefreshEngine:
+        def run(self, **kwargs):
+            return SimpleNamespace(
+                run_id="fresh-live-run",
+                scanned_emails=1,
+                total_emails=1,
+                action_items={},
+                recommendations=[],
+                batch_count=1,
+            )
+
+    class RefreshService:
+        def __init__(self):
+            self.provider = ProbeProvider()
+            self.engine = RefreshEngine()
+
+        def load_provider_connection(self, provider_name):
+            return SimpleNamespace(
+                provider=provider_name,
+                status="connected",
+                sync_enabled=True,
+            )
+
+    @contextmanager
+    def fake_session_scope():
+        yield object()
+
+    monkeypatch.setattr(frontend_router, "InboxRepository", ZeroRunRepository)
+    monkeypatch.setattr(frontend_router, "session_scope", fake_session_scope)
+    monkeypatch.setattr(
+        frontend_router,
+        "_service_for_provider",
+        lambda provider_name: RefreshService(),
+    )
+
+    run_id, provider_name = frontend_router._ensure_frontend_run(provider="gmail")
+
+    assert run_id == "fresh-live-run"
+    assert provider_name == "gmail"
+
+
 def test_frontend_gmail_auth_routes_issue_local_session(monkeypatch, tmp_path):
     credentials_path = tmp_path / "credentials.json"
     token_path = tmp_path / "token.json"
@@ -520,17 +836,31 @@ def test_frontend_gmail_auth_routes_issue_local_session(monkeypatch, tmp_path):
     monkeypatch.setattr(
         auth_router,
         "build_authorization_url",
-        lambda *args, **kwargs: ("https://accounts.google.com/o/oauth2/test", "state-123"),
+        lambda *args, **kwargs: (
+            "https://accounts.google.com/o/oauth2/test",
+            "state-123",
+            "frontend-verifier",
+        ),
     )
+    callback_payload: dict[str, str | None] = {}
     monkeypatch.setattr(
         auth_router,
         "exchange_code_for_token",
-        lambda *args, **kwargs: object(),
+        lambda *args, **kwargs: callback_payload.update(
+            {"state": kwargs.get("state"), "code_verifier": kwargs.get("code_verifier")}
+        )
+        or object(),
     )
     monkeypatch.setattr(
         auth_router,
         "_fetch_google_email",
         lambda credentials: "gmail.user@example.com",
+    )
+    marked_providers: list[str] = []
+    monkeypatch.setattr(
+        auth_router,
+        "mark_frontend_provider_dirty",
+        lambda provider_name: marked_providers.append(provider_name),
     )
 
     auth_url_response = client.get(
@@ -542,7 +872,7 @@ def test_frontend_gmail_auth_routes_issue_local_session(monkeypatch, tmp_path):
 
     callback_response = client.post(
         "/auth/gmail/callback",
-        json={"code": "demo-code"},
+        json={"code": "demo-code", "state": "state-123"},
         headers={"Referer": "http://localhost:3000/login?code=demo-code"},
     )
     assert callback_response.status_code == 200
@@ -561,3 +891,34 @@ def test_frontend_gmail_auth_routes_issue_local_session(monkeypatch, tmp_path):
     connection_response = client.get("/providers/gmail/connection")
     assert connection_response.status_code == 200
     assert connection_response.json()["status"] == "connected"
+    workspace_response = client.get("/settings/workspace")
+    assert workspace_response.status_code == 200
+    assert workspace_response.json()["preferred_provider"] == "gmail"
+    assert callback_payload["state"] == "state-123"
+    assert callback_payload["code_verifier"] == "frontend-verifier"
+    assert marked_providers == ["gmail"]
+
+
+def test_frontend_gmail_auth_always_uses_login_redirect(monkeypatch, tmp_path):
+    credentials_path = tmp_path / "credentials.json"
+    token_path = tmp_path / "token.json"
+    credentials_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(auth_router.SETTINGS, "gmail_credentials_path", str(credentials_path))
+    monkeypatch.setattr(auth_router.SETTINGS, "gmail_token_path", str(token_path))
+
+    captured: dict[str, str] = {}
+
+    def fake_build_authorization_url(*args, **kwargs):
+        captured["redirect_uri"] = kwargs["redirect_uri"]
+        return "https://accounts.google.com/o/oauth2/test", "state-123", "frontend-verifier"
+
+    monkeypatch.setattr(auth_router, "build_authorization_url", fake_build_authorization_url)
+
+    response = client.get(
+        "/auth/gmail/url",
+        headers={"Referer": "http://localhost:8080/settings"},
+    )
+
+    assert response.status_code == 200
+    assert captured["redirect_uri"] == "http://localhost:8080/login"

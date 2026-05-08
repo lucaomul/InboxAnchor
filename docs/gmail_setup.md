@@ -1,6 +1,9 @@
 # Gmail OAuth Setup
 
-This project uses a standard Google OAuth desktop flow for live Gmail access.
+This project supports two local Gmail OAuth patterns:
+
+- the Python helper flow that stores `token.json` locally
+- the React frontend flow that redirects back to the frontend login page and exchanges the code through the FastAPI backend
 
 ## 1. Create a Google Cloud project
 
@@ -17,8 +20,16 @@ This project uses a standard Google OAuth desktop flow for live Gmail access.
 1. Open **Google Auth Platform** or **APIs & Services > Credentials**.
 2. Configure the OAuth consent screen if this is the first OAuth client in the project.
 3. Create a new **OAuth client ID**.
-4. Choose **Desktop app** as the application type.
-5. Download the client secrets JSON file.
+4. If you plan to use the Python helper flow directly, choose **Desktop app**.
+5. If you plan to connect Gmail from the React frontend, choose **Web application** and add your frontend login URL as an authorized redirect URI.
+6. Download the client secrets JSON file.
+
+Typical local frontend redirect URIs:
+
+- `http://127.0.0.1:4173/login`
+- `http://localhost:4173/login`
+- `http://127.0.0.1:5173/login`
+- `http://localhost:5173/login`
 
 ## 4. Save `credentials.json`
 
@@ -48,6 +59,8 @@ get_credentials(
 ```
 
 On later runs, the token is refreshed silently when possible.
+
+If you are using the React frontend instead of the Python helper, InboxAnchor will redirect back to the frontend login page and exchange the code through the backend automatically.
 
 ## 6. Required scope
 

@@ -70,6 +70,35 @@ export function isAuthenticated(): boolean {
   return !!getAuthToken();
 }
 
+function localApiHint(base: string): string {
+  if (!base.includes("localhost")) {
+    return "";
+  }
+  return " If your backend is running locally, try http://127.0.0.1:8000 instead of localhost.";
+}
+
+function explainApiFailure(base: string, path: string, rawMessage: string): string {
+  const message = rawMessage.trim();
+
+  if (path.startsWith("/auth/gmail")) {
+    if (message.includes("GMAIL_CREDENTIALS_PATH is not configured")) {
+      return "Gmail OAuth is not configured on the backend yet. Set GMAIL_CREDENTIALS_PATH to your Google OAuth client JSON file and restart the API.";
+    }
+    if (message.includes("Gmail OAuth credentials file was not found")) {
+      return "The backend is missing the Gmail OAuth credentials file. Check GMAIL_CREDENTIALS_PATH and restart the API.";
+    }
+    if (message.includes("redirect_uri_mismatch")) {
+      return "Google rejected the OAuth redirect URI. Add your frontend login URL, such as http://127.0.0.1:4173/login, to the authorized redirect URIs in Google Cloud.";
+    }
+  }
+
+  if (!message) {
+    return `Could not reach the API at ${base}.${localApiHint(base)}`;
+  }
+
+  return message;
+}
+
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
   const base = getApiUrl();
   if (!base) throw new Error("API URL not configured. Go to Settings to set it.");
@@ -80,10 +109,28 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
     ...(authToken ? { Authorization: `Bearer ${authToken}` } : token ? { Authorization: `Bearer ${token}` } : {}),
     ...(options?.headers as Record<string, string> || {}),
   };
-  const res = await fetch(`${base}${path}`, { ...options, headers });
+  let res: Response;
+  try {
+    res = await fetch(`${base}${path}`, { ...options, headers });
+  } catch {
+    throw new Error(
+      `Could not reach the API at ${base}. Make sure the backend is running and reachable from the browser.${localApiHint(base)}`,
+    );
+  }
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`API ${res.status}: ${body || res.statusText}`);
+    let parsedMessage = body || res.statusText;
+    try {
+      const payload = JSON.parse(body);
+      if (typeof payload?.message === "string" && payload.message.trim()) {
+        parsedMessage = payload.message;
+      } else if (typeof payload?.detail === "string" && payload.detail.trim()) {
+        parsedMessage = payload.detail;
+      }
+    } catch {
+      // Keep the original response body when it is not JSON.
+    }
+    throw new Error(`API ${res.status}: ${explainApiFailure(base, path, parsedMessage)}`);
   }
   return res.json();
 }
@@ -104,10 +151,18 @@ export interface GmailCallbackResponse {
   email: string;
 }
 
-export async function exchangeGmailCode(code: string): Promise<GmailCallbackResponse> {
+export async function exchangeGmailCode(
+  code: string,
+  state?: string | null,
+  redirectUri?: string,
+): Promise<GmailCallbackResponse> {
   return apiFetch<GmailCallbackResponse>("/auth/gmail/callback", {
     method: "POST",
-    body: JSON.stringify({ code }),
+    body: JSON.stringify({
+      code,
+      state: state || undefined,
+      redirect_uri: redirectUri || undefined,
+    }),
   });
 }
 
@@ -189,6 +244,74 @@ export async function saveProviderConnection(
   });
 }
 
+export interface WorkspacePolicy {
+  allow_newsletter_mark_read: boolean;
+  newsletter_confidence_threshold: number;
+  allow_promo_archive: boolean;
+  promo_archive_age_days: number;
+  allow_low_priority_cleanup: boolean;
+  low_priority_age_days: number;
+  allow_spam_trash_recommendations: boolean;
+  auto_label_recommendations: boolean;
+  require_review_for_attachments: boolean;
+  require_review_for_finance: boolean;
+  require_review_for_personal: boolean;
+}
+
+export interface WorkspaceSettings {
+  preferred_provider: string;
+  dry_run_default: boolean;
+  default_scan_limit: number;
+  default_batch_size: number;
+  default_confidence_threshold: number;
+  default_email_preview_limit: number;
+  default_recommendation_preview_limit: number;
+  follow_up_radar_enabled: boolean;
+  follow_up_after_hours: number;
+  follow_up_priority_floor: string;
+  onboarding_completed: boolean;
+  operator_mode: string;
+  policy: WorkspacePolicy;
+  updated_at?: string;
+}
+
+export async function fetchWorkspaceSettings(): Promise<WorkspaceSettings> {
+  return apiFetch<WorkspaceSettings>("/settings/workspace");
+}
+
+export async function saveWorkspaceSettings(
+  payload: WorkspaceSettings,
+): Promise<WorkspaceSettings> {
+  return apiFetch<WorkspaceSettings>("/settings/workspace", {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function activateGmailWorkspace(email: string): Promise<void> {
+  const current = await fetchWorkspaceSettings();
+  await saveProviderConnection("gmail", {
+    provider: "gmail",
+    status: "connected",
+    account_hint: email,
+    sync_enabled: true,
+    dry_run_only: false,
+    last_tested_at: new Date().toISOString(),
+    notes: "Connected through the InboxAnchor Gmail frontend flow.",
+  });
+  await saveWorkspaceSettings({
+    ...current,
+    preferred_provider: "gmail",
+    default_scan_limit: Math.max(current.default_scan_limit, 10000),
+    default_batch_size: Math.max(current.default_batch_size, 1000),
+    default_email_preview_limit: Math.max(current.default_email_preview_limit, 250),
+    default_recommendation_preview_limit: Math.max(
+      current.default_recommendation_preview_limit,
+      400,
+    ),
+  });
+}
+
 // --- Emails ---
 
 export interface FetchEmailsParams {
@@ -217,6 +340,10 @@ export async function fetchEmails(params?: FetchEmailsParams): Promise<FetchEmai
   return apiFetch<FetchEmailsResponse>(`/emails${query ? `?${query}` : ""}`);
 }
 
+export async function fetchEmailById(emailId: string): Promise<EmailMessage> {
+  return apiFetch<EmailMessage>(`/emails/${emailId}`);
+}
+
 // --- Classifications ---
 
 export async function fetchClassifications(): Promise<Record<string, EmailClassification>> {
@@ -225,8 +352,11 @@ export async function fetchClassifications(): Promise<Record<string, EmailClassi
 
 // --- Recommendations ---
 
-export async function fetchRecommendations(): Promise<EmailRecommendation[]> {
-  return apiFetch<EmailRecommendation[]>("/recommendations");
+export async function fetchRecommendations(emailId?: string | null): Promise<EmailRecommendation[]> {
+  const qs = new URLSearchParams();
+  if (emailId) qs.set("email_id", emailId);
+  const query = qs.toString();
+  return apiFetch<EmailRecommendation[]>(`/recommendations${query ? `?${query}` : ""}`);
 }
 
 // --- Action Items ---
@@ -317,8 +447,28 @@ export interface WorkflowMutationResult {
   overview: OpsOverview;
 }
 
+export interface OpsProgress {
+  provider: string;
+  status: "idle" | "running" | "complete" | "error";
+  stage: string;
+  target_count: number;
+  processed_count: number;
+  read_count: number;
+  action_item_count: number;
+  recommendation_count: number;
+  batch_count: number;
+  latest_subject?: string | null;
+  run_id?: string | null;
+  error?: string | null;
+  updated_at: string;
+}
+
 export async function fetchOpsOverview(): Promise<OpsOverview> {
   return apiFetch<OpsOverview>("/ops/overview");
+}
+
+export async function fetchOpsProgress(): Promise<OpsProgress> {
+  return apiFetch<OpsProgress>("/ops/progress");
 }
 
 export async function runOpsScan(): Promise<OpsOverview> {

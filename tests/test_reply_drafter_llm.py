@@ -68,3 +68,26 @@ def test_reply_drafter_falls_back_to_template_on_error():
 
     assert "Thanks for the message" in draft
     assert "Best,\nLuca" in draft
+
+
+def test_reply_drafter_skips_non_reply_workflows():
+    email = build_demo_emails()[0]
+    llm = StubLLMClient(
+        LLMResult(content="test", provider="openai", model="gpt-4o-mini", latency_ms=10)
+    )
+    agent = ReplyDrafterAgent(llm_client=llm)
+
+    draft = agent.draft(
+        email,
+        [
+            EmailActionItem(
+                email_id=email.id,
+                action_type="invoice_payment",
+                description="Pay the invoice.",
+                requires_reply=False,
+            )
+        ],
+    )
+
+    assert draft is None
+    assert llm.calls == 0

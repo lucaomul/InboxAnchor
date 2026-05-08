@@ -51,9 +51,13 @@ def build_authorization_url(
     *,
     redirect_uri: str,
     state: Optional[str] = None,
-) -> tuple[str, str]:
+) -> tuple[str, str, Optional[str]]:
     _, _, Flow, _ = _import_google_oauth()
-    flow = Flow.from_client_secrets_file(str(Path(credentials_path).expanduser()), scopes=scopes)
+    flow = Flow.from_client_secrets_file(
+        str(Path(credentials_path).expanduser()),
+        scopes=scopes,
+        autogenerate_code_verifier=True,
+    )
     flow.redirect_uri = redirect_uri
     authorization_url, resolved_state = flow.authorization_url(
         access_type="offline",
@@ -61,7 +65,7 @@ def build_authorization_url(
         prompt="consent",
         state=state,
     )
-    return authorization_url, resolved_state
+    return authorization_url, resolved_state, getattr(flow, "code_verifier", None)
 
 
 def exchange_code_for_token(
@@ -72,15 +76,22 @@ def exchange_code_for_token(
     code: str,
     redirect_uri: str,
     state: Optional[str] = None,
+    code_verifier: Optional[str] = None,
 ):
     _, _, Flow, _ = _import_google_oauth()
     token_file = Path(token_path).expanduser()
     token_file.parent.mkdir(parents=True, exist_ok=True)
 
-    flow = Flow.from_client_secrets_file(str(Path(credentials_path).expanduser()), scopes=scopes)
+    flow = Flow.from_client_secrets_file(
+        str(Path(credentials_path).expanduser()),
+        scopes=scopes,
+        autogenerate_code_verifier=True,
+    )
     flow.redirect_uri = redirect_uri
     if state:
         flow.oauth2session.state = state
+    if code_verifier:
+        flow.code_verifier = code_verifier
     flow.fetch_token(code=code)
     creds = flow.credentials
     token_file.write_text(creds.to_json(), encoding="utf-8")

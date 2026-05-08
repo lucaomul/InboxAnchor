@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import and_
+from sqlalchemy import and_, or_
 
 from inboxanchor.infra.database import (
     ActionItemORM,
@@ -11,6 +11,7 @@ from inboxanchor.infra.database import (
     ClassificationORM,
     EmailRecordORM,
     FollowUpReminderORM,
+    MailboxEmailORM,
     ProviderCheckpointORM,
     ProviderConnectionORM,
     RecommendationORM,
@@ -30,6 +31,62 @@ from inboxanchor.models import (
 class InboxRepository:
     def __init__(self, session):
         self.session = session
+
+    def _run_email_details_query(
+        self,
+        run_id: str,
+        *,
+        priority: Optional[str] = None,
+        category: Optional[str] = None,
+        q: Optional[str] = None,
+        unread_only: bool = False,
+    ):
+        query = (
+            self.session.query(EmailRecordORM, ClassificationORM)
+            .join(
+                ClassificationORM,
+                and_(
+                    ClassificationORM.run_id == EmailRecordORM.run_id,
+                    ClassificationORM.email_id == EmailRecordORM.email_id,
+                ),
+            )
+            .filter(EmailRecordORM.run_id == run_id)
+        )
+        if priority:
+            query = query.filter(ClassificationORM.priority == priority)
+        if category:
+            query = query.filter(ClassificationORM.category == category)
+        if unread_only:
+            query = query.filter(EmailRecordORM.unread.is_(True))
+        if q:
+            pattern = f"%{q.strip()}%"
+            query = query.filter(
+                or_(
+                    EmailRecordORM.subject.ilike(pattern),
+                    EmailRecordORM.sender.ilike(pattern),
+                    EmailRecordORM.snippet.ilike(pattern),
+                    EmailRecordORM.body_preview.ilike(pattern),
+                )
+            )
+        return query
+
+    @staticmethod
+    def _mailbox_email_payload(row: MailboxEmailORM) -> dict:
+        return {
+            "provider": row.provider,
+            "email_id": row.email_id,
+            "thread_id": row.thread_id,
+            "sender": row.sender,
+            "subject": row.subject,
+            "snippet": row.snippet,
+            "body_preview": row.body_preview,
+            "body_full": row.body_full,
+            "received_at": row.received_at.isoformat(),
+            "labels": row.labels,
+            "has_attachments": row.has_attachments,
+            "unread": row.unread,
+            "last_synced_at": row.last_synced_at.isoformat(),
+        }
 
     @staticmethod
     def _reminder_model(row: FollowUpReminderORM) -> FollowUpReminder:
@@ -81,6 +138,7 @@ class InboxRepository:
         self.session.add(run)
 
         for email in emails:
+            self.upsert_mailbox_email(result.provider, email)
             self.session.add(
                 EmailRecordORM(
                     run_id=result.run_id,
@@ -146,6 +204,78 @@ class InboxRepository:
             query = query.filter(TriageRunORM.provider == provider)
         row = query.order_by(TriageRunORM.started_at.desc()).first()
         return row.run_id if row else None
+
+    def upsert_mailbox_email(self, provider: str, email) -> None:
+        row = (
+            self.session.query(MailboxEmailORM)
+            .filter(
+                MailboxEmailORM.provider == provider,
+                MailboxEmailORM.email_id == email.id,
+            )
+            .first()
+        )
+        body_full = (getattr(email, "body_full", "") or email.body_preview or email.snippet).strip()
+        payload = {
+            "thread_id": email.thread_id,
+            "sender": email.sender,
+            "subject": email.subject,
+            "snippet": email.snippet,
+            "body_preview": email.body_preview,
+            "body_full": body_full,
+            "received_at": email.received_at,
+            "labels": email.labels,
+            "has_attachments": email.has_attachments,
+            "unread": email.unread,
+            "last_synced_at": datetime.now(timezone.utc),
+        }
+
+        if row is None:
+            self.session.add(
+                MailboxEmailORM(
+                    provider=provider,
+                    email_id=email.id,
+                    **payload,
+                )
+            )
+            return
+
+        row.thread_id = payload["thread_id"]
+        row.sender = payload["sender"]
+        row.subject = payload["subject"]
+        row.snippet = payload["snippet"]
+        row.body_preview = payload["body_preview"]
+        row.body_full = payload["body_full"]
+        row.received_at = payload["received_at"]
+        row.labels = payload["labels"]
+        row.has_attachments = payload["has_attachments"]
+        row.unread = payload["unread"]
+        row.last_synced_at = payload["last_synced_at"]
+
+    def get_mailbox_email(self, provider: str, email_id: str) -> Optional[dict]:
+        row = (
+            self.session.query(MailboxEmailORM)
+            .filter(
+                MailboxEmailORM.provider == provider,
+                MailboxEmailORM.email_id == email_id,
+            )
+            .first()
+        )
+        if row is None:
+            return None
+        return self._mailbox_email_payload(row)
+
+    def get_mailbox_email_map(self, provider: str, email_ids: list[str]) -> dict[str, dict]:
+        if not email_ids:
+            return {}
+        rows = (
+            self.session.query(MailboxEmailORM)
+            .filter(
+                MailboxEmailORM.provider == provider,
+                MailboxEmailORM.email_id.in_(email_ids),
+            )
+            .all()
+        )
+        return {row.email_id: self._mailbox_email_payload(row) for row in rows}
 
     def list_runs(self, limit: int = 25) -> list[dict]:
         rows = (
@@ -379,23 +509,16 @@ class InboxRepository:
         offset: int = 0,
         priority: Optional[str] = None,
         category: Optional[str] = None,
+        q: Optional[str] = None,
+        unread_only: bool = False,
     ) -> list[dict]:
-        query = (
-            self.session.query(EmailRecordORM, ClassificationORM)
-            .join(
-                ClassificationORM,
-                and_(
-                    ClassificationORM.run_id == EmailRecordORM.run_id,
-                    ClassificationORM.email_id == EmailRecordORM.email_id,
-                ),
-            )
-            .filter(EmailRecordORM.run_id == run_id)
+        query = self._run_email_details_query(
+            run_id,
+            priority=priority,
+            category=category,
+            q=q,
+            unread_only=unread_only,
         )
-        if priority:
-            query = query.filter(ClassificationORM.priority == priority)
-        if category:
-            query = query.filter(ClassificationORM.category == category)
-
         rows = (
             query.order_by(EmailRecordORM.received_at.desc())
             .offset(offset)
@@ -468,23 +591,45 @@ class InboxRepository:
         *,
         priority: Optional[str] = None,
         category: Optional[str] = None,
+        q: Optional[str] = None,
+        unread_only: bool = False,
     ) -> int:
-        query = (
-            self.session.query(EmailRecordORM)
-            .join(
-                ClassificationORM,
-                and_(
-                    ClassificationORM.run_id == EmailRecordORM.run_id,
-                    ClassificationORM.email_id == EmailRecordORM.email_id,
-                ),
+        return self._run_email_details_query(
+            run_id,
+            priority=priority,
+            category=category,
+            q=q,
+            unread_only=unread_only,
+        ).count()
+
+    def count_run_high_priority_emails(self, run_id: str) -> int:
+        return self._run_email_details_query(run_id).filter(
+            ClassificationORM.priority.in_(["critical", "high"])
+        ).count()
+
+    def count_run_attachment_emails(self, run_id: str) -> int:
+        return self._run_email_details_query(run_id).filter(
+            EmailRecordORM.has_attachments.is_(True)
+        ).count()
+
+    def count_run_auto_label_candidates(self, run_id: str) -> int:
+        return self._run_email_details_query(run_id).filter(
+            or_(
+                ClassificationORM.category != "unknown",
+                ClassificationORM.priority.in_(["critical", "high"]),
+                EmailRecordORM.has_attachments.is_(True),
             )
-            .filter(EmailRecordORM.run_id == run_id)
+        ).count()
+
+    def count_run_recommendations_by_status(self, run_id: str, status: str) -> int:
+        return (
+            self.session.query(RecommendationORM)
+            .filter(
+                RecommendationORM.run_id == run_id,
+                RecommendationORM.status == status,
+            )
+            .count()
         )
-        if priority:
-            query = query.filter(ClassificationORM.priority == priority)
-        if category:
-            query = query.filter(ClassificationORM.category == category)
-        return query.count()
 
     def list_run_recommendations(
         self,
@@ -697,6 +842,10 @@ class InboxRepository:
                 subject=row.subject,
                 snippet=row.snippet,
                 body_preview=row.body_preview,
+                body_full=(self.get_mailbox_email(run.provider, row.email_id) or {}).get(
+                    "body_full",
+                    row.body_preview,
+                ),
                 received_at=row.received_at,
                 labels=row.labels,
                 has_attachments=row.has_attachments,

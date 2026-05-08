@@ -85,10 +85,11 @@ function LoginPage() {
     if (typeof window === "undefined") return;
     const params = new URLSearchParams(window.location.search);
     const code = params.get("code");
+    const state = params.get("state");
     if (!code) return;
     setAuthView("gmail");
     setAuthLoading(true);
-    login(code)
+    login(code, state, `${window.location.origin}/login`)
       .then(() => {
         window.history.replaceState({}, "", "/login");
         navigate({ to: "/" });
@@ -259,13 +260,18 @@ function LoginPage() {
                   <Input
                     value={apiUrl}
                     onChange={(event) => setApiUrlLocal(event.target.value)}
-                    placeholder="http://localhost:8000"
+                    placeholder="http://127.0.0.1:8000"
                     className="flex-1"
                   />
                   <Button onClick={handleSaveApi} variant="outline">
                     Save
                   </Button>
                 </div>
+                <p className="mt-2 text-[11px] leading-5 text-muted-foreground">
+                  Local testing works best with <span className="font-medium text-foreground">http://127.0.0.1:8000</span>.
+                  If you use <span className="font-medium text-foreground">localhost</span>, some browsers may fail to
+                  reach a backend that is only listening on IPv4.
+                </p>
                 {apiError && (
                   <p className="mt-2 flex items-center gap-1 text-xs text-destructive">
                     <AlertCircle className="h-3.5 w-3.5" />
@@ -402,6 +408,13 @@ function LoginPage() {
                       <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
                       InboxAnchor reads unread state, applies useful labels, and never trashes mail
                       without explicit confirmation.
+                    </p>
+                  </div>
+                  <div className="rounded-2xl border border-border bg-card p-3">
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      Before connecting Gmail, make sure the backend has
+                      <span className="mx-1 font-medium text-foreground">GMAIL_CREDENTIALS_PATH</span>
+                      configured and that Google OAuth allows this frontend login URL as a redirect.
                     </p>
                   </div>
                   <Button

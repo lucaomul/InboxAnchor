@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 from uuid import uuid4
 
 from inboxanchor.agents import (
@@ -64,6 +64,7 @@ class TriageEngine:
         email_preview_limit: int = 100,
         recommendation_preview_limit: int = 150,
         workspace_policy: Optional[WorkspacePolicy] = None,
+        progress_callback: Optional[Callable[[dict], None]] = None,
     ) -> TriageRunResult:
         workspace_policy = workspace_policy or WorkspacePolicy()
         classifications: dict[str, EmailClassification] = {}
@@ -73,6 +74,23 @@ class TriageEngine:
         all_emails: list[EmailMessage] = []
         batch_count = 0
         scanned_emails = 0
+        total_action_items = 0
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "stage": "starting",
+                    "provider": self.provider.provider_name,
+                    "limit": limit,
+                    "batch_size": batch_size,
+                    "scanned_emails": 0,
+                    "processed_emails": 0,
+                    "read_count": 0,
+                    "action_item_count": 0,
+                    "recommendation_count": 0,
+                    "batch_count": 0,
+                }
+            )
 
         for batch in self.provider.iter_unread_batches(
             limit=limit,
@@ -80,6 +98,21 @@ class TriageEngine:
             include_body=True,
         ):
             batch_count += 1
+            if progress_callback:
+                progress_callback(
+                    {
+                        "stage": "reading_batch",
+                        "provider": self.provider.provider_name,
+                        "limit": limit,
+                        "batch_size": batch_size,
+                        "scanned_emails": scanned_emails,
+                        "processed_emails": len(all_emails),
+                        "read_count": len(all_emails),
+                        "action_item_count": total_action_items,
+                        "recommendation_count": len(recommendations),
+                        "batch_count": batch_count,
+                    }
+                )
             for email in batch:
                 scanned_emails += 1
                 classification = self.priority_agent.prioritize(
@@ -98,7 +131,10 @@ class TriageEngine:
                         }
                     )
 
-                items = self.action_extractor.extract(email)
+                items = self.action_extractor.extract(
+                    email,
+                    classification=classification,
+                )
                 recommendation = self.safety_verifier.verify(
                     email,
                     classification,
@@ -113,12 +149,33 @@ class TriageEngine:
 
                 classifications[email.id] = classification
                 action_items[email.id].extend(items)
+                total_action_items += len(items)
                 if items:
-                    draft = self.reply_drafter.draft(email, items)
+                    draft = self.reply_drafter.draft(
+                        email,
+                        items,
+                        classification=classification,
+                    )
                     if draft:
                         reply_drafts[email.id] = draft
                 recommendations.append(recommendation)
                 all_emails.append(email)
+                if progress_callback and (scanned_emails <= 5 or scanned_emails % 10 == 0):
+                    progress_callback(
+                        {
+                            "stage": "triaging",
+                            "provider": self.provider.provider_name,
+                            "limit": limit,
+                            "batch_size": batch_size,
+                            "scanned_emails": scanned_emails,
+                            "processed_emails": len(all_emails),
+                            "read_count": len(all_emails),
+                            "action_item_count": total_action_items,
+                            "recommendation_count": len(recommendations),
+                            "batch_count": batch_count,
+                            "latest_subject": email.subject,
+                        }
+                    )
 
         digest = self.summarizer.build_digest(all_emails, classifications)
         approvals_required = [
@@ -187,6 +244,22 @@ class TriageEngine:
                 persisted_classifications=classifications,
                 persisted_action_items=dict(action_items),
                 persisted_recommendations=recommendations,
+            )
+        if progress_callback:
+            progress_callback(
+                {
+                    "stage": "complete",
+                    "provider": self.provider.provider_name,
+                    "limit": limit,
+                    "batch_size": batch_size,
+                    "scanned_emails": scanned_emails,
+                    "processed_emails": len(all_emails),
+                    "read_count": len(all_emails),
+                    "action_item_count": total_action_items,
+                    "recommendation_count": len(recommendations),
+                    "batch_count": batch_count,
+                    "run_id": result.run_id,
+                }
             )
         return result
 

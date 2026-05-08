@@ -42,6 +42,7 @@ export function EmailDetail({ email, classification, recommendations, actionItem
   const applyMutation = useApplyRecommendation();
   const approveMutation = useApproveRecommendation();
   const blockMutation = useBlockRecommendation();
+  const fullBody = email.bodyFull?.trim() || email.bodyPreview?.trim() || email.snippet;
 
   return (
     <div className="flex flex-col gap-5 p-5">
@@ -63,7 +64,12 @@ export function EmailDetail({ email, classification, recommendations, actionItem
 
       {/* Preview */}
       <div className="rounded-lg bg-secondary/50 p-4 border border-border">
-        <p className="text-sm text-foreground leading-relaxed">{email.snippet}</p>
+        <p className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">
+          Message body
+        </p>
+        <p className="mt-3 whitespace-pre-wrap text-sm text-foreground leading-relaxed">
+          {fullBody}
+        </p>
       </div>
 
       {/* Action Items */}

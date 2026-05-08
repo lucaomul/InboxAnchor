@@ -1,7 +1,6 @@
 import { Badge } from "@/components/ui/badge";
 import {
   type EmailMessage,
-  type EmailClassification,
   CATEGORY_CONFIG,
   PRIORITY_CONFIG,
 } from "@/lib/mock-data";
@@ -9,7 +8,6 @@ import { Paperclip } from "lucide-react";
 
 interface EmailListProps {
   emails: EmailMessage[];
-  classifications: Record<string, EmailClassification>;
   selectedId: string | null;
   onSelect: (id: string) => void;
 }
@@ -23,11 +21,11 @@ function timeAgo(dateStr: string) {
   return `${Math.floor(hrs / 24)}d`;
 }
 
-export function EmailList({ emails, classifications, selectedId, onSelect }: EmailListProps) {
+export function EmailList({ emails, selectedId, onSelect }: EmailListProps) {
   return (
     <div className="flex flex-col divide-y divide-border">
       {emails.map((email) => {
-        const cls = classifications[email.id];
+        const cls = email.classification;
         const catCfg = cls ? CATEGORY_CONFIG[cls.category] : null;
         const priCfg = cls ? PRIORITY_CONFIG[cls.priority] : null;
         const isSelected = email.id === selectedId;

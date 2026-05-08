@@ -42,7 +42,7 @@ class ClassifierAgent:
 
     def classify(self, email: EmailMessage) -> EmailClassification:
         heuristic = self._heuristic_classify(email)
-        if heuristic.confidence >= 0.93:
+        if not self._should_use_llm(email, heuristic):
             return heuristic
 
         llm_result = self.llm_client.complete(
@@ -61,18 +61,45 @@ class ClassifierAgent:
         except Exception:
             return heuristic
 
+    def _should_use_llm(
+        self,
+        email: EmailMessage,
+        heuristic: EmailClassification,
+    ) -> bool:
+        if heuristic.confidence >= 0.9:
+            return False
+        if heuristic.category in {
+            EmailCategory.finance,
+            EmailCategory.newsletter,
+            EmailCategory.promo,
+            EmailCategory.spam_like,
+            EmailCategory.low_priority,
+        }:
+            return False
+        if self._looks_automated(email):
+            return False
+        return heuristic.category in {
+            EmailCategory.work,
+            EmailCategory.opportunity,
+            EmailCategory.personal,
+            EmailCategory.unknown,
+            EmailCategory.urgent,
+        }
+
     def _build_prompt(self, email: EmailMessage) -> str:
+        full_body = email.content_for_processing(max_chars=4000)
         return (
             "Classify this email.\n"
             f"Sender: {email.sender}\n"
             f"Subject: {email.subject}\n"
             f"Snippet: {email.snippet}\n"
             f"Body preview: {email.body_preview}\n"
+            f"Body full: {full_body}\n"
             f"Has attachments: {email.has_attachments}\n"
         )
 
     def _heuristic_classify(self, email: EmailMessage) -> EmailClassification:
-        text = f"{email.subject}\n{email.snippet}\n{email.body_preview}".lower()
+        text = f"{email.subject}\n{email.snippet}\n{email.content_for_processing()}".lower()
 
         if any(token in text for token in ["invoice", "payment", "receipt", "bank", "refund"]):
             return EmailClassification(
@@ -145,4 +172,22 @@ class ClassifierAgent:
             priority=PriorityLevel.medium if email.has_attachments else PriorityLevel.low,
             confidence=0.55,
             reason="No strong heuristic matched; keep for review.",
+        )
+
+    def _looks_automated(self, email: EmailMessage) -> bool:
+        sender = email.sender.lower()
+        subject = email.subject.lower()
+        snippet = email.snippet.lower()
+        return any(
+            token in f"{sender}\n{subject}\n{snippet}"
+            for token in [
+                "noreply",
+                "no-reply",
+                "do-not-reply",
+                "unsubscribe",
+                "digest",
+                "newsletter",
+                "notification",
+                "alert",
+            ]
         )

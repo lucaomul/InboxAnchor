@@ -16,6 +16,7 @@ from inboxanchor.infra.database import session_scope
 from inboxanchor.infra.repository import InboxRepository
 
 router = APIRouter(prefix="/oauth", tags=["oauth"])
+GMAIL_PKCE_REGISTRY: dict[str, str] = {}
 
 
 def _resolve_token_path() -> str:
@@ -37,6 +38,15 @@ def _html_page(message: str, *, success: bool) -> HTMLResponse:
         "</body></html>"
     )
     return HTMLResponse(content=body, status_code=200 if success else 400)
+
+
+def _normalize_auth_url_result(result) -> tuple[str, str, Optional[str]]:
+    if isinstance(result, tuple):
+        if len(result) == 3:
+            return result[0], result[1], result[2]
+        if len(result) == 2:
+            return result[0], result[1], None
+    raise ValueError("Unexpected authorization URL result payload.")
 
 
 @router.get("/gmail/start")
@@ -61,12 +71,16 @@ def gmail_oauth_start():
         )
 
     try:
-        auth_url, state = build_authorization_url(
-            str(credentials_path),
-            [GMAIL_MODIFY_SCOPE],
-            redirect_uri=SETTINGS.gmail_redirect_uri,
-            state=secrets.token_urlsafe(24),
+        auth_url, state, code_verifier = _normalize_auth_url_result(
+            build_authorization_url(
+                str(credentials_path),
+                [GMAIL_MODIFY_SCOPE],
+                redirect_uri=SETTINGS.gmail_redirect_uri,
+                state=secrets.token_urlsafe(24),
+            )
         )
+        if code_verifier:
+            GMAIL_PKCE_REGISTRY[state] = code_verifier
     except Exception as error:
         return JSONResponse(
             status_code=400,
@@ -94,6 +108,7 @@ def gmail_oauth_callback(
         return _html_page("Unable to determine where token.json should be stored.", success=False)
 
     try:
+        code_verifier = GMAIL_PKCE_REGISTRY.pop(state, None) if state else None
         exchange_code_for_token(
             SETTINGS.gmail_credentials_path,
             token_path,
@@ -101,6 +116,7 @@ def gmail_oauth_callback(
             code=code,
             redirect_uri=SETTINGS.gmail_redirect_uri,
             state=state,
+            code_verifier=code_verifier,
         )
         with session_scope() as session:
             repository = InboxRepository(session)

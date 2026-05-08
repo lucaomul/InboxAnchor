@@ -13,6 +13,7 @@ InboxAnchor is a safety-first inbox triage system for overloaded email accounts.
 - Separates recommendations into safe, requires-approval, and blocked lanes
 - Persists triage runs, recommendations, audit history, provider state, and workspace settings
 - Supports bulk lane actions, operator playbooks, focus views, follow-up radar, and reminder center workflows in the dashboard
+- Shows live unread-scan progress with a wait-state loader that can run in `Fun Mode` or `Serious Mode`
 - Exposes a FastAPI backend and a Streamlit workspace on top of the same core engine
 - Includes a full React frontend in `frontend/` with a premium command center, welcome/auth flow, inbox workspace, and settings surface wired to the FastAPI backend
 
@@ -56,7 +57,7 @@ frontend/         TanStack/React product UI, frontend routes, and modern compone
 ### Core Components
 
 - `inboxanchor/agents/`
-  LLM-backed task agents with heuristic fallback. OpenAI and Groq are supported through the shared provider layer.
+  LLM-backed task agents with heuristic fallback. OpenAI and Groq are supported through the shared provider layer, but obvious inbox cases stay rules-first so the model mainly steps in on ambiguous edge cases.
 - `inboxanchor/connectors/`
   Demo mailbox support, Gmail OAuth transport, and IMAP-family transport support.
 - `inboxanchor/core/triage_engine.py`
@@ -83,7 +84,7 @@ InboxAnchor is built around conservative defaults.
 
 ## LLM Providers
 
-The task agents use real LLM calls where it matters and fall back to heuristics when needed.
+The task agents use real LLM calls where it matters and fall back to heuristics when needed. InboxAnchor is intentionally rules-first: obvious newsletters, promos, spam-like messages, low-priority updates, and straightforward finance mail stay deterministic, while the LLM is reserved more for ambiguous work, opportunity, urgent, and coordination-heavy threads.
 
 - Supported providers: `openai`, `groq`, and `mock`
 - Provider selection: `INBOXANCHOR_LLM_PROVIDER`
@@ -203,6 +204,7 @@ Important:
 - this frontend started from the separate `lucaomul/inbox-assistant` codebase
 - the visual shell, routes, and components are now in-repo and adapted to the InboxAnchor FastAPI backend
 - the React app now serves as the premium product shell, while the Streamlit workspace remains available for Python-native operations and admin flows
+- live wait states include a progress-aware loader with `Fun Mode` and `Serious Mode`
 
 ## Authentication
 
@@ -305,6 +307,7 @@ Still pending before calling it fully production-ready:
 - battle-tested live mailbox onboarding across Gmail and IMAP-family providers
 - deeper multi-user SaaS controls
 - more mature shared inbox / assignment workflows
+- historical backfill and larger-than-unread mailbox sync beyond the current working set
 - broader deployment and secrets-management hardening
 
 ## Roadmap

@@ -9,8 +9,8 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { EmailCategory, PriorityLevel } from "@/lib/mock-data";
 import {
+  useEmailDetail,
   useEmails,
-  useClassifications,
   useRecommendations,
   useDigest,
   useActionItems,
@@ -20,11 +20,13 @@ import {
 import { useAuth } from "@/hooks/use-auth";
 import { useDebounce } from "@/hooks/use-debounce";
 import { useTheme } from "@/hooks/use-theme";
+import { useOpsProgress } from "@/hooks/use-ops";
 import { StickmanLoader, StickmanEmpty, StickmanStyles } from "@/components/StickmenAnimations";
 import { Input } from "@/components/ui/input";
 import {
   Activity,
   Anchor,
+  AlertTriangle,
   ChevronLeft,
   ChevronRight,
   Home,
@@ -43,7 +45,7 @@ import { getApiUrl } from "@/lib/api-client";
 
 type View = "inbox" | "lanes";
 
-const PAGE_SIZE = 20;
+const PAGE_SIZE = 25;
 
 export function InboxWorkspace() {
   const { email: userEmail, logout } = useAuth();
@@ -58,16 +60,38 @@ export function InboxWorkspace() {
   const { theme, setTheme, themes } = useTheme();
 
   const apiConnected = typeof window !== "undefined" && !!getApiUrl();
-  const { data: emailsData, isLoading: emailsLoading, isError: emailsError } = useEmails();
-  const { data: classifications, isLoading: clsLoading } = useClassifications();
-  const { data: recommendations, isLoading: recsLoading } = useRecommendations();
-  const { data: digest, isLoading: digestLoading } = useDigest();
+  const emailQueryParams = useMemo(
+    () => ({
+      limit: PAGE_SIZE,
+      offset: page * PAGE_SIZE,
+      q: debouncedSearch || undefined,
+      category: filterCategory || undefined,
+      priority: filterPriority || undefined,
+    }),
+    [debouncedSearch, filterCategory, filterPriority, page],
+  );
+  const {
+    data: emailsData,
+    isLoading: emailsLoading,
+    isError: emailsError,
+    error: emailsQueryError,
+  } = useEmails(emailQueryParams);
+  const {
+    data: recommendations,
+    isLoading: recsLoading,
+    error: recommendationsError,
+  } = useRecommendations(
+    view === "lanes" ? null : selectedEmailId,
+    view === "lanes" || !!selectedEmailId,
+  );
+  const { data: digest, isLoading: digestLoading, error: digestError } = useDigest();
   const { data: selectedActions } = useActionItems(selectedEmailId);
+  const { data: selectedEmailDetail } = useEmailDetail(selectedEmailId);
   const { data: webhookHealth } = useWebhookHealth();
   const { status: streamStatus } = useEmailStream();
+  const { data: progress } = useOpsProgress(emailsLoading || digestLoading || recsLoading);
 
   const emails = emailsData?.emails || [];
-  const cls = classifications || {};
   const recs = recommendations || [];
   const dig = digest || {
     totalUnread: 0,
@@ -77,42 +101,49 @@ export function InboxWorkspace() {
   };
 
   useEffect(() => {
+    setPage(0);
+    setSelectedEmailId(null);
+  }, [debouncedSearch, filterCategory, filterPriority]);
+
+  useEffect(() => {
     if (!selectedEmailId && emails.length > 0) {
       setSelectedEmailId(emails[0].id);
     }
   }, [emails, selectedEmailId]);
 
-  const filteredEmails = useMemo(() => {
-    let result = emails;
-    if (debouncedSearch) {
-      const q = debouncedSearch.toLowerCase();
-      result = result.filter(
-        (e) =>
-          e.subject.toLowerCase().includes(q) ||
-          e.sender.toLowerCase().includes(q) ||
-          e.snippet.toLowerCase().includes(q),
-      );
+  useEffect(() => {
+    const maxPage = Math.max(0, Math.ceil((emailsData?.total || 0) / PAGE_SIZE) - 1);
+    if (page > maxPage) {
+      setPage(maxPage);
     }
-    if (filterCategory) {
-      result = result.filter((e) => cls[e.id]?.category === filterCategory);
-    }
-    if (filterPriority) {
-      result = result.filter((e) => cls[e.id]?.priority === filterPriority);
-    }
-    return result;
-  }, [emails, debouncedSearch, filterCategory, filterPriority, cls]);
+  }, [emailsData?.total, page]);
 
-  const selectedEmail = emails.find((e) => e.id === selectedEmailId);
-  const selectedClassification = selectedEmailId ? cls[selectedEmailId] : null;
+  const selectedEmail = emails.find((e) => e.id === selectedEmailId) || selectedEmailDetail || null;
+  const selectedClassification = selectedEmail?.classification || null;
   const selectedRecs = selectedEmailId
     ? recs.filter((r) => r.emailId === selectedEmailId)
     : [];
 
   const hasFilters = !!debouncedSearch || !!filterCategory || !!filterPriority;
-  const totalFiltered = filteredEmails.length;
+  const totalFiltered = emailsData?.total || 0;
   const totalPages = Math.max(1, Math.ceil(totalFiltered / PAGE_SIZE));
-  const pagedEmails = filteredEmails.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
-  const isLoading = emailsLoading || clsLoading;
+  const pagedEmails = emails;
+  const isLoading = emailsLoading;
+  const showWorkspaceLoader =
+    emailsLoading || digestLoading || recsLoading || progress?.status === "running";
+  const progressStats = progress
+    ? [
+        { label: "Emails read", value: progress.read_count },
+        { label: "Processed", value: progress.processed_count },
+        { label: "Actions", value: progress.action_item_count },
+        { label: "Suggestions", value: progress.recommendation_count },
+      ]
+    : [];
+  const workspaceError =
+    (emailsQueryError instanceof Error && emailsQueryError.message) ||
+    (recommendationsError instanceof Error && recommendationsError.message) ||
+    (digestError instanceof Error && digestError.message) ||
+    "";
 
   const webhookStatusColor = webhookHealth?.status === "healthy"
     ? "text-safe"
@@ -329,26 +360,49 @@ export function InboxWorkspace() {
           </>
         )}
       </div>
+      {workspaceError && (
+        <div className="border-b border-border bg-amber-500/5 px-5 py-3">
+          <div className="flex items-start gap-3 rounded-xl border border-amber-500/30 bg-card px-4 py-3">
+            <AlertTriangle className="mt-0.5 h-4 w-4 text-amber-500" />
+            <div>
+              <p className="text-sm font-medium text-foreground">
+                The live mailbox is connected, but this workspace could not load the unread set.
+              </p>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">{workspaceError}</p>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="flex flex-1 min-h-0">
         {view === "inbox" ? (
           <>
             <div className="w-[360px] shrink-0 border-r border-border overflow-y-auto">
-              {isLoading ? (
-                <div className="flex flex-col gap-1 p-3">
-                  {[1, 2, 3, 4, 5, 6].map((i) => (
-                    <div key={i} className="space-y-2 p-3">
-                      <Skeleton className="h-4 w-3/4" />
-                      <Skeleton className="h-3 w-full" />
-                      <Skeleton className="h-3 w-1/2" />
-                    </div>
-                  ))}
+              {showWorkspaceLoader ? (
+                <div className="flex h-full items-center justify-center p-5">
+                  <StickmanLoader
+                    playful
+                    stage={progress?.stage ? `Stage: ${progress.stage}` : undefined}
+                    stats={progressStats}
+                    message={
+                      progress?.target_count
+                        ? `Syncing unread mail. ${progress.read_count} emails read and ${progress.processed_count} processed out of ${progress.target_count} in this live batch.`
+                        : progress?.status === "running"
+                          ? "Connecting the live mailbox and preparing the unread working set."
+                        : "Syncing unread mail. Use W, S, the arrow keys, or space while InboxAnchor caches the batch."
+                    }
+                  />
                 </div>
               ) : emailsError ? (
                 <div className="flex items-center justify-center h-full p-5">
-                  <StickmanEmpty message="Failed to load emails. Check your API connection." />
+                  <StickmanEmpty
+                    message={
+                      workspaceError ||
+                      "Failed to load emails. Check your API connection."
+                    }
+                  />
                 </div>
-              ) : filteredEmails.length === 0 ? (
+              ) : totalFiltered === 0 ? (
                 <div className="flex items-center justify-center h-full p-5">
                   <StickmanEmpty
                     message={hasFilters ? "No emails match your filters." : "No emails found."}
@@ -358,7 +412,6 @@ export function InboxWorkspace() {
                 <>
                   <EmailList
                     emails={pagedEmails}
-                    classifications={cls}
                     selectedId={selectedEmailId}
                     onSelect={setSelectedEmailId}
                   />
@@ -368,7 +421,10 @@ export function InboxWorkspace() {
                         size="sm"
                         variant="ghost"
                         disabled={page === 0}
-                        onClick={() => setPage((p) => Math.max(0, p - 1))}
+                        onClick={() => {
+                          setSelectedEmailId(null);
+                          setPage((p) => Math.max(0, p - 1));
+                        }}
                       >
                         <ChevronLeft className="w-3.5 h-3.5" />
                       </Button>
@@ -379,7 +435,10 @@ export function InboxWorkspace() {
                         size="sm"
                         variant="ghost"
                         disabled={page >= totalPages - 1}
-                        onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
+                        onClick={() => {
+                          setSelectedEmailId(null);
+                          setPage((p) => Math.min(totalPages - 1, p + 1));
+                        }}
                       >
                         <ChevronRight className="w-3.5 h-3.5" />
                       </Button>

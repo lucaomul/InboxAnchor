@@ -236,6 +236,7 @@ class ImaplibTransport(EmailProvider):
             subject=subject,
             snippet=(body or subject)[:180],
             body_preview=(body or subject)[:500],
+            body_full=body or subject,
             received_at=received_at,
             labels=normalized_labels,
             has_attachments=has_attachments,
@@ -248,7 +249,7 @@ class ImaplibTransport(EmailProvider):
             raw_message, flags, labels = self._fetch_raw_message(uid)
             email = self._message_to_email(uid, raw_message, flags, labels)
             if not include_body:
-                email = email.model_copy(update={"body_preview": email.snippet})
+                email = email.model_copy(update={"body_preview": email.snippet, "body_full": ""})
             emails.append(email)
         emails.sort(key=lambda item: item.received_at, reverse=True)
         return emails

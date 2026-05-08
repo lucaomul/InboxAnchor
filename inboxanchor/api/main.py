@@ -10,7 +10,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from inboxanchor.api.v1.routers.auth import router as auth_router
-from inboxanchor.api.v1.routers.frontend import router as frontend_router
+from inboxanchor.api.v1.routers.frontend import (
+    mark_frontend_provider_dirty,
+)
+from inboxanchor.api.v1.routers.frontend import (
+    router as frontend_router,
+)
 from inboxanchor.api.v1.routers.oauth import router as oauth_router
 from inboxanchor.api.v1.routers.webhooks import router as webhook_router
 from inboxanchor.bootstrap import InboxAnchorService, list_provider_profiles
@@ -105,6 +110,8 @@ def _cors_origins() -> list[str]:
         "http://127.0.0.1:4173",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
     ]
 
 
@@ -156,8 +163,12 @@ def get_workspace_settings():
 @app.put("/settings/workspace")
 def save_workspace_settings(payload: WorkspaceSettingsRequest):
     service = get_service()
+    current = service.load_workspace_settings()
     settings = WorkspaceSettings.model_validate(payload.model_dump())
     saved = service.save_workspace_settings(settings)
+    for candidate in {current.preferred_provider, saved.preferred_provider}:
+        if candidate:
+            mark_frontend_provider_dirty(candidate)
     return saved.model_dump(mode="json")
 
 
@@ -176,6 +187,7 @@ def save_provider_connection(provider: str, payload: ProviderConnectionRequest):
         **payload.model_dump(),
     )
     saved = service.save_provider_connection(state)
+    mark_frontend_provider_dirty(provider)
     return saved.model_dump(mode="json")
 
 

@@ -16,6 +16,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     create_engine,
 )
 from sqlalchemy.orm import (
@@ -80,6 +81,26 @@ class EmailRecordORM(Base):
     unread: Mapped[bool] = mapped_column(Boolean, default=True)
 
     run: Mapped[TriageRunORM] = relationship(back_populates="emails")
+
+
+class MailboxEmailORM(Base):
+    __tablename__ = "mailbox_emails"
+    __table_args__ = (UniqueConstraint("provider", "email_id", name="uq_mailbox_email"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(String(32), index=True)
+    email_id: Mapped[str] = mapped_column(String(128), index=True)
+    thread_id: Mapped[str] = mapped_column(String(128))
+    sender: Mapped[str] = mapped_column(String(255))
+    subject: Mapped[str] = mapped_column(Text)
+    snippet: Mapped[str] = mapped_column(Text, default="")
+    body_preview: Mapped[str] = mapped_column(Text, default="")
+    body_full: Mapped[str] = mapped_column(Text, default="")
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    labels: Mapped[list[str]] = mapped_column(JSON, default=list)
+    has_attachments: Mapped[bool] = mapped_column(Boolean, default=False)
+    unread: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
 class ClassificationORM(Base):

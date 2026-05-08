@@ -2,6 +2,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState, useCallback } from "react";
 import { toast } from "sonner";
 import {
+  fetchEmailById,
   fetchEmails,
   fetchClassifications,
   fetchRecommendations,
@@ -33,9 +34,32 @@ export function useEmails(params?: FetchEmailsParams) {
   return useQuery({
     queryKey: ["emails", params],
     queryFn: async () => {
-      if (!isApiConfigured()) return { emails: MOCK_EMAILS, total: MOCK_EMAILS.length };
+      if (!isApiConfigured()) {
+        return {
+          emails: MOCK_EMAILS.map((email) => ({
+            ...email,
+            classification: MOCK_CLASSIFICATIONS[email.id],
+          })),
+          total: MOCK_EMAILS.length,
+        };
+      }
       return fetchEmails(params);
     },
+    staleTime: 30_000,
+    placeholderData: (previousData) => previousData,
+  });
+}
+
+export function useEmailDetail(emailId: string | null) {
+  return useQuery({
+    queryKey: ["emailDetail", emailId],
+    queryFn: async () => {
+      if (!emailId || !isApiConfigured()) {
+        return null;
+      }
+      return fetchEmailById(emailId);
+    },
+    enabled: !!emailId && isApiConfigured(),
     staleTime: 30_000,
   });
 }
@@ -51,13 +75,14 @@ export function useClassifications() {
   });
 }
 
-export function useRecommendations() {
+export function useRecommendations(emailId?: string | null, enabled: boolean = true) {
   return useQuery({
-    queryKey: ["recommendations"],
+    queryKey: ["recommendations", emailId || "all"],
     queryFn: async () => {
       if (!isApiConfigured()) return MOCK_RECOMMENDATIONS;
-      return fetchRecommendations();
+      return fetchRecommendations(emailId);
     },
+    enabled,
     staleTime: 30_000,
   });
 }

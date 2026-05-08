@@ -5,6 +5,7 @@ import {
   setAuthSession,
   clearAuthSession,
   exchangeGmailCode,
+  activateGmailWorkspace,
   getGmailAuthUrl,
   getApiUrl,
   fetchCurrentSession,
@@ -81,11 +82,15 @@ export function useAuth() {
     };
   }, []);
 
-  const loginWithGoogleCode = useCallback(async (code: string) => {
-    const res = await exchangeGmailCode(code);
-    setAuthSession(res.access_token, res.email);
-    setState({ authenticated: true, email: res.email, loading: false });
-  }, []);
+  const loginWithGoogleCode = useCallback(
+    async (code: string, state?: string | null, redirectUri?: string) => {
+      const res = await exchangeGmailCode(code, state, redirectUri);
+      setAuthSession(res.access_token, res.email);
+      await activateGmailWorkspace(res.email);
+      setState({ authenticated: true, email: res.email, loading: false });
+    },
+    [],
+  );
 
   const signIn = useCallback(async (email: string, password: string) => {
     const res = await loginWithPassword(email, password);

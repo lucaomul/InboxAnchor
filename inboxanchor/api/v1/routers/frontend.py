@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -22,6 +23,19 @@ router = APIRouter(tags=["frontend-compat"])
 FRONTEND_RUN_CACHE: dict[str, str] = {}
 FRONTEND_SERVICE_CACHE: dict[str, InboxAnchorService] = {}
 FRONTEND_BLOCK_REGISTRY: dict[str, set[str]] = {}
+FRONTEND_FORCE_REFRESH_PROVIDERS: set[str] = set()
+FRONTEND_PROVIDER_ERRORS: dict[str, str] = {}
+FRONTEND_PROGRESS: dict[str, dict] = {}
+FRONTEND_ACTIVE_RUNS: dict[str, "FrontendRunJob"] = {}
+FRONTEND_ACTIVE_RUNS_LOCK = threading.Lock()
+
+
+@dataclass
+class FrontendRunJob:
+    provider_name: str
+    event: threading.Event = field(default_factory=threading.Event)
+    run_id: Optional[str] = None
+    error: Optional[str] = None
 
 
 @dataclass
@@ -84,7 +98,19 @@ def _current_actor_email(authorization: Optional[str]) -> str:
 def _get_provider_name(provider: Optional[str] = None) -> str:
     service = InboxAnchorService()
     settings = service.load_workspace_settings()
-    return (provider or settings.preferred_provider or "fake").lower()
+    if provider:
+        return provider.lower()
+
+    preferred = (settings.preferred_provider or "fake").lower()
+    if preferred != "fake":
+        return preferred
+
+    for candidate in ("gmail", "imap", "yahoo", "outlook"):
+        connection = service.load_provider_connection(candidate)
+        if connection.sync_enabled and connection.status in {"configured", "connected"}:
+            return candidate
+
+    return preferred
 
 
 def _get_workspace_settings() -> WorkspaceSettings:
@@ -99,38 +125,279 @@ def _service_for_provider(provider_name: str) -> InboxAnchorService:
     return service
 
 
+def mark_frontend_provider_dirty(provider_name: str) -> None:
+    FRONTEND_RUN_CACHE.pop(provider_name, None)
+    FRONTEND_SERVICE_CACHE.pop(provider_name, None)
+    FRONTEND_BLOCK_REGISTRY.pop(provider_name, None)
+    FRONTEND_PROVIDER_ERRORS.pop(provider_name, None)
+    FRONTEND_PROGRESS.pop(provider_name, None)
+    FRONTEND_FORCE_REFRESH_PROVIDERS.add(provider_name)
+
+
+def _provider_runtime_error_message(provider_name: str, exc: Exception) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    if "gmail.googleapis.com" in message:
+        return (
+            "Gmail connected, but InboxAnchor could not reach gmail.googleapis.com from the "
+            "backend, so the unread scan never completed. Check the backend machine's "
+            "internet/DNS access, then retry Refresh unread scan."
+        )
+    if provider_name == "gmail":
+        return f"Gmail connected, but InboxAnchor could not fetch unread mail: {message}"
+    if provider_name in {"imap", "yahoo", "outlook"}:
+        return (
+            f"{provider_name.upper()} connected, but InboxAnchor could not fetch unread "
+            f"mail: {message}"
+        )
+    return f"InboxAnchor could not refresh the live mailbox: {message}"
+
+
+def _raise_provider_runtime_error(provider_name: str, exc: Exception) -> None:
+    message = _provider_runtime_error_message(provider_name, exc)
+    FRONTEND_PROVIDER_ERRORS[provider_name] = message
+    raise HTTPException(status_code=502, detail=message) from exc
+
+
+def _update_frontend_progress(provider_name: str, payload: dict) -> None:
+    previous = FRONTEND_PROGRESS.get(provider_name, {})
+    progress = {
+        "provider": provider_name,
+        "status": previous.get("status", "running"),
+        "stage": previous.get("stage", "starting"),
+        "target_count": previous.get("target_count", 0),
+        "processed_count": previous.get("processed_count", 0),
+        "read_count": previous.get("read_count", 0),
+        "action_item_count": previous.get("action_item_count", 0),
+        "recommendation_count": previous.get("recommendation_count", 0),
+        "batch_count": previous.get("batch_count", 0),
+        "latest_subject": previous.get("latest_subject"),
+        "run_id": previous.get("run_id"),
+        "error": previous.get("error"),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if "status" in payload:
+        progress["status"] = payload["status"]
+    if "stage" in payload:
+        progress["stage"] = payload["stage"]
+    if "limit" in payload:
+        progress["target_count"] = payload["limit"]
+    if "processed_emails" in payload:
+        progress["processed_count"] = payload["processed_emails"]
+    if "read_count" in payload:
+        progress["read_count"] = payload["read_count"]
+    if "action_item_count" in payload:
+        progress["action_item_count"] = payload["action_item_count"]
+    if "recommendation_count" in payload:
+        progress["recommendation_count"] = payload["recommendation_count"]
+    if "batch_count" in payload:
+        progress["batch_count"] = payload["batch_count"]
+    if "latest_subject" in payload:
+        progress["latest_subject"] = payload["latest_subject"]
+    if "run_id" in payload:
+        progress["run_id"] = payload["run_id"]
+    if "error" in payload:
+        progress["error"] = payload["error"]
+    FRONTEND_PROGRESS[provider_name] = progress
+    if progress["status"] == "running":
+        STREAM_HUB.emit({"type": "scan_progress", **progress})
+
+
+def _wait_for_frontend_job(job: FrontendRunJob, provider_name: str) -> tuple[str, str]:
+    completed = job.event.wait(timeout=180)
+    if not completed:
+        message = (
+            f"InboxAnchor timed out while preparing the live {provider_name} inbox. "
+            "Retry the unread scan."
+        )
+        FRONTEND_PROVIDER_ERRORS[provider_name] = message
+        _update_frontend_progress(
+            provider_name,
+            {
+                "status": "error",
+                "stage": "timeout",
+                "error": message,
+            },
+        )
+        raise HTTPException(status_code=504, detail=message)
+    if job.error:
+        FRONTEND_PROVIDER_ERRORS[provider_name] = job.error
+        raise HTTPException(status_code=502, detail=job.error)
+    if not job.run_id:
+        raise HTTPException(status_code=500, detail="Frontend run finished without a run id.")
+    FRONTEND_RUN_CACHE[provider_name] = job.run_id
+    return job.run_id, provider_name
+
+
+def _provider_has_live_sync(service: InboxAnchorService, provider_name: str) -> bool:
+    if provider_name == "fake":
+        return False
+    connection = service.load_provider_connection(provider_name)
+    return connection.sync_enabled and connection.status in {"configured", "connected"}
+
+
+def _zero_run_needs_refresh(
+    service: InboxAnchorService,
+    repository: InboxRepository,
+    provider_name: str,
+    run_id: str,
+) -> bool:
+    if not _provider_has_live_sync(service, provider_name):
+        return False
+    if repository.count_run_email_details(run_id) > 0:
+        return False
+    try:
+        unread_probe = service.provider.list_unread(limit=1, include_body=False)
+    except Exception as exc:
+        _raise_provider_runtime_error(provider_name, exc)
+    return len(unread_probe) > 0
+
+
 def _ensure_frontend_run(*, provider: Optional[str] = None, force: bool = False) -> tuple[str, str]:
     provider_name = _get_provider_name(provider)
+    if provider_name in FRONTEND_FORCE_REFRESH_PROVIDERS:
+        force = True
+        FRONTEND_FORCE_REFRESH_PROVIDERS.discard(provider_name)
     service = _service_for_provider(provider_name)
     settings = _get_workspace_settings()
+    latest_run_id: Optional[str] = None
 
     with session_scope() as session:
         repository = InboxRepository(session)
         if not force:
             cached_run_id = FRONTEND_RUN_CACHE.get(provider_name)
             if cached_run_id and repository.get_run(cached_run_id):
-                return cached_run_id, provider_name
+                if _zero_run_needs_refresh(
+                    service,
+                    repository,
+                    provider_name,
+                    cached_run_id,
+                ):
+                    FRONTEND_RUN_CACHE.pop(provider_name, None)
+                else:
+                    return cached_run_id, provider_name
             latest_run_id = repository.get_latest_run_id(provider_name)
             if latest_run_id:
-                FRONTEND_RUN_CACHE[provider_name] = latest_run_id
-                return latest_run_id, provider_name
+                if _zero_run_needs_refresh(service, repository, provider_name, latest_run_id):
+                    latest_run_id = None
+                else:
+                    FRONTEND_RUN_CACHE[provider_name] = latest_run_id
+                    return latest_run_id, provider_name
 
-    result = service.engine.run(
-        dry_run=True,
-        limit=settings.default_scan_limit,
-        batch_size=settings.default_batch_size,
-        confidence_threshold=settings.default_confidence_threshold,
-        email_preview_limit=max(
-            settings.default_email_preview_limit,
-            min(settings.default_scan_limit, 500),
-        ),
-        recommendation_preview_limit=max(
-            settings.default_recommendation_preview_limit,
-            min(settings.default_scan_limit, 750),
-        ),
-        workspace_policy=settings.policy,
+    bootstrap_limit = min(settings.default_scan_limit, 50)
+    bootstrap_batch_size = min(settings.default_batch_size, 50)
+    bootstrap_email_preview_limit = min(max(settings.default_email_preview_limit, 50), 80)
+    bootstrap_recommendation_preview_limit = min(
+        max(settings.default_recommendation_preview_limit, 60),
+        120,
     )
+    initial_load = not force and latest_run_id is None
+
+    wait_job: Optional[FrontendRunJob] = None
+    with FRONTEND_ACTIVE_RUNS_LOCK:
+        active_job = FRONTEND_ACTIVE_RUNS.get(provider_name)
+        if active_job is not None:
+            wait_job = active_job
+        else:
+            job = FrontendRunJob(provider_name=provider_name)
+            FRONTEND_ACTIVE_RUNS[provider_name] = job
+
+    if wait_job is not None:
+        return _wait_for_frontend_job(wait_job, provider_name)
+
+    _update_frontend_progress(
+        provider_name,
+        {
+            "status": "running",
+            "stage": "bootstrapping" if initial_load else "refreshing",
+            "limit": bootstrap_limit if initial_load else settings.default_scan_limit,
+            "processed_emails": 0,
+            "read_count": 0,
+            "action_item_count": 0,
+            "recommendation_count": 0,
+            "batch_count": 0,
+            "run_id": latest_run_id,
+            "error": None,
+        },
+    )
+
+    try:
+        result = service.engine.run(
+            dry_run=True,
+            limit=bootstrap_limit if initial_load else settings.default_scan_limit,
+            batch_size=bootstrap_batch_size if initial_load else settings.default_batch_size,
+            confidence_threshold=settings.default_confidence_threshold,
+            email_preview_limit=(
+                bootstrap_email_preview_limit
+                if initial_load
+                else max(
+                    settings.default_email_preview_limit,
+                    min(settings.default_scan_limit, 500),
+                )
+            ),
+            recommendation_preview_limit=(
+                bootstrap_recommendation_preview_limit
+                if initial_load
+                else max(
+                    settings.default_recommendation_preview_limit,
+                    min(settings.default_scan_limit, 750),
+                )
+            ),
+            workspace_policy=settings.policy,
+            progress_callback=lambda payload: _update_frontend_progress(provider_name, payload),
+        )
+    except HTTPException:
+        job.error = "InboxAnchor could not prepare the live mailbox."
+        job.event.set()
+        with FRONTEND_ACTIVE_RUNS_LOCK:
+            FRONTEND_ACTIVE_RUNS.pop(provider_name, None)
+        raise
+    except Exception as exc:
+        message = _provider_runtime_error_message(provider_name, exc)
+        job.error = message
+        FRONTEND_PROVIDER_ERRORS[provider_name] = message
+        _update_frontend_progress(
+            provider_name,
+            {
+                "status": "error",
+                "stage": "failed",
+                "error": message,
+            },
+        )
+        job.event.set()
+        with FRONTEND_ACTIVE_RUNS_LOCK:
+            FRONTEND_ACTIVE_RUNS.pop(provider_name, None)
+        raise HTTPException(status_code=502, detail=message) from exc
+
     FRONTEND_RUN_CACHE[provider_name] = result.run_id
+    FRONTEND_PROVIDER_ERRORS.pop(provider_name, None)
+    scanned_emails = getattr(
+        result,
+        "scanned_emails",
+        getattr(result, "total_emails", 0),
+    )
+    total_emails = getattr(result, "total_emails", scanned_emails)
+    action_items = getattr(result, "action_items", {})
+    recommendations = getattr(result, "recommendations", [])
+    batch_count = getattr(result, "batch_count", 0)
+    _update_frontend_progress(
+        provider_name,
+        {
+            "status": "complete",
+            "stage": "ready",
+            "limit": scanned_emails,
+            "processed_emails": total_emails,
+            "read_count": scanned_emails,
+            "action_item_count": sum(len(items) for items in action_items.values()),
+            "recommendation_count": len(recommendations),
+            "batch_count": batch_count,
+            "run_id": result.run_id,
+            "error": None,
+        },
+    )
+    job.run_id = result.run_id
+    job.event.set()
+    with FRONTEND_ACTIVE_RUNS_LOCK:
+        FRONTEND_ACTIVE_RUNS.pop(provider_name, None)
     STREAM_HUB.emit(
         {
             "type": "triage_refreshed",
@@ -217,17 +484,22 @@ def _recommended_labels_for_email(detail: dict) -> list[str]:
     return _dedupe_labels(labels)
 
 
-def _frontend_email_payload(detail: dict) -> dict:
+def _frontend_email_payload(detail: dict, mailbox_email: Optional[dict] = None) -> dict:
+    body_preview = detail.get("body_preview", "")
+    body_full = (mailbox_email or {}).get("body_full", body_preview)
     return {
         "id": detail["email_id"],
         "threadId": detail["thread_id"],
         "sender": detail["sender"],
         "subject": detail["subject"],
         "snippet": detail["snippet"],
+        "bodyPreview": body_preview,
+        "bodyFull": body_full,
         "receivedAt": detail["received_at"],
         "labels": detail["labels"],
         "hasAttachments": detail["has_attachments"],
         "unread": detail["unread"],
+        "classification": _frontend_classification_payload(detail),
     }
 
 
@@ -246,6 +518,12 @@ def _load_email_details(run_id: str) -> list[dict]:
         repository = InboxRepository(session)
         total = repository.count_run_email_details(run_id)
         return repository.list_run_email_details(run_id, limit=max(total, 1), offset=0)
+
+
+def _load_mailbox_email_map(provider_name: str, email_ids: list[str]) -> dict[str, dict]:
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        return repository.get_mailbox_email_map(provider_name, email_ids)
 
 
 def _load_recommendation_details(run_id: str) -> list[dict]:
@@ -289,24 +567,29 @@ def _apply_provider_action(
 ) -> dict:
     service = _service_for_provider(provider_name)
     provider = service.provider
-    if labels:
-        provider.apply_labels([email_id], labels, dry_run=False)
+    try:
+        if labels:
+            provider.apply_labels([email_id], labels, dry_run=False)
 
-    final_action = action
-    if action == "mark_read":
-        provider.batch_mark_as_read([email_id], dry_run=False)
-    elif action == "archive":
-        provider.archive_emails([email_id], dry_run=False)
-    elif action == "trash":
-        provider.move_to_trash(
-            [email_id],
-            explicit_confirmation=True,
-            dry_run=False,
-        )
-    elif action in {"label", "flag_urgent", "none", "review"}:
-        final_action = "label" if labels else "reviewed"
-    else:
-        raise HTTPException(status_code=400, detail=f"Unsupported action '{action}'.")
+        final_action = action
+        if action == "mark_read":
+            provider.batch_mark_as_read([email_id], dry_run=False)
+        elif action == "archive":
+            provider.archive_emails([email_id], dry_run=False)
+        elif action == "trash":
+            provider.move_to_trash(
+                [email_id],
+                explicit_confirmation=True,
+                dry_run=False,
+            )
+        elif action in {"label", "flag_urgent", "none", "review"}:
+            final_action = "label" if labels else "reviewed"
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported action '{action}'.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_provider_runtime_error(provider_name, exc)
 
     decision = AutomationDecision(
         email_id=email_id,
@@ -331,22 +614,17 @@ def _apply_provider_action(
 
 def _build_ops_overview(provider_name: str, run_id: str) -> dict:
     settings = _get_workspace_settings()
-    details = _load_email_details(run_id)
-    recommendations = _load_recommendation_details(run_id)
     digest = _load_digest(run_id)
     blocked = FRONTEND_BLOCK_REGISTRY.setdefault(provider_name, set())
     connection = InboxAnchorService().load_provider_connection(provider_name)
-
-    safe_count = sum(1 for item in recommendations if item["status"] == "safe")
-    review_count = sum(1 for item in recommendations if item["status"] == "requires_approval")
-    blocked_count = sum(1 for item in recommendations if item["status"] == "blocked")
-    auto_label_candidates = sum(1 for item in details if _recommended_labels_for_email(item))
-    high_priority_count = sum(
-        1
-        for item in details
-        if item["classification"]["priority"] in {"critical", "high"}
-    )
-    attachment_count = sum(1 for item in details if item["has_attachments"])
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        safe_count = repository.count_run_recommendations_by_status(run_id, "safe")
+        review_count = repository.count_run_recommendations_by_status(run_id, "requires_approval")
+        blocked_count = repository.count_run_recommendations_by_status(run_id, "blocked")
+        auto_label_candidates = repository.count_run_auto_label_candidates(run_id)
+        high_priority_count = repository.count_run_high_priority_emails(run_id)
+        attachment_count = repository.count_run_attachment_emails(run_id)
 
     return {
         "provider": provider_name,
@@ -404,31 +682,47 @@ def frontend_emails(
     category: str = "",
     priority: str = "",
     unread_only: bool = Query(default=False),
-    limit: int = Query(default=20, ge=1, le=500),
+    limit: int = Query(default=25, ge=1, le=250),
     offset: int = Query(default=0, ge=0),
 ):
-    run_id, _ = _ensure_frontend_run()
-    items = _load_email_details(run_id)
+    run_id, provider_name = _ensure_frontend_run()
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        total = repository.count_run_email_details(
+            run_id,
+            priority=priority or None,
+            category=category or None,
+            q=q or None,
+            unread_only=unread_only,
+        )
+        page = repository.list_run_email_details(
+            run_id,
+            limit=limit,
+            offset=offset,
+            priority=priority or None,
+            category=category or None,
+            q=q or None,
+            unread_only=unread_only,
+        )
+    mailbox_map = _load_mailbox_email_map(provider_name, [item["email_id"] for item in page])
+    return {
+        "emails": [
+            _frontend_email_payload(item, mailbox_map.get(item["email_id"]))
+            for item in page
+        ],
+        "total": total,
+    }
 
-    normalized_q = q.strip().lower()
-    if normalized_q:
-        items = [
-            item
-            for item in items
-            if normalized_q in item["subject"].lower()
-            or normalized_q in item["sender"].lower()
-            or normalized_q in item["snippet"].lower()
-        ]
-    if category:
-        items = [item for item in items if item["classification"]["category"] == category]
-    if priority:
-        items = [item for item in items if item["classification"]["priority"] == priority]
-    if unread_only:
-        items = [item for item in items if item["unread"]]
 
-    total = len(items)
-    page = items[offset : offset + limit]
-    return {"emails": [_frontend_email_payload(item) for item in page], "total": total}
+@router.get("/emails/{email_id}")
+def frontend_email(email_id: str):
+    run_id, provider_name = _ensure_frontend_run()
+    with session_scope() as session:
+        detail = InboxRepository(session).get_run_email_detail(run_id, email_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Email not found")
+    mailbox_map = _load_mailbox_email_map(provider_name, [email_id])
+    return _frontend_email_payload(detail, mailbox_map.get(email_id))
 
 
 @router.get("/classifications")
@@ -442,10 +736,15 @@ def frontend_classifications():
 
 
 @router.get("/recommendations")
-def frontend_recommendations():
+def frontend_recommendations(email_id: str = ""):
     run_id, provider_name = _ensure_frontend_run()
     blocked = FRONTEND_BLOCK_REGISTRY.setdefault(provider_name, set())
-    details = _load_recommendation_details(run_id)
+    if email_id:
+        with session_scope() as session:
+            detail = InboxRepository(session).get_run_recommendation_detail(run_id, email_id)
+        details = [detail] if detail else []
+    else:
+        details = _load_recommendation_details(run_id)
     return [
         _frontend_recommendation_payload(item, blocked=item["email_id"] in blocked)
         for item in details
@@ -483,6 +782,29 @@ def frontend_digest():
 def frontend_ops_overview(provider: str = ""):
     run_id, provider_name = _ensure_frontend_run(provider=provider or None)
     return _build_ops_overview(provider_name, run_id)
+
+
+@router.get("/ops/progress")
+def frontend_ops_progress(provider: str = ""):
+    provider_name = _get_provider_name(provider or None)
+    progress = FRONTEND_PROGRESS.get(provider_name)
+    if progress:
+        return progress
+    return {
+        "provider": provider_name,
+        "status": "idle",
+        "stage": "idle",
+        "target_count": 0,
+        "processed_count": 0,
+        "read_count": 0,
+        "action_item_count": 0,
+        "recommendation_count": 0,
+        "batch_count": 0,
+        "latest_subject": None,
+        "run_id": FRONTEND_RUN_CACHE.get(provider_name),
+        "error": FRONTEND_PROVIDER_ERRORS.get(provider_name),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @router.post("/ops/scan")

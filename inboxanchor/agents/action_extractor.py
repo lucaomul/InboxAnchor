@@ -6,7 +6,8 @@ from typing import Optional
 from inboxanchor.agents._llm_utils import parse_json_content
 from inboxanchor.infra.llm_client import LLMClient
 from inboxanchor.infra.llm_providers import build_llm_client
-from inboxanchor.models import EmailActionItem, EmailMessage
+from inboxanchor.models import EmailActionItem, EmailClassification, EmailMessage
+from inboxanchor.models.email import EmailCategory
 
 ACTION_EXTRACTOR_SYSTEM_PROMPT = """
 You are an email action extractor.
@@ -38,10 +39,20 @@ class ActionExtractorAgent:
     def __init__(self, llm_client: Optional[LLMClient] = None):
         self.llm_client = llm_client or build_llm_client()
 
-    def extract(self, email: EmailMessage) -> list[EmailActionItem]:
-        preview = email.body_preview.strip()
+    def extract(
+        self,
+        email: EmailMessage,
+        *,
+        classification: Optional[EmailClassification] = None,
+    ) -> list[EmailActionItem]:
+        preview = email.content_for_processing().strip()
         heuristic_items = self._heuristic_extract(email)
-        if len(preview) < 50:
+        if not self._should_use_llm(
+            email,
+            heuristic_items,
+            classification=classification,
+            preview_length=len(preview),
+        ):
             return heuristic_items
 
         llm_result = self.llm_client.complete(
@@ -74,17 +85,61 @@ class ActionExtractorAgent:
 
         return items if items else heuristic_items
 
+    def _should_use_llm(
+        self,
+        email: EmailMessage,
+        heuristic_items: list[EmailActionItem],
+        *,
+        classification: Optional[EmailClassification],
+        preview_length: int,
+    ) -> bool:
+        if preview_length < 80:
+            return False
+        if self._looks_automated(email):
+            return False
+
+        category = classification.category if classification else None
+        if category in {
+            EmailCategory.newsletter,
+            EmailCategory.promo,
+            EmailCategory.spam_like,
+            EmailCategory.low_priority,
+        }:
+            return False
+        if category == EmailCategory.finance and not email.has_attachments:
+            return False
+
+        if classification and classification.confidence >= 0.9 and len(heuristic_items) <= 1:
+            return False
+
+        if not heuristic_items:
+            return bool(email.has_attachments or preview_length > 240)
+
+        if len(heuristic_items) >= 2:
+            return True
+
+        action = heuristic_items[0].action_type
+        if action in {"meeting_scheduling", "document_review", "deadline", "follow_up"}:
+            return bool(email.has_attachments or preview_length > 90)
+
+        if action == "reply_needed":
+            return preview_length > 180 or email.has_attachments
+
+        return False
+
     def _build_prompt(self, email: EmailMessage) -> str:
+        full_body = email.content_for_processing(max_chars=4000)
         return (
             "Extract follow-up actions from this email.\n"
             f"Sender: {email.sender}\n"
             f"Subject: {email.subject}\n"
             f"Snippet: {email.snippet}\n"
             f"Body preview: {email.body_preview}\n"
+            f"Body full: {full_body}\n"
         )
 
     def _heuristic_extract(self, email: EmailMessage) -> list[EmailActionItem]:
-        text = f"{email.subject}\n{email.snippet}\n{email.body_preview}".lower()
+        text = f"{email.subject}\n{email.snippet}\n{email.content_for_processing()}".lower()
         items: list[EmailActionItem] = []
 
         if any(token in text for token in ["reply", "respond", "let me know"]):
@@ -140,3 +195,23 @@ class ActionExtractorAgent:
                 )
             )
         return items
+
+    def _looks_automated(self, email: EmailMessage) -> bool:
+        sender = email.sender.lower()
+        subject = email.subject.lower()
+        snippet = email.snippet.lower()
+        return any(
+            token in f"{sender}\n{subject}\n{snippet}"
+            for token in [
+                "noreply",
+                "no-reply",
+                "do-not-reply",
+                "unsubscribe",
+                "digest",
+                "newsletter",
+                "notification",
+                "alert",
+                "sale",
+                "promo",
+            ]
+        )

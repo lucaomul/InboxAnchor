@@ -1,3 +1,11 @@
+import { StickmanInboxRunner } from "@/components/StickmanInboxRunner";
+import { useLoaderMode } from "@/hooks/use-loader-mode";
+
+type LoaderStat = {
+  label: string;
+  value: string | number;
+};
+
 // Animated stickmen SVG characters for loading states and visual accents
 
 function WalkCycle({ className = "" }: { className?: string }) {
@@ -113,7 +121,86 @@ function Celebrating({ className = "" }: { className?: string }) {
 }
 
 // Loading screen with mail carrier stickman
-export function StickmanLoader({ message = "Loading your inbox..." }: { message?: string }) {
+export function StickmanLoader({
+  message = "Loading your inbox...",
+  playful = false,
+  stage,
+  stats = [],
+}: {
+  message?: string;
+  playful?: boolean;
+  stage?: string;
+  stats?: LoaderStat[];
+}) {
+  const { mode, setMode, isFunMode } = useLoaderMode();
+
+  if (playful) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-3 py-6 text-muted-foreground">
+        <div className="flex items-center gap-2 rounded-full border border-border bg-card/70 p-1">
+          <button
+            type="button"
+            onClick={() => setMode("fun")}
+            className={`rounded-full px-3 py-1 text-[10px] font-medium uppercase tracking-[0.18em] transition-colors ${
+              mode === "fun"
+                ? "bg-primary text-primary-foreground"
+                : "text-muted-foreground hover:bg-secondary hover:text-foreground"
+            }`}
+          >
+            Fun Mode
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode("serious")}
+            className={`rounded-full px-3 py-1 text-[10px] font-medium uppercase tracking-[0.18em] transition-colors ${
+              mode === "serious"
+                ? "bg-primary text-primary-foreground"
+                : "text-muted-foreground hover:bg-secondary hover:text-foreground"
+            }`}
+          >
+            Serious Mode
+          </button>
+        </div>
+        {isFunMode ? (
+          <StickmanInboxRunner />
+        ) : (
+          <div className="flex w-full max-w-[360px] flex-col items-center gap-4 rounded-2xl border border-border bg-background/80 p-6 shadow-sm">
+            <div className="h-12 w-12 animate-spin rounded-full border-4 border-border border-t-primary" />
+            <div className="space-y-1 text-center">
+              <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+                Serious loading
+              </p>
+              <p className="text-sm text-foreground">
+                InboxAnchor is reading and triaging the mailbox.
+              </p>
+            </div>
+          </div>
+        )}
+        <div className="max-w-lg space-y-3 text-center">
+          {stage ? (
+            <p className="text-[11px] uppercase tracking-[0.18em] text-primary/80">{stage}</p>
+          ) : null}
+          <p className="text-sm leading-6 text-muted-foreground">{message}</p>
+          {stats.length > 0 ? (
+            <div className="grid grid-cols-2 gap-2 text-left sm:grid-cols-4">
+              {stats.map((stat) => (
+                <div
+                  key={stat.label}
+                  className="rounded-xl border border-border bg-card/70 px-3 py-2"
+                >
+                  <p className="text-lg font-semibold text-foreground">{stat.value}</p>
+                  <p className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
+                    {stat.label}
+                  </p>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col items-center justify-center gap-4 py-12 text-muted-foreground">
       <MailCarrier className="text-primary" />
