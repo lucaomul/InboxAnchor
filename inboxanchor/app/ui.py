@@ -28,8 +28,8 @@ def inject_styles() -> None:
         }
         .block-container {
             max-width: 1280px;
-            padding-top: 1.8rem;
-            padding-bottom: 2.4rem;
+            padding-top: 1.45rem;
+            padding-bottom: 2rem;
         }
         div[data-testid="stHorizontalBlock"] {
             align-items: stretch;
@@ -159,8 +159,24 @@ def inject_styles() -> None:
             background: rgba(248,250,252,0.74);
             border: 1px solid rgba(148,163,184,0.18);
             border-radius: 18px;
-            padding: 1rem 1rem 0.35rem 1rem;
+            padding: 0.95rem 1rem 0.7rem 1rem;
             overflow: hidden;
+        }
+        div[data-testid="stForm"] [data-testid="stTextInputRootElement"] {
+            margin-bottom: 0.25rem;
+        }
+        div[data-testid="stForm"] .stTextInput {
+            margin-bottom: 0.28rem;
+        }
+        div[data-testid="stForm"] [data-testid="stCaptionContainer"] {
+            margin-top: 0.15rem;
+            margin-bottom: 0.55rem;
+        }
+        div[data-testid="stForm"] [data-testid="stFormSubmitButton"] {
+            margin-top: 0.1rem;
+        }
+        input[type="password"] {
+            letter-spacing: normal;
         }
         div[data-testid="stExpander"] {
             border-radius: 18px;
@@ -212,6 +228,9 @@ def inject_styles() -> None:
             flex-wrap: nowrap;
             padding-bottom: 0.1rem;
         }
+        div[data-testid="stTabs"] > div:first-child {
+            margin-bottom: 0.3rem;
+        }
         div[data-testid="stTabs"] button[aria-selected="true"] {
             background: rgba(37,99,235,0.12);
             color: #1d4ed8;
@@ -232,7 +251,7 @@ def inject_styles() -> None:
             padding: 1.55rem 1.65rem 1.4rem 1.65rem;
             border-radius: 26px;
             box-shadow: 0 22px 46px rgba(15, 23, 42, 0.18);
-            margin-bottom: 1.1rem;
+            margin-bottom: 0.8rem;
             position: relative;
             overflow: hidden;
         }
@@ -264,13 +283,13 @@ def inject_styles() -> None:
             border-radius: 22px;
             padding: 1rem 1.1rem 1.1rem 1.1rem;
             box-shadow: 0 14px 34px rgba(15, 23, 42, 0.08);
-            margin-bottom: 1rem;
+            margin-bottom: 0.65rem;
         }
         .ia-section-note {
             color: #64748b;
             font-size: 0.88rem;
             line-height: 1.5;
-            margin: -0.2rem 0 0.7rem 0;
+            margin: -0.05rem 0 0.45rem 0;
         }
         .ia-chip {
             display: inline-flex;

@@ -1,3 +1,4 @@
+from inboxanchor.models.auth import AccountUser, AuthSession
 from inboxanchor.models.email import (
     AuditLogEntry,
     AutomationDecision,
@@ -16,7 +17,9 @@ from inboxanchor.models.policy import WorkspacePolicy, WorkspaceSettings
 from inboxanchor.models.provider import ProviderConnectionState, ProviderProfile
 
 __all__ = [
+    "AccountUser",
     "AuditLogEntry",
+    "AuthSession",
     "AutomationDecision",
     "EmailActionItem",
     "EmailClassification",

@@ -19,8 +19,9 @@ from inboxanchor.app.ui import (
     render_operator_stage,
     render_pill_row,
 )
+from inboxanchor.infra.auth import AuthError, AuthService
 from inboxanchor.infra.database import AuditLogORM, TriageRunORM, session_scope
-from inboxanchor.models import TriageRunResult
+from inboxanchor.models import AccountUser, TriageRunResult
 from inboxanchor.models.email import EmailRecommendation, RecommendationStatus
 
 CONNECTION_STATUS_OPTIONS = [
@@ -338,6 +339,205 @@ def _load_dashboard_data() -> tuple[list[dict], list]:
                 session.query(AuditLogORM).order_by(AuditLogORM.timestamp.desc()).limit(10).all()
             )
     return runs, audit_entries
+
+
+def _set_authenticated_session(token: str, user: AccountUser) -> None:
+    st.session_state.auth_token = token
+    st.session_state.auth_user = user.model_dump(mode="json")
+    st.session_state.demo_access = False
+
+
+def _clear_authenticated_session() -> None:
+    st.session_state.pop("auth_token", None)
+    st.session_state.pop("auth_user", None)
+
+
+def _current_account_user() -> Optional[AccountUser]:
+    token = st.session_state.get("auth_token")
+    if not token:
+        _clear_authenticated_session()
+        return None
+
+    cached_user = st.session_state.get("auth_user")
+    if cached_user:
+        try:
+            return AccountUser.model_validate(cached_user)
+        except Exception:
+            st.session_state.pop("auth_user", None)
+
+    with session_scope() as session:
+        auth_session = AuthService(session).get_session(token)
+
+    if auth_session is None:
+        _clear_authenticated_session()
+        return None
+
+    st.session_state.auth_user = auth_session.user.model_dump(mode="json")
+    return auth_session.user
+
+
+def _login_account(email: str, password: str) -> tuple[bool, str]:
+    try:
+        with session_scope() as session:
+            auth_session = AuthService(session).authenticate(email=email, password=password)
+        _set_authenticated_session(auth_session.token, auth_session.user)
+        return True, "Signed in successfully."
+    except AuthError as error:
+        return False, error.message
+
+
+def _signup_account(full_name: str, email: str, password: str) -> tuple[bool, str]:
+    try:
+        with session_scope() as session:
+            auth_session = AuthService(session).register_user(
+                full_name=full_name,
+                email=email,
+                password=password,
+            )
+        _set_authenticated_session(auth_session.token, auth_session.user)
+        return True, "Account created successfully."
+    except AuthError as error:
+        return False, error.message
+
+
+def _logout_account() -> None:
+    token = st.session_state.get("auth_token")
+    if token:
+        with session_scope() as session:
+            AuthService(session).logout(token)
+    _clear_authenticated_session()
+
+
+def _render_auth_gate() -> bool:
+    account_user = _current_account_user()
+    if account_user is not None or st.session_state.get("demo_access", False):
+        return True
+
+    intro_col, auth_col = st.columns([1.04, 0.96], gap="medium")
+    with intro_col:
+        st.markdown(
+            "\n".join(
+                [
+                    '<div class="ia-hero">',
+                    (
+                        "<div "
+                        'style="font-size:0.8rem;letter-spacing:0.2em;'
+                        'text-transform:uppercase;opacity:0.78;">InboxAnchor</div>'
+                    ),
+                    (
+                        '<h1 style="margin:0.25rem 0 0.42rem 0;">'
+                        "Turn inbox overload into a real operations workflow</h1>"
+                    ),
+                    (
+                        '<p style="margin:0;max-width:760px;font-size:1rem;'
+                        'line-height:1.58;opacity:0.94;">'
+                        "Classify, prioritize, and clean up email safely with human approval, "
+                        "audit trails, and provider-ready infrastructure."
+                        "</p>"
+                    ),
+                    (
+                        '<div style="margin-top:0.95rem;">'
+                        '<span class="ia-chip ia-chip-dark">Account-aware</span>'
+                        '<span class="ia-chip ia-chip-dark">Human approval</span>'
+                        '<span class="ia-chip ia-chip-dark">Audit trail</span>'
+                        '<span class="ia-chip ia-chip-dark">Demo ready</span>'
+                        "</div>"
+                    ),
+                    "</div>",
+                ]
+            ),
+            unsafe_allow_html=True,
+        )
+        render_metric_bar(
+            [
+                {"label": "Workspace", "value": "Private", "note": "Sign in to continue"},
+                {"label": "Providers", "value": 5, "note": "Fake, Gmail, IMAP, Yahoo, Outlook"},
+                {"label": "Safety", "value": "On", "note": "Approval-first workflow"},
+                {"label": "Mode", "value": "Demo", "note": "Guest path still available"},
+            ]
+        )
+    with auth_col:
+        with st.container(border=True):
+            st.markdown("#### Account Access")
+            st.caption(
+                "Use a real workspace account for a platform-style experience, or keep "
+                "exploring in demo mode while the SaaS layer grows."
+            )
+            login_tab, signup_tab, demo_tab = st.tabs(["Log In", "Sign Up", "Demo Mode"])
+            with login_tab:
+                with st.form("login_form"):
+                    email = st.text_input(
+                        "Email",
+                        placeholder="name@company.com",
+                    )
+                    password = st.text_input(
+                        "Password",
+                        type="password",
+                        placeholder="Enter your password",
+                    )
+                    st.caption("Secure sign-in for your private InboxAnchor workspace.")
+                    submitted = st.form_submit_button("Log in", use_container_width=True)
+                if submitted:
+                    ok, message = _login_account(email, password)
+                    if ok:
+                        st.success(message)
+                        st.rerun()
+                    st.error(message)
+
+            with signup_tab:
+                with st.form("signup_form"):
+                    identity_col1, identity_col2 = st.columns(2, gap="medium")
+                    with identity_col1:
+                        full_name = st.text_input(
+                            "Full name",
+                            placeholder="Luca Craciun",
+                        )
+                    with identity_col2:
+                        email = st.text_input(
+                            "Email",
+                            placeholder="name@company.com",
+                        )
+                    st.markdown("##### Credentials")
+                    password = st.text_input(
+                        "Password",
+                        type="password",
+                        placeholder="Minimum 8 characters",
+                    )
+                    password_confirm = st.text_input(
+                        "Confirm password",
+                        type="password",
+                        placeholder="Repeat password",
+                    )
+                    st.caption(
+                        "Use a real email and a strong password. Passwords are hashed locally "
+                        "before they are stored."
+                    )
+                    submitted = st.form_submit_button("Create account", use_container_width=True)
+                if submitted:
+                    if password != password_confirm:
+                        st.error("Passwords do not match.")
+                    else:
+                        ok, message = _signup_account(full_name, email, password)
+                        if ok:
+                            st.success(message)
+                            st.rerun()
+                        else:
+                            st.error(message)
+
+            with demo_tab:
+                render_callout(
+                    "Guest preview",
+                    (
+                        "Demo mode keeps InboxAnchor fully explorable with seeded mailbox data. "
+                        "You can come back and create an account whenever you want the full "
+                        "platform-style flow."
+                    ),
+                    tone="info",
+                )
+                if st.button("Continue as demo guest", type="primary", use_container_width=True):
+                    st.session_state.demo_access = True
+                    st.rerun()
+    return False
 
 
 def _render_provider_profile(provider_name: str, service: Any) -> None:
@@ -674,6 +874,8 @@ def _crew_status(result: Optional[TriageRunResult]) -> tuple[str, str]:
 
 
 def _hero(result: Optional[TriageRunResult], service: Any) -> None:
+    account_user = _current_account_user()
+    demo_access = st.session_state.get("demo_access", False)
     if result is None:
         highlights = [
             ("Safe-by-default", "chip"),
@@ -699,31 +901,73 @@ def _hero(result: Optional[TriageRunResult], service: Any) -> None:
     chips = "".join(
         f'<span class="ia-chip ia-chip-dark">{label}</span>' for label, _ in highlights
     )
-    st.markdown(
-        "\n".join(
-            [
-                '<div class="ia-hero">',
-                (
-                    "<div "
-                    'style="font-size:0.8rem;letter-spacing:0.2em;'
-                    'text-transform:uppercase;opacity:0.78;">InboxAnchor</div>'
-                ),
-                (
-                    '<h1 style="margin:0.25rem 0 0.42rem 0;">'
-                    "The safe inbox operations workspace</h1>"
-                ),
-                (
-                    '<p style="margin:0;max-width:820px;font-size:1rem;'
-                    'line-height:1.58;opacity:0.94;">'
-                ),
-                subtitle,
-                "</p>",
-                f'<div style="margin-top:0.95rem;">{chips}</div>',
-                "</div>",
-            ]
-        ),
-        unsafe_allow_html=True,
-    )
+    hero_col, account_col = st.columns([1.06, 0.54], gap="medium")
+    with hero_col:
+        st.markdown(
+            "\n".join(
+                [
+                    '<div class="ia-hero">',
+                    (
+                        "<div "
+                        'style="font-size:0.8rem;letter-spacing:0.2em;'
+                        'text-transform:uppercase;opacity:0.78;">InboxAnchor</div>'
+                    ),
+                    (
+                        '<h1 style="margin:0.25rem 0 0.42rem 0;">'
+                        "The safe inbox operations workspace</h1>"
+                    ),
+                    (
+                        '<p style="margin:0;max-width:820px;font-size:1rem;'
+                        'line-height:1.58;opacity:0.94;">'
+                    ),
+                    subtitle,
+                    "</p>",
+                    f'<div style="margin-top:0.95rem;">{chips}</div>',
+                    "</div>",
+                ]
+            ),
+            unsafe_allow_html=True,
+        )
+    with account_col:
+        with st.container(border=True):
+            if account_user is not None:
+                st.markdown("#### Account")
+                render_pill_row([("signed in", "safe"), (account_user.plan, "chip")])
+                st.write(account_user.full_name)
+                st.caption(account_user.email)
+                if st.button("Log out", use_container_width=True):
+                    _logout_account()
+                    st.rerun()
+            elif demo_access:
+                st.markdown("#### Demo Guest")
+                render_pill_row([("demo mode", "review"), ("not saved", "chip")])
+                st.caption(
+                    "You are exploring InboxAnchor without an account. Create one when "
+                    "you want the full platform-style flow."
+                )
+                action_col1, action_col2 = st.columns(2, gap="small")
+                with action_col1:
+                    if st.button("Log In", use_container_width=True):
+                        st.session_state.demo_access = False
+                        st.session_state.auth_view = "login"
+                        st.rerun()
+                with action_col2:
+                    if st.button("Sign Up", use_container_width=True):
+                        st.session_state.demo_access = False
+                        st.session_state.auth_view = "signup"
+                        st.rerun()
+            else:
+                st.markdown("#### Workspace Access")
+                render_pill_row(
+                    [
+                        ("authentication required", "review"),
+                        ("private workspace", "chip"),
+                    ]
+                )
+                st.caption(
+                    "Create an account or sign in from the panel below to unlock a persistent "
+                    "workspace experience."
+                )
 
 
 def _metric_snapshot(result: Optional[TriageRunResult], service: Any) -> None:
@@ -1508,6 +1752,8 @@ def main() -> None:
         initial_sidebar_state="collapsed",
     )
     inject_styles()
+    if not _render_auth_gate():
+        return
     service = _service()
     current_result = st.session_state.get("result")
     _hero(current_result, service)

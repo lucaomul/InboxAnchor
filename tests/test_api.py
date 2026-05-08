@@ -5,6 +5,7 @@ from typing import Optional
 from fastapi.testclient import TestClient
 
 import inboxanchor.api.main as api_main
+import inboxanchor.api.v1.routers.oauth as oauth_router
 from inboxanchor.api.main import app
 
 client = TestClient(app)
@@ -15,6 +16,62 @@ def test_api_health():
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+
+
+def test_auth_signup_login_me_and_logout_flow():
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "full_name": "Luca Craciun",
+            "email": "luca@example.com",
+            "password": "super-secret-pass",
+        },
+    )
+
+    assert signup.status_code == 200
+    token = signup.json()["token"]
+    me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert me.status_code == 200
+    assert me.json()["authenticated"] is True
+    assert me.json()["user"]["email"] == "luca@example.com"
+
+    logout = client.post("/auth/logout", headers={"Authorization": f"Bearer {token}"})
+    assert logout.status_code == 200
+    assert logout.json()["ok"] is True
+
+    post_logout = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert post_logout.status_code == 200
+    assert post_logout.json()["authenticated"] is False
+
+    login = client.post(
+        "/auth/login",
+        json={"email": "luca@example.com", "password": "super-secret-pass"},
+    )
+    assert login.status_code == 200
+    assert login.json()["user"]["full_name"] == "Luca Craciun"
+
+
+def test_auth_signup_rejects_duplicate_email():
+    first = client.post(
+        "/auth/signup",
+        json={
+            "full_name": "Luca Craciun",
+            "email": "luca@example.com",
+            "password": "super-secret-pass",
+        },
+    )
+    duplicate = client.post(
+        "/auth/signup",
+        json={
+            "full_name": "Luca Craciun",
+            "email": "luca@example.com",
+            "password": "super-secret-pass",
+        },
+    )
+
+    assert first.status_code == 200
+    assert duplicate.status_code == 409
+    assert duplicate.json()["error"] is True
 
 
 def test_providers_endpoint_exposes_provider_profiles():
@@ -232,3 +289,41 @@ def test_gmail_webhook_route_accepts_pubsub_payload():
     payload = response.json()
     assert payload["accepted"] is True
     assert payload["notification"]["history_id"] == "12345"
+
+
+def test_gmail_oauth_start_returns_authorization_url(monkeypatch, tmp_path):
+    credentials_path = tmp_path / "credentials.json"
+    credentials_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(oauth_router.SETTINGS, "gmail_credentials_path", str(credentials_path))
+    monkeypatch.setattr(
+        oauth_router,
+        "build_authorization_url",
+        lambda *args, **kwargs: ("https://accounts.google.com/test-auth", "state-123"),
+    )
+
+    response = client.get("/oauth/gmail/start")
+
+    assert response.status_code == 200
+    assert response.json()["auth_url"] == "https://accounts.google.com/test-auth"
+
+
+def test_gmail_oauth_callback_updates_provider_state(monkeypatch, tmp_path):
+    credentials_path = tmp_path / "credentials.json"
+    token_path = tmp_path / "token.json"
+    credentials_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(oauth_router.SETTINGS, "gmail_credentials_path", str(credentials_path))
+    monkeypatch.setattr(oauth_router.SETTINGS, "gmail_token_path", str(token_path))
+    monkeypatch.setattr(
+        oauth_router,
+        "exchange_code_for_token",
+        lambda *args, **kwargs: object(),
+    )
+
+    response = client.get("/oauth/gmail/callback", params={"code": "demo-code", "state": "demo"})
+    connection = client.get("/providers/gmail/connection")
+
+    assert response.status_code == 200
+    assert "Gmail connected successfully" in response.text
+    assert connection.status_code == 200
+    assert connection.json()["status"] == "connected"
+    assert connection.json()["sync_enabled"] is True

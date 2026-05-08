@@ -1,6 +1,6 @@
 # InboxAnchor Productionization Prompt
 
-Use this prompt when you want Codex to continue the productionization of InboxAnchor without fighting the current architecture.
+Use this prompt when you want to continue the productionization of InboxAnchor without fighting the current architecture.
 
 ```text
 You are a senior Python backend engineer helping me productionize InboxAnchor.

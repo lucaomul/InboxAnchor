@@ -7,6 +7,8 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from inboxanchor.api.v1.routers.auth import router as auth_router
+from inboxanchor.api.v1.routers.oauth import router as oauth_router
 from inboxanchor.api.v1.routers.webhooks import router as webhook_router
 from inboxanchor.bootstrap import InboxAnchorService, list_provider_profiles
 from inboxanchor.infra.database import session_scope
@@ -64,6 +66,8 @@ def get_service() -> InboxAnchorService:
 
 
 app = FastAPI(title="InboxAnchor", version="0.1.0")
+app.include_router(auth_router)
+app.include_router(oauth_router)
 app.include_router(webhook_router)
 
 

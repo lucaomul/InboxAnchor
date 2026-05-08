@@ -30,6 +30,10 @@ class Settings:
     default_provider: str = os.getenv("INBOXANCHOR_DEFAULT_PROVIDER", "fake")
     dry_run_default: bool = _as_bool(os.getenv("INBOXANCHOR_DRY_RUN"), True)
     llm_provider: str = os.getenv("INBOXANCHOR_LLM_PROVIDER", "mock")
+    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
+    groq_api_key: str = os.getenv("GROQ_API_KEY", "")
+    openai_model: str = os.getenv("INBOXANCHOR_OPENAI_MODEL", "gpt-4o-mini")
+    groq_model: str = os.getenv("INBOXANCHOR_GROQ_MODEL", "llama-3.1-8b-instant")
     llm_timeout_seconds: int = int(os.getenv("INBOXANCHOR_LLM_TIMEOUT_SECONDS", "30"))
     llm_retry_attempts: int = int(os.getenv("INBOXANCHOR_LLM_RETRY_ATTEMPTS", "3"))
     llm_retry_base_delay_seconds: float = float(
@@ -38,6 +42,7 @@ class Settings:
     llm_retry_max_delay_seconds: float = float(
         os.getenv("INBOXANCHOR_LLM_RETRY_MAX_DELAY_SECONDS", "30.0")
     )
+    session_ttl_days: int = int(os.getenv("INBOXANCHOR_SESSION_TTL_DAYS", "30"))
     gmail_credentials_path: str = os.getenv("GMAIL_CREDENTIALS_PATH", "")
     gmail_token_path: str = os.getenv("GMAIL_TOKEN_PATH", "")
     gmail_client_id: str = os.getenv("GMAIL_CLIENT_ID", "")
