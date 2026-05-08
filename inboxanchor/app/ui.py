@@ -162,6 +162,24 @@ def inject_styles() -> None:
             padding: 0.95rem 1rem 0.7rem 1rem;
             overflow: hidden;
         }
+        div[data-testid="stRadio"] {
+            margin: 0.15rem 0 0.65rem 0;
+        }
+        div[data-testid="stRadio"] > div {
+            gap: 0.65rem;
+        }
+        div[data-testid="stRadio"] label {
+            background: rgba(255,255,255,0.95);
+            border: 1px solid rgba(148,163,184,0.2);
+            border-radius: 999px;
+            padding: 0.45rem 0.85rem;
+            min-height: auto !important;
+        }
+        div[data-testid="stRadio"] label p,
+        div[data-testid="stRadio"] label span {
+            color: #0f172a !important;
+            font-weight: 700;
+        }
         div[data-testid="stForm"] [data-testid="stTextInputRootElement"] {
             margin-bottom: 0.25rem;
         }

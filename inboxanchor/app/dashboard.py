@@ -32,6 +32,112 @@ CONNECTION_STATUS_OPTIONS = [
     "needs_attention",
 ]
 
+WORKSPACE_PLAYBOOKS = {
+    "balanced": {
+        "label": "Balanced Triage",
+        "summary": "Conservative daily workflow with strong review gates and moderate scan depth.",
+        "pills": ["safe default", "daily triage", "audit-first"],
+        "settings": {
+            "preferred_provider": "fake",
+            "dry_run_default": True,
+            "default_scan_limit": 500,
+            "default_batch_size": 250,
+            "default_confidence_threshold": 0.65,
+            "default_email_preview_limit": 120,
+            "default_recommendation_preview_limit": 180,
+            "follow_up_radar_enabled": True,
+            "follow_up_after_hours": 24,
+            "follow_up_priority_floor": "medium",
+            "operator_mode": "safe",
+        },
+        "policy": {},
+    },
+    "inbox_zero": {
+        "label": "Inbox Zero Sweep",
+        "summary": (
+            "Aggressive cleanup for newsletters, promos, and low-priority backlog "
+            "without removing human approval."
+        ),
+        "pills": ["cleanup", "bulk triage", "noise reduction"],
+        "settings": {
+            "preferred_provider": "fake",
+            "dry_run_default": True,
+            "default_scan_limit": 2000,
+            "default_batch_size": 500,
+            "default_confidence_threshold": 0.6,
+            "default_email_preview_limit": 100,
+            "default_recommendation_preview_limit": 260,
+            "follow_up_radar_enabled": True,
+            "follow_up_after_hours": 48,
+            "follow_up_priority_floor": "high",
+            "operator_mode": "balanced",
+        },
+        "policy": {
+            "allow_newsletter_mark_read": True,
+            "newsletter_confidence_threshold": 0.85,
+            "allow_promo_archive": True,
+            "promo_archive_age_days": 10,
+            "allow_low_priority_cleanup": True,
+            "low_priority_age_days": 5,
+            "allow_spam_trash_recommendations": True,
+        },
+    },
+    "founder_radar": {
+        "label": "Founder Radar",
+        "summary": (
+            "Protect sensitive, finance, and high-priority threads while keeping "
+            "the scan shallow and decisive."
+        ),
+        "pills": ["sensitive first", "exec view", "high confidence"],
+        "settings": {
+            "preferred_provider": "fake",
+            "dry_run_default": True,
+            "default_scan_limit": 350,
+            "default_batch_size": 250,
+            "default_confidence_threshold": 0.75,
+            "default_email_preview_limit": 140,
+            "default_recommendation_preview_limit": 160,
+            "follow_up_radar_enabled": True,
+            "follow_up_after_hours": 18,
+            "follow_up_priority_floor": "medium",
+            "operator_mode": "safe",
+        },
+        "policy": {
+            "allow_low_priority_cleanup": False,
+            "require_review_for_finance": True,
+            "require_review_for_personal": True,
+            "require_review_for_attachments": True,
+        },
+    },
+    "sales_follow_up": {
+        "label": "Sales Follow-Up",
+        "summary": (
+            "Prioritize replies, opportunities, and follow-up-ready drafts before "
+            "broad cleanup work."
+        ),
+        "pills": ["reply queue", "opportunities", "follow-up"],
+        "settings": {
+            "preferred_provider": "fake",
+            "dry_run_default": True,
+            "default_scan_limit": 750,
+            "default_batch_size": 500,
+            "default_confidence_threshold": 0.6,
+            "default_email_preview_limit": 160,
+            "default_recommendation_preview_limit": 220,
+            "follow_up_radar_enabled": True,
+            "follow_up_after_hours": 12,
+            "follow_up_priority_floor": "medium",
+            "operator_mode": "balanced",
+        },
+        "policy": {
+            "allow_promo_archive": False,
+            "allow_low_priority_cleanup": False,
+            "require_review_for_finance": True,
+            "require_review_for_personal": True,
+        },
+    },
+}
+
 
 def _fallback_provider_profile(provider_name: Optional[str]):
     profiles = {
@@ -124,6 +230,14 @@ def _provider_profile(provider_name: Optional[str]):
     return _fallback_provider_profile(provider_name)
 
 
+def _playbook_choices() -> list[str]:
+    return list(WORKSPACE_PLAYBOOKS)
+
+
+def _playbook_definition(slug: str) -> dict[str, Any]:
+    return WORKSPACE_PLAYBOOKS.get(slug, WORKSPACE_PLAYBOOKS["balanced"])
+
+
 def _service_class():
     service_cls = getattr(bootstrap_module, "InboxAnchorService", None)
     if service_cls is None:
@@ -156,6 +270,9 @@ def _workspace_settings(service: Any):
             default_confidence_threshold=0.65,
             default_email_preview_limit=120,
             default_recommendation_preview_limit=180,
+            follow_up_radar_enabled=True,
+            follow_up_after_hours=24,
+            follow_up_priority_floor="medium",
             onboarding_completed=False,
             operator_mode="safe",
             policy=SimpleNamespace(
@@ -203,6 +320,9 @@ def _copy_settings(settings: Any, update: dict[str, Any]):
         "default_recommendation_preview_limit": getattr(
             settings, "default_recommendation_preview_limit", 180
         ),
+        "follow_up_radar_enabled": getattr(settings, "follow_up_radar_enabled", True),
+        "follow_up_after_hours": getattr(settings, "follow_up_after_hours", 24),
+        "follow_up_priority_floor": getattr(settings, "follow_up_priority_floor", "medium"),
         "onboarding_completed": getattr(settings, "onboarding_completed", False),
         "operator_mode": getattr(settings, "operator_mode", "safe"),
         "policy": update.get("policy", existing_policy),
@@ -265,6 +385,76 @@ def _copy_provider_connection(connection: Any, update: dict[str, Any]):
 
         provider_connection_cls = ProviderConnectionState
     return provider_connection_cls.model_validate(payload)
+
+
+def _sync_workspace_control_state(settings: Any) -> None:
+    st.session_state.workspace_provider = getattr(settings, "preferred_provider", "fake")
+    st.session_state.workspace_dry_run = getattr(settings, "dry_run_default", True)
+    st.session_state.workspace_dry_run_toggle = getattr(settings, "dry_run_default", True)
+    st.session_state.workspace_batch_size = getattr(settings, "default_batch_size", 250)
+    st.session_state.workspace_batch_size_slider = getattr(settings, "default_batch_size", 250)
+    st.session_state.workspace_confidence_threshold = getattr(
+        settings, "default_confidence_threshold", 0.65
+    )
+    st.session_state.workspace_confidence_slider = getattr(
+        settings, "default_confidence_threshold", 0.65
+    )
+    st.session_state.workspace_limit = getattr(settings, "default_scan_limit", 500)
+    st.session_state.workspace_limit_slider = getattr(settings, "default_scan_limit", 500)
+    st.session_state.workspace_email_preview_limit = getattr(
+        settings, "default_email_preview_limit", 120
+    )
+    st.session_state.workspace_email_preview_slider = getattr(
+        settings, "default_email_preview_limit", 120
+    )
+    st.session_state.workspace_recommendation_preview_limit = getattr(
+        settings, "default_recommendation_preview_limit", 180
+    )
+    st.session_state.workspace_recommendation_preview_slider = getattr(
+        settings, "default_recommendation_preview_limit", 180
+    )
+    st.session_state.workspace_follow_up_enabled = getattr(
+        settings, "follow_up_radar_enabled", True
+    )
+    st.session_state.workspace_follow_up_after_hours = getattr(
+        settings, "follow_up_after_hours", 24
+    )
+    st.session_state.workspace_follow_up_priority_floor = getattr(
+        settings, "follow_up_priority_floor", "medium"
+    )
+
+
+def _queue_workspace_notice(title: str, body: str, tone: str = "success") -> None:
+    st.session_state.workspace_notice = {
+        "title": title,
+        "body": body,
+        "tone": tone,
+    }
+
+
+def _apply_workspace_playbook(service: Any, slug: str):
+    settings = _workspace_settings(service)
+    playbook = _playbook_definition(slug)
+    updated_policy = _copy_policy(settings.policy, playbook.get("policy", {}))
+    updated_settings = _copy_settings(
+        settings,
+        {
+            **playbook.get("settings", {}),
+            "policy": updated_policy,
+            "updated_at": datetime.now(timezone.utc),
+        },
+    )
+    saved = service.save_workspace_settings(updated_settings)
+    _sync_workspace_control_state(saved)
+    _queue_workspace_notice(
+        f"{playbook['label']} applied",
+        (
+            f"{playbook['summary']} InboxAnchor updated the workspace defaults and policy "
+            "for the next run."
+        ),
+        tone="success",
+    )
+    return saved
 
 
 def _run_engine_compat(engine: Any, **kwargs):
@@ -345,11 +535,17 @@ def _set_authenticated_session(token: str, user: AccountUser) -> None:
     st.session_state.auth_token = token
     st.session_state.auth_user = user.model_dump(mode="json")
     st.session_state.demo_access = False
+    st.session_state.auth_view = "login"
 
 
 def _clear_authenticated_session() -> None:
     st.session_state.pop("auth_token", None)
     st.session_state.pop("auth_user", None)
+
+
+def _set_auth_view(view: str) -> None:
+    if view in {"login", "signup", "demo"}:
+        st.session_state.auth_view = view
 
 
 def _current_account_user() -> Optional[AccountUser]:
@@ -384,6 +580,8 @@ def _login_account(email: str, password: str) -> tuple[bool, str]:
         return True, "Signed in successfully."
     except AuthError as error:
         return False, error.message
+    except Exception:
+        return False, "Sign in is unavailable right now. Please try again in a moment."
 
 
 def _signup_account(full_name: str, email: str, password: str) -> tuple[bool, str]:
@@ -398,20 +596,29 @@ def _signup_account(full_name: str, email: str, password: str) -> tuple[bool, st
         return True, "Account created successfully."
     except AuthError as error:
         return False, error.message
+    except Exception:
+        return False, "Account creation is unavailable right now. Please try again in a moment."
 
 
 def _logout_account() -> None:
     token = st.session_state.get("auth_token")
     if token:
-        with session_scope() as session:
-            AuthService(session).logout(token)
+        try:
+            with session_scope() as session:
+                AuthService(session).logout(token)
+        except Exception:
+            pass
     _clear_authenticated_session()
+    _set_auth_view("login")
 
 
 def _render_auth_gate() -> bool:
     account_user = _current_account_user()
     if account_user is not None or st.session_state.get("demo_access", False):
         return True
+
+    current_view = st.session_state.get("auth_view", "login")
+    auth_index = {"login": 0, "signup": 1, "demo": 2}.get(current_view, 0)
 
     intro_col, auth_col = st.columns([1.04, 0.96], gap="medium")
     with intro_col:
@@ -463,8 +670,15 @@ def _render_auth_gate() -> bool:
                 "Use a real workspace account for a platform-style experience, or keep "
                 "exploring in demo mode while the SaaS layer grows."
             )
-            login_tab, signup_tab, demo_tab = st.tabs(["Log In", "Sign Up", "Demo Mode"])
-            with login_tab:
+            auth_view = st.radio(
+                "Access mode",
+                ["Log In", "Sign Up", "Demo Mode"],
+                index=auth_index,
+                horizontal=True,
+                label_visibility="collapsed",
+            )
+            if auth_view == "Log In":
+                _set_auth_view("login")
                 with st.form("login_form"):
                     email = st.text_input(
                         "Email",
@@ -482,9 +696,11 @@ def _render_auth_gate() -> bool:
                     if ok:
                         st.success(message)
                         st.rerun()
-                    st.error(message)
+                    else:
+                        st.error(message)
 
-            with signup_tab:
+            elif auth_view == "Sign Up":
+                _set_auth_view("signup")
                 with st.form("signup_form"):
                     identity_col1, identity_col2 = st.columns(2, gap="medium")
                     with identity_col1:
@@ -524,7 +740,8 @@ def _render_auth_gate() -> bool:
                         else:
                             st.error(message)
 
-            with demo_tab:
+            else:
+                _set_auth_view("demo")
                 render_callout(
                     "Guest preview",
                     (
@@ -639,6 +856,28 @@ def _render_workspace_settings_panel(service: Any) -> None:
                 step=10,
             )
 
+        follow_up_row = st.columns(2, gap="medium")
+        with follow_up_row[0]:
+            follow_up_radar_enabled = st.toggle(
+                "Enable follow-up radar",
+                value=getattr(settings, "follow_up_radar_enabled", True),
+            )
+        with follow_up_row[1]:
+            follow_up_priority_floor = st.selectbox(
+                "Follow-up priority floor",
+                ["critical", "high", "medium", "low"],
+                index=["critical", "high", "medium", "low"].index(
+                    getattr(settings, "follow_up_priority_floor", "medium")
+                ),
+            )
+        follow_up_after_hours = st.slider(
+            "Resurface follow-ups after (hours)",
+            min_value=1,
+            max_value=240,
+            value=getattr(settings, "follow_up_after_hours", 24),
+            step=1,
+        )
+
         onboarding_completed = st.toggle(
             "Onboarding completed",
             value=getattr(settings, "onboarding_completed", False),
@@ -658,12 +897,15 @@ def _render_workspace_settings_panel(service: Any) -> None:
                     "default_confidence_threshold": default_confidence_threshold,
                     "default_email_preview_limit": default_email_preview_limit,
                     "default_recommendation_preview_limit": default_recommendation_preview_limit,
+                    "follow_up_radar_enabled": follow_up_radar_enabled,
+                    "follow_up_after_hours": follow_up_after_hours,
+                    "follow_up_priority_floor": follow_up_priority_floor,
                     "onboarding_completed": onboarding_completed,
                     "updated_at": datetime.now(timezone.utc),
                 },
             )
         )
-        st.session_state.workspace_provider = saved.preferred_provider
+        _sync_workspace_control_state(saved)
         render_callout(
             "Workspace defaults saved",
             "Future triage runs will start from these settings unless you override them.",
@@ -935,7 +1177,8 @@ def _hero(result: Optional[TriageRunResult], service: Any) -> None:
                 render_pill_row([("signed in", "safe"), (account_user.plan, "chip")])
                 st.write(account_user.full_name)
                 st.caption(account_user.email)
-                if st.button("Log out", use_container_width=True):
+                st.caption("Your workspace state stays private to this account session.")
+                if st.button("Log out securely", use_container_width=True):
                     _logout_account()
                     st.rerun()
             elif demo_access:
@@ -1165,6 +1408,21 @@ def _render_recommendation_lane_summary(recommendations: Iterable[EmailRecommend
     )
 
 
+def _queue_many_actions(
+    service: Any,
+    run_id: str,
+    email_ids: Iterable[str],
+    should_queue: bool,
+) -> None:
+    ids = sorted(set(email_ids))
+    if not ids:
+        return
+    if should_queue:
+        service.approve(run_id, ids)
+    else:
+        service.reject(run_id, ids)
+
+
 def _recommendation_tone(status: RecommendationStatus) -> str:
     if status == RecommendationStatus.safe:
         return "safe"
@@ -1258,6 +1516,49 @@ def _render_recommendations(result: TriageRunResult, service: Any) -> None:
         "Queue safe actions directly, approve higher-risk actions deliberately, and inspect "
         "blocked items without losing the audit trail."
     )
+    action_row = st.columns(3, gap="small")
+    with action_row[0]:
+        if st.button(
+            "Queue all safe cleanup",
+            use_container_width=True,
+            key=f"queue_safe_lane_{result.run_id}",
+            disabled=not safe,
+        ):
+            _queue_many_actions(
+                service,
+                result.run_id,
+                [item.email_id for item in safe],
+                True,
+            )
+            st.rerun()
+    with action_row[1]:
+        if st.button(
+            "Approve all review items",
+            use_container_width=True,
+            key=f"queue_review_lane_{result.run_id}",
+            disabled=not gated,
+        ):
+            _queue_many_actions(
+                service,
+                result.run_id,
+                [item.email_id for item in gated],
+                True,
+            )
+            st.rerun()
+    with action_row[2]:
+        if st.button(
+            "Clear queued lane actions",
+            use_container_width=True,
+            key=f"clear_lane_queue_{result.run_id}",
+            disabled=not _current_queue(service, result.run_id),
+        ):
+            _queue_many_actions(
+                service,
+                result.run_id,
+                list(_current_queue(service, result.run_id)),
+                False,
+            )
+            st.rerun()
     tabs = st.tabs(["Safe Cleanup", "Requires Review", "Blocked by Policy"])
     for tab, items in zip(tabs, [safe, gated, blocked]):
         with tab:
@@ -1293,6 +1594,279 @@ def _render_priority_queue(result: TriageRunResult) -> None:
             )
             st.caption(email.sender)
             st.write(classification.reason)
+    card_close()
+
+
+def _focus_rank(classification: Any, email: Any) -> tuple[int, float]:
+    priority_value = str(getattr(classification, "priority", "medium"))
+    priority_rank = {
+        "critical": 0,
+        "high": 1,
+        "medium": 2,
+        "low": 3,
+    }.get(priority_value, 4)
+    return (priority_rank, -email.received_at.timestamp())
+
+
+def _priority_meets_floor(priority: str, floor: str) -> bool:
+    priority_order = {
+        "critical": 0,
+        "high": 1,
+        "medium": 2,
+        "low": 3,
+    }
+    return priority_order.get(priority, 4) <= priority_order.get(floor, 2)
+
+
+def _build_focus_views(result: TriageRunResult) -> dict[str, list[dict[str, Any]]]:
+    recommendation_map = {item.email_id: item for item in result.recommendations}
+    views = {
+        "reply_now": [],
+        "needs_approval": [],
+        "sensitive": [],
+        "cleanup": [],
+    }
+    sensitive_categories = {"finance", "personal", "opportunity", "urgent"}
+    reply_action_types = {"reply_needed", "follow_up", "deadline", "invoice_payment"}
+
+    for email in result.emails:
+        classification = result.classifications[email.id]
+        recommendation = recommendation_map.get(email.id)
+        items = result.action_items.get(email.id, [])
+        action_types = {item.action_type for item in items}
+        requires_reply = any(item.requires_reply for item in items)
+        has_draft = email.id in result.reply_drafts
+        is_sensitive = (
+            email.has_attachments
+            or str(classification.category) in sensitive_categories
+            or (
+                recommendation is not None
+                and recommendation.status == RecommendationStatus.blocked
+            )
+        )
+        cleanup_candidate = (
+            recommendation is not None
+            and recommendation.status == RecommendationStatus.safe
+            and recommendation.recommended_action
+            in {"mark_read", "archive", "trash", "apply_labels"}
+        )
+        approval_candidate = (
+            recommendation is not None
+            and recommendation.status == RecommendationStatus.requires_approval
+        )
+        reply_candidate = (
+            str(classification.priority) in {"critical", "high"}
+            or requires_reply
+            or has_draft
+            or bool(action_types & reply_action_types)
+        )
+        entry = {
+            "email": email,
+            "classification": classification,
+            "recommendation": recommendation,
+            "items": items,
+            "has_draft": has_draft,
+            "requires_reply": requires_reply,
+        }
+        if reply_candidate:
+            views["reply_now"].append(entry)
+        if approval_candidate:
+            views["needs_approval"].append(entry)
+        if is_sensitive:
+            views["sensitive"].append(entry)
+        if cleanup_candidate:
+            views["cleanup"].append(entry)
+
+    for key in views:
+        views[key] = sorted(
+            views[key],
+            key=lambda entry: _focus_rank(entry["classification"], entry["email"]),
+        )
+    return views
+
+
+def _build_follow_up_radar(result: TriageRunResult, settings: Any) -> list[dict[str, Any]]:
+    if not getattr(settings, "follow_up_radar_enabled", True):
+        return []
+
+    threshold_hours = getattr(settings, "follow_up_after_hours", 24)
+    priority_floor = getattr(settings, "follow_up_priority_floor", "medium")
+    recommendation_map = {item.email_id: item for item in result.recommendations}
+    now = datetime.now(timezone.utc)
+    radar_entries: list[dict[str, Any]] = []
+
+    for email in result.emails:
+        classification = result.classifications[email.id]
+        items = result.action_items.get(email.id, [])
+        recommendation = recommendation_map.get(email.id)
+        age_hours = max(
+            0,
+            int((now - email.received_at).total_seconds() // 3600),
+        )
+        has_follow_up_signal = (
+            any(item.requires_reply for item in items)
+            or any(item.action_type in {"reply_needed", "follow_up", "deadline"} for item in items)
+            or email.id in result.reply_drafts
+            or (
+                recommendation is not None
+                and recommendation.status == RecommendationStatus.requires_approval
+            )
+        )
+        if not has_follow_up_signal:
+            continue
+        if age_hours < threshold_hours:
+            continue
+        if not _priority_meets_floor(str(classification.priority), priority_floor):
+            continue
+
+        radar_entries.append(
+            {
+                "email": email,
+                "classification": classification,
+                "recommendation": recommendation,
+                "items": items,
+                "age_hours": age_hours,
+                "has_draft": email.id in result.reply_drafts,
+            }
+        )
+
+    return sorted(
+        radar_entries,
+        key=lambda entry: (
+            -entry["age_hours"],
+            *_focus_rank(entry["classification"], entry["email"]),
+        ),
+    )
+
+
+def _render_focus_entry(entry: dict[str, Any], tone: str) -> None:
+    email = entry["email"]
+    classification = entry["classification"]
+    recommendation = entry.get("recommendation")
+    items = entry.get("items", [])
+    pills = [
+        (str(classification.priority).upper(), tone),
+        (str(classification.category), "chip"),
+    ]
+    if recommendation is not None:
+        pills.append((recommendation.recommended_action.replace("_", " "), tone))
+    if entry.get("has_draft"):
+        pills.append(("draft ready", "safe"))
+    if items:
+        pills.append((f"{len(items)} action item(s)", "chip"))
+    if email.has_attachments:
+        pills.append(("attachments", "review"))
+
+    with st.container(border=True):
+        st.markdown(f"**{email.subject}**")
+        render_pill_row(pills)
+        st.caption(email.sender)
+        if recommendation is not None:
+            st.write(recommendation.reason)
+        else:
+            st.write(classification.reason)
+        st.caption(email.snippet)
+
+
+def _render_focus_inbox(result: TriageRunResult) -> None:
+    focus_views = _build_focus_views(result)
+    card_open(
+        "Focus Inbox",
+        (
+            "Split the current run into response pressure, approvals, sensitive mail, "
+            "and cleanup work."
+        ),
+    )
+    render_pill_row(
+        [
+            (f"{len(focus_views['reply_now'])} reply now", "review"),
+            (f"{len(focus_views['needs_approval'])} approvals", "review"),
+            (f"{len(focus_views['sensitive'])} sensitive", "blocked"),
+            (f"{len(focus_views['cleanup'])} cleanup", "safe"),
+        ]
+    )
+    st.caption(
+        "This is InboxAnchor's answer to split inboxes and follow-up reminders: one surface "
+        "for what needs a reply, what needs a human decision, and what is safe to clear."
+    )
+    tabs = st.tabs(["Reply Now", "Needs Approval", "Sensitive", "Cleanup"])
+    tab_map = [
+        ("reply_now", "review", "Nothing urgent is asking for a reply in this preview."),
+        (
+            "needs_approval",
+            "review",
+            "No recommendation currently needs manual approval.",
+        ),
+        ("sensitive", "blocked", "No sensitive or blocked items are in the preview."),
+        ("cleanup", "safe", "No low-risk cleanup candidates are ready right now."),
+    ]
+    for tab, (view_key, tone, empty_message) in zip(tabs, tab_map):
+        with tab:
+            entries = focus_views[view_key]
+            if not entries:
+                st.info(empty_message)
+                continue
+            for entry in entries[:8]:
+                _render_focus_entry(entry, tone)
+    card_close()
+
+
+def _render_follow_up_radar(result: TriageRunResult, settings: Any) -> None:
+    radar_entries = _build_follow_up_radar(result, settings)
+    threshold_hours = getattr(settings, "follow_up_after_hours", 24)
+    priority_floor = getattr(settings, "follow_up_priority_floor", "medium")
+    card_open(
+        "Follow-Up Radar",
+        (
+            "Resurface reply pressure before it goes cold. This is tuned from workspace "
+            "settings and only highlights stale threads that still deserve operator attention."
+        ),
+    )
+    render_pill_row(
+        [
+            (
+                "enabled" if getattr(settings, "follow_up_radar_enabled", True) else "disabled",
+                "chip",
+            ),
+            (f"{threshold_hours}h threshold", "chip"),
+            (f"{priority_floor}+ priority", "review"),
+            (f"{len(radar_entries)} surfaced", "review" if radar_entries else "neutral"),
+        ]
+    )
+    if not getattr(settings, "follow_up_radar_enabled", True):
+        st.info("Follow-up radar is disabled in workspace settings.")
+        card_close()
+        return
+    if not radar_entries:
+        st.info("No stale follow-ups are above the current reminder threshold.")
+        card_close()
+        return
+
+    for entry in radar_entries[:8]:
+        email = entry["email"]
+        classification = entry["classification"]
+        recommendation = entry.get("recommendation")
+        items = entry.get("items", [])
+        pills = [
+            (f"{entry['age_hours']}h old", "review"),
+            (str(classification.priority).upper(), "review"),
+            (str(classification.category), "chip"),
+        ]
+        if entry.get("has_draft"):
+            pills.append(("draft ready", "safe"))
+        if recommendation is not None:
+            pills.append((recommendation.recommended_action.replace("_", " "), "chip"))
+        with st.container(border=True):
+            st.markdown(f"**{email.subject}**")
+            render_pill_row(pills)
+            st.caption(email.sender)
+            if items:
+                st.write(items[0].description)
+            elif recommendation is not None:
+                st.write(recommendation.reason)
+            else:
+                st.write(classification.reason)
+            st.caption(email.snippet)
     card_close()
 
 
@@ -1547,6 +2121,7 @@ def _render_run_explorer(result: TriageRunResult, runs: list[dict]) -> None:
 def _render_control_deck(result: Optional[TriageRunResult]) -> Optional[TriageRunResult]:
     service = _service()
     settings = _workspace_settings(service)
+    notice = st.session_state.pop("workspace_notice", None)
     provider_options = _provider_options()
     provider_default = st.session_state.get(
         "workspace_provider",
@@ -1560,9 +2135,27 @@ def _render_control_deck(result: Optional[TriageRunResult]) -> Optional[TriageRu
         "Choose a provider, size the scan window, and keep the workspace responsive even "
         "when you are simulating 10K+ unread emails."
     )
+    if notice:
+        render_callout(notice["title"], notice["body"], tone=notice["tone"])
     controls_col, stage_col = st.columns([1.2, 0.8], gap="large")
     with controls_col:
         with st.container(border=True):
+            playbook_options = _playbook_choices()
+            selected_playbook = st.selectbox(
+                "Operator playbook",
+                playbook_options,
+                index=playbook_options.index(st.session_state.get("workspace_playbook", "balanced"))
+                if st.session_state.get("workspace_playbook", "balanced") in playbook_options
+                else 0,
+                format_func=lambda slug: _playbook_definition(slug)["label"],
+                key="workspace_playbook",
+            )
+            playbook = _playbook_definition(selected_playbook)
+            render_pill_row([(label, "chip") for label in playbook["pills"]])
+            st.caption(playbook["summary"])
+            if st.button("Apply playbook to workspace", use_container_width=True):
+                _apply_workspace_playbook(service, selected_playbook)
+                st.rerun()
             st.markdown("#### Triage Settings")
             st.caption(
                 "Start safe, widen the scan only when you need to, and let preview caps keep "
@@ -1823,6 +2416,7 @@ def main() -> None:
             "</div>",
             unsafe_allow_html=True,
         )
+        active_settings = _workspace_settings(service)
         overview_col, control_col = st.columns([1.08, 0.92], gap="medium")
         with overview_col:
             _render_inbox_overview(result)
@@ -1831,7 +2425,8 @@ def main() -> None:
             card_close()
         with control_col:
             _render_run_health(result, service)
-            _render_priority_queue(result)
+            _render_focus_inbox(result)
+            _render_follow_up_radar(result, active_settings)
 
         content_col, side_col = st.columns([1.12, 0.88], gap="medium")
         with content_col:

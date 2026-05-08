@@ -96,6 +96,9 @@ def test_workspace_settings_roundtrip_and_triage_uses_saved_defaults():
             "default_confidence_threshold": 0.8,
             "default_email_preview_limit": 80,
             "default_recommendation_preview_limit": 90,
+            "follow_up_radar_enabled": True,
+            "follow_up_after_hours": 36,
+            "follow_up_priority_floor": "high",
             "onboarding_completed": True,
             "operator_mode": "balanced",
             "policy": {
@@ -119,6 +122,8 @@ def test_workspace_settings_roundtrip_and_triage_uses_saved_defaults():
     assert save_response.status_code == 200
     assert settings_response.status_code == 200
     assert settings_response.json()["preferred_provider"] == "outlook"
+    assert settings_response.json()["follow_up_after_hours"] == 36
+    assert settings_response.json()["follow_up_priority_floor"] == "high"
     assert run_response.status_code == 200
     payload = run_response.json()
     assert payload["provider"] == "outlook"

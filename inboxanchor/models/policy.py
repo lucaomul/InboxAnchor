@@ -31,6 +31,9 @@ class WorkspaceSettings(BaseModel):
     default_confidence_threshold: float = Field(default=0.65, ge=0.0, le=1.0)
     default_email_preview_limit: int = Field(default=120, ge=10, le=500)
     default_recommendation_preview_limit: int = Field(default=180, ge=10, le=1000)
+    follow_up_radar_enabled: bool = True
+    follow_up_after_hours: int = Field(default=24, ge=1, le=240)
+    follow_up_priority_floor: str = "medium"
     onboarding_completed: bool = False
     operator_mode: str = "safe"
     policy: WorkspacePolicy = Field(default_factory=WorkspacePolicy)
