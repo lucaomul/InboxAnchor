@@ -97,6 +97,7 @@ That means:
 - the connector contract is stable
 - tests stay fully mocked
 - production Gmail API wiring can be added without changing the triage engine
+- live setup instructions now live in `docs/gmail_setup.md`
 
 ### IMAP / Yahoo / Outlook-Style Providers
 
@@ -109,6 +110,22 @@ That gives the project a clean path toward:
 - other generic IMAP-compatible mailboxes
 
 V1 keeps this implementation intentionally thin and safe while the engine, rules, API, and UI mature around it.
+
+## Productionization Status
+
+InboxAnchor now includes:
+
+- a real Gmail OAuth transport path
+- a real IMAP transport path
+- retry and timeout handling for LLM calls
+- incremental triage checkpoint support
+- optional Gmail webhook scaffolding for push-triggered incremental triage
+
+Still pending before full production rollout:
+
+- battle-tested live provider onboarding UX
+- deployment-grade secret management and SaaS auth
+- deeper provider-specific hardening for every mailbox family
 
 ## Core Components
 

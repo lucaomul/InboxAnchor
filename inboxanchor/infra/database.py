@@ -154,6 +154,14 @@ class ProviderConnectionORM(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class ProviderCheckpointORM(Base):
+    __tablename__ = "provider_checkpoints"
+
+    provider: Mapped[str] = mapped_column(String(32), primary_key=True)
+    checkpoint_value: Mapped[str] = mapped_column(String(255))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 def _fallback_sqlite_url() -> str:
     app_dir = Path(
         os.getenv(

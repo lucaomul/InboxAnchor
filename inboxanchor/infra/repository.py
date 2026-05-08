@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import and_
@@ -9,6 +10,7 @@ from inboxanchor.infra.database import (
     AuditLogORM,
     ClassificationORM,
     EmailRecordORM,
+    ProviderCheckpointORM,
     ProviderConnectionORM,
     RecommendationORM,
     TriageRunORM,
@@ -193,6 +195,22 @@ class InboxRepository:
             ProviderConnectionState.model_validate(row.payload).model_dump(mode="json")
             for row in rows
         ]
+
+    def get_checkpoint(self, provider_name: str) -> Optional[str]:
+        row = self.session.get(ProviderCheckpointORM, provider_name)
+        return row.checkpoint_value if row else None
+
+    def save_checkpoint(self, provider_name: str, checkpoint_value: str) -> None:
+        row = self.session.get(ProviderCheckpointORM, provider_name)
+        if row is None:
+            row = ProviderCheckpointORM(
+                provider=provider_name,
+                checkpoint_value=checkpoint_value,
+            )
+            self.session.add(row)
+        else:
+            row.checkpoint_value = checkpoint_value
+            row.updated_at = datetime.now(timezone.utc)
 
     def list_run_emails(self, run_id: str, *, limit: int = 50, offset: int = 0) -> list[dict]:
         rows = (

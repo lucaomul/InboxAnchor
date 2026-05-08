@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -29,6 +30,26 @@ class EmailProvider(ABC):
         emails = self.list_unread(limit=limit, include_body=include_body)
         for start in range(0, len(emails), batch_size):
             yield emails[start : start + batch_size]
+
+    def supports_incremental_sync(self) -> bool:
+        return False
+
+    def iter_unread_batches_since(
+        self,
+        checkpoint: str,
+        *,
+        limit: int = 50,
+        batch_size: int = 100,
+        include_body: bool = True,
+    ):
+        return self.iter_unread_batches(
+            limit=limit,
+            batch_size=batch_size,
+            include_body=include_body,
+        )
+
+    def get_incremental_checkpoint(self) -> Optional[str]:
+        return None
 
     @abstractmethod
     def list_unread(self, limit: int = 50, include_body: bool = True) -> list[EmailMessage]:

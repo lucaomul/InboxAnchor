@@ -1,3 +1,5 @@
+import base64
+import json
 from typing import Optional
 
 from fastapi.testclient import TestClient
@@ -208,3 +210,25 @@ def test_execute_uses_provider_from_stored_run(mocker):
 
     assert execute_response.status_code == 200
     assert provider_calls[-1] == "outlook"
+
+
+def test_gmail_webhook_route_accepts_pubsub_payload():
+    encoded = base64.urlsafe_b64encode(
+        json.dumps({"emailAddress": "ops@example.com", "historyId": "12345"}).encode("utf-8")
+    ).decode("utf-8")
+
+    response = client.post(
+        "/webhooks/gmail",
+        json={
+            "message": {
+                "data": encoded,
+                "messageId": "msg-1",
+                "publishTime": "2026-05-08T10:00:00Z",
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["accepted"] is True
+    assert payload["notification"]["history_id"] == "12345"

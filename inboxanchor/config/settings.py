@@ -30,19 +30,32 @@ class Settings:
     default_provider: str = os.getenv("INBOXANCHOR_DEFAULT_PROVIDER", "fake")
     dry_run_default: bool = _as_bool(os.getenv("INBOXANCHOR_DRY_RUN"), True)
     llm_provider: str = os.getenv("INBOXANCHOR_LLM_PROVIDER", "mock")
-    llm_timeout_seconds: int = int(os.getenv("INBOXANCHOR_LLM_TIMEOUT_SECONDS", "15"))
-    llm_retry_attempts: int = int(os.getenv("INBOXANCHOR_LLM_RETRY_ATTEMPTS", "2"))
+    llm_timeout_seconds: int = int(os.getenv("INBOXANCHOR_LLM_TIMEOUT_SECONDS", "30"))
+    llm_retry_attempts: int = int(os.getenv("INBOXANCHOR_LLM_RETRY_ATTEMPTS", "3"))
+    llm_retry_base_delay_seconds: float = float(
+        os.getenv("INBOXANCHOR_LLM_RETRY_BASE_DELAY_SECONDS", "1.0")
+    )
+    llm_retry_max_delay_seconds: float = float(
+        os.getenv("INBOXANCHOR_LLM_RETRY_MAX_DELAY_SECONDS", "30.0")
+    )
+    gmail_credentials_path: str = os.getenv("GMAIL_CREDENTIALS_PATH", "")
+    gmail_token_path: str = os.getenv("GMAIL_TOKEN_PATH", "")
     gmail_client_id: str = os.getenv("GMAIL_CLIENT_ID", "")
     gmail_client_secret: str = os.getenv("GMAIL_CLIENT_SECRET", "")
     gmail_redirect_uri: str = os.getenv(
         "GMAIL_REDIRECT_URI",
         "http://localhost:8000/oauth/gmail/callback",
     )
+    gmail_pubsub_topic: str = os.getenv("GMAIL_PUBSUB_TOPIC", "")
+    gmail_watch_label_ids: str = os.getenv("GMAIL_WATCH_LABEL_IDS", "INBOX")
     imap_host: str = os.getenv("IMAP_HOST", "")
     imap_port: int = int(os.getenv("IMAP_PORT", "993"))
     imap_username: str = os.getenv("IMAP_USERNAME", "")
     imap_password: str = os.getenv("IMAP_PASSWORD", "")
     imap_use_ssl: bool = _as_bool(os.getenv("IMAP_USE_SSL"), True)
+    imap_mailbox: str = os.getenv("IMAP_MAILBOX", "INBOX")
+    imap_archive_mailbox: str = os.getenv("IMAP_ARCHIVE_MAILBOX", "")
+    imap_trash_mailbox: str = os.getenv("IMAP_TRASH_MAILBOX", "")
 
 
 SETTINGS = Settings()

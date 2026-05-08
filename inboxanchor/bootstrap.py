@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 from inboxanchor.agents import SafetyVerifierAgent
 from inboxanchor.config.settings import SETTINGS
-from inboxanchor.connectors import FakeEmailProvider, IMAPEmailClient
-from inboxanchor.core import TriageEngine
+from inboxanchor.connectors import FakeEmailProvider, GmailClient, IMAPEmailClient, ImaplibTransport
+from inboxanchor.core import IncrementalTriageEngine, TriageEngine
 from inboxanchor.infra.database import init_db, session_scope
 from inboxanchor.infra.repository import InboxRepository
 from inboxanchor.models import (
@@ -15,6 +17,8 @@ from inboxanchor.models import (
     ProviderProfile,
     WorkspaceSettings,
 )
+
+logger = logging.getLogger(__name__)
 
 PROVIDER_OPTIONS = ["fake", "gmail", "imap", "yahoo", "outlook"]
 IMAP_FAMILY_PROVIDERS = {"imap", "yahoo", "outlook"}
@@ -215,13 +219,102 @@ def build_demo_emails() -> list[EmailMessage]:
     ]
 
 
+def _provider_has_live_connection(state: ProviderConnectionState) -> bool:
+    return state.status in {"configured", "connected"} and state.sync_enabled
+
+
+def _load_provider_connection_state(provider_name: str) -> ProviderConnectionState:
+    try:
+        with session_scope() as session:
+            return InboxRepository(session).get_provider_connection(provider_name)
+    except Exception:
+        return ProviderConnectionState(provider=provider_name)
+
+
+def _gmail_token_path() -> str:
+    if SETTINGS.gmail_token_path:
+        return SETTINGS.gmail_token_path
+    if SETTINGS.gmail_credentials_path:
+        credentials_path = Path(SETTINGS.gmail_credentials_path).expanduser()
+        return str(credentials_path.with_name("token.json"))
+    return ""
+
+
+def _imap_host_for_provider(provider_name: str) -> str:
+    if SETTINGS.imap_host:
+        return SETTINGS.imap_host
+    defaults = {
+        "yahoo": "imap.mail.yahoo.com",
+        "outlook": "outlook.office365.com",
+    }
+    return defaults.get(provider_name, "")
+
+
+def _provider_can_run_live(provider_name: str, state: ProviderConnectionState) -> bool:
+    if provider_name == "gmail":
+        return bool(
+            SETTINGS.gmail_credentials_path
+            and (SETTINGS.gmail_token_path or SETTINGS.gmail_credentials_path)
+            and (_provider_has_live_connection(state) or SETTINGS.gmail_credentials_path)
+        )
+    if provider_name in IMAP_FAMILY_PROVIDERS:
+        return bool(
+            SETTINGS.imap_username
+            and SETTINGS.imap_password
+            and _imap_host_for_provider(provider_name)
+            and (_provider_has_live_connection(state) or SETTINGS.imap_username)
+        )
+    return provider_name == "fake"
+
+
+def _build_live_gmail_provider():
+    from inboxanchor.connectors.gmail_transport import GoogleAPITransport
+
+    token_path = _gmail_token_path()
+    return GmailClient(
+        transport=GoogleAPITransport(
+            credentials_path=SETTINGS.gmail_credentials_path,
+            token_path=token_path,
+        )
+    )
+
+
+def _build_live_imap_provider(provider_name: str):
+    return ImaplibTransport(
+        host=_imap_host_for_provider(provider_name),
+        port=SETTINGS.imap_port,
+        username=SETTINGS.imap_username,
+        password=SETTINGS.imap_password,
+        use_ssl=SETTINGS.imap_use_ssl,
+        mailbox=SETTINGS.imap_mailbox,
+        provider_name=provider_name,
+        archive_mailbox=SETTINGS.imap_archive_mailbox or None,
+        trash_mailbox=SETTINGS.imap_trash_mailbox or None,
+    )
+
+
 def build_provider(provider_name: Optional[str] = None):
     provider_name = (provider_name or SETTINGS.default_provider).lower()
     demo_emails = build_demo_emails()
+    state = _load_provider_connection_state(provider_name)
 
     if provider_name == "gmail":
+        if _provider_can_run_live(provider_name, state):
+            try:
+                return _build_live_gmail_provider()
+            except Exception as error:  # pragma: no cover - optional dependencies/env-driven
+                logger.warning("Falling back to Gmail preview provider: %s", error)
         return FakeEmailProvider(demo_emails, provider_name="gmail")
     if provider_name in IMAP_FAMILY_PROVIDERS:
+        if _provider_can_run_live(provider_name, state):
+            try:
+                return _build_live_imap_provider(provider_name)
+            except Exception as error:  # pragma: no cover - env-driven
+                logger.warning(
+                    "Falling back to IMAP preview provider for %s: %s",
+                    provider_name,
+                    error,
+                )
         return IMAPEmailClient(
             seed_messages=demo_emails,
             provider_name=provider_name,
@@ -229,22 +322,37 @@ def build_provider(provider_name: Optional[str] = None):
     return FakeEmailProvider(demo_emails, provider_name=provider_name)
 
 
+def _runtime_profile(profile: ProviderProfile) -> ProviderProfile:
+    if profile.slug == "fake":
+        return profile
+    live_ready = _provider_can_run_live(
+        profile.slug,
+        _load_provider_connection_state(profile.slug),
+    )
+    status = "live-ready" if live_ready else profile.status
+    return profile.model_copy(update={"live_ready": live_ready, "status": status})
+
+
 def list_provider_profiles() -> list[ProviderProfile]:
-    return [PROVIDER_PROFILES[slug] for slug in PROVIDER_OPTIONS]
+    return [_runtime_profile(PROVIDER_PROFILES[slug]) for slug in PROVIDER_OPTIONS]
 
 
 def get_provider_profile(provider_name: Optional[str]) -> ProviderProfile:
     slug = (provider_name or SETTINGS.default_provider).lower()
-    return PROVIDER_PROFILES.get(slug, PROVIDER_PROFILES["fake"])
+    return _runtime_profile(PROVIDER_PROFILES.get(slug, PROVIDER_PROFILES["fake"]))
 
 
 class InboxAnchorService:
     def __init__(self, provider_name: Optional[str] = None):
         init_db()
         self.provider = build_provider(provider_name)
-        self.engine = TriageEngine(
+        base_engine = TriageEngine(
             self.provider,
             safety_verifier=SafetyVerifierAgent(),
+        )
+        self.engine = IncrementalTriageEngine(
+            base_engine,
+            provider_name=self.provider.provider_name,
         )
         self.approvals: dict[str, set[str]] = {}
 

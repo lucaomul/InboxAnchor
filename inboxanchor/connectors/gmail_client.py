@@ -65,6 +65,41 @@ class GmailClient(EmailProvider):
         for start in range(0, len(emails), batch_size):
             yield emails[start : start + batch_size]
 
+    def supports_incremental_sync(self) -> bool:
+        transport = self._require_transport()
+        return callable(getattr(transport, "iter_unread_batches_since", None)) and callable(
+            getattr(transport, "get_incremental_checkpoint", None)
+        )
+
+    def iter_unread_batches_since(
+        self,
+        checkpoint: str,
+        *,
+        limit: int = 50,
+        batch_size: int = 100,
+        include_body: bool = True,
+    ):
+        transport = self._require_transport()
+        if callable(getattr(transport, "iter_unread_batches_since", None)):
+            return transport.iter_unread_batches_since(
+                checkpoint,
+                limit=limit,
+                batch_size=batch_size,
+                include_body=include_body,
+            )
+        return self.iter_unread_batches(
+            limit=limit,
+            batch_size=batch_size,
+            include_body=include_body,
+        )
+
+    def get_incremental_checkpoint(self) -> Optional[str]:
+        transport = self._require_transport()
+        checkpoint_getter = getattr(transport, "get_incremental_checkpoint", None)
+        if callable(checkpoint_getter):
+            return checkpoint_getter()
+        return None
+
     def fetch_email_metadata(self, email_id: str) -> EmailMessage:
         return self._require_transport().get_message(email_id)
 
