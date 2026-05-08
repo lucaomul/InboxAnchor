@@ -274,3 +274,13 @@ def test_dashboard_build_follow_up_radar_respects_threshold_and_priority_floor()
     radar_entries = dashboard._build_follow_up_radar(result, settings)
 
     assert [entry["email"].id for entry in radar_entries] == ["stale_high"]
+
+
+def test_dashboard_format_due_label_handles_future_and_overdue_windows():
+    now = datetime.now(timezone.utc)
+
+    future_label = dashboard._format_due_label(now + timedelta(hours=6))
+    overdue_label = dashboard._format_due_label(now - timedelta(hours=3))
+
+    assert future_label.startswith("due in ")
+    assert overdue_label.startswith("overdue by ")

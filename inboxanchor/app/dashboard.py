@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import inspect
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Iterable, Optional
 
@@ -13,6 +13,8 @@ from inboxanchor.app.ui import (
     card_close,
     card_open,
     inject_styles,
+    render_app_bar,
+    render_briefing,
     render_callout,
     render_empty_state,
     render_metric_bar,
@@ -23,6 +25,7 @@ from inboxanchor.infra.auth import AuthError, AuthService
 from inboxanchor.infra.database import AuditLogORM, TriageRunORM, session_scope
 from inboxanchor.models import AccountUser, TriageRunResult
 from inboxanchor.models.email import EmailRecommendation, RecommendationStatus
+from inboxanchor.models.reminder import FollowUpReminder
 
 CONNECTION_STATUS_OPTIONS = [
     "not_connected",
@@ -531,6 +534,113 @@ def _load_dashboard_data() -> tuple[list[dict], list]:
     return runs, audit_entries
 
 
+def _workspace_actor_email() -> str:
+    account_user = _current_account_user()
+    if account_user is not None:
+        return account_user.email
+    if st.session_state.get("demo_access", False):
+        return "demo@inboxanchor.local"
+    return "workspace@inboxanchor.local"
+
+
+def _list_follow_up_reminders(
+    *,
+    status: str = "active",
+    due_only: bool = False,
+    limit: int = 24,
+) -> list[FollowUpReminder]:
+    with session_scope() as session:
+        repository = _repository_class()(session)
+        if not hasattr(repository, "list_follow_up_reminders"):
+            return []
+        return repository.list_follow_up_reminders(
+            owner_email=_workspace_actor_email(),
+            status=status,
+            due_before=datetime.now(timezone.utc) if due_only else None,
+            limit=limit,
+        )
+
+
+def _active_reminder_by_email() -> dict[str, FollowUpReminder]:
+    reminders = _list_follow_up_reminders(status="active", limit=64)
+    return {reminder.email_id: reminder for reminder in reminders}
+
+
+def _schedule_follow_up_reminder(
+    *,
+    result: Any,
+    email: Any,
+    classification: Any,
+    note: str,
+    due_in_hours: int,
+    source: str,
+) -> None:
+    reminder = FollowUpReminder(
+        provider=result.provider,
+        email_id=email.id,
+        owner_email=_workspace_actor_email(),
+        thread_id=email.thread_id,
+        run_id=result.run_id,
+        sender=email.sender,
+        subject=email.subject,
+        preview=email.snippet or email.body_preview,
+        priority=str(classification.priority),
+        category=str(classification.category),
+        note=note,
+        source=source,
+        due_at=datetime.now(timezone.utc) + timedelta(hours=due_in_hours),
+    )
+    with session_scope() as session:
+        repository = _repository_class()(session)
+        if not hasattr(repository, "upsert_follow_up_reminder"):
+            raise RuntimeError("Reminder persistence is not available in this repository build.")
+        saved = repository.upsert_follow_up_reminder(reminder)
+    _queue_workspace_notice(
+        "Follow-up reminder saved",
+        (
+            f"{saved.subject} will resurface in about {due_in_hours} hours for "
+            f"{saved.owner_email}."
+        ),
+        tone="success",
+    )
+
+
+def _update_follow_up_reminder(reminder_id: int, status: str) -> None:
+    with session_scope() as session:
+        repository = _repository_class()(session)
+        if not hasattr(repository, "update_follow_up_reminder_status"):
+            raise RuntimeError(
+                "Reminder status updates are not available in this repository build."
+            )
+        reminder = repository.update_follow_up_reminder_status(reminder_id, status)
+    if reminder is None:
+        _queue_workspace_notice(
+            "Reminder not found",
+            "That follow-up reminder no longer exists in the current workspace.",
+            tone="warning",
+        )
+        return
+    verb = "completed" if status == "completed" else "dismissed"
+    _queue_workspace_notice(
+        "Reminder updated",
+        f"{reminder.subject} was marked as {verb}.",
+        tone="success" if status == "completed" else "info",
+    )
+
+
+def _format_due_label(due_at: datetime) -> str:
+    now = datetime.now(timezone.utc)
+    delta_seconds = int((due_at - now).total_seconds())
+    if delta_seconds <= 0:
+        overdue_hours = max(1, abs(delta_seconds) // 3600)
+        return f"overdue by {overdue_hours}h"
+    if delta_seconds < 3600:
+        return f"due in {max(1, delta_seconds // 60)}m"
+    if delta_seconds < 86400:
+        return f"due in {max(1, delta_seconds // 3600)}h"
+    return f"due in {max(1, delta_seconds // 86400)}d"
+
+
 def _set_authenticated_session(token: str, user: AccountUser) -> None:
     st.session_state.auth_token = token
     st.session_state.auth_user = user.model_dump(mode="json")
@@ -620,50 +730,38 @@ def _render_auth_gate() -> bool:
     current_view = st.session_state.get("auth_view", "login")
     auth_index = {"login": 0, "signup": 1, "demo": 2}.get(current_view, 0)
 
-    intro_col, auth_col = st.columns([1.04, 0.96], gap="medium")
-    with intro_col:
-        st.markdown(
-            "\n".join(
-                [
-                    '<div class="ia-hero">',
-                    (
-                        "<div "
-                        'style="font-size:0.8rem;letter-spacing:0.2em;'
-                        'text-transform:uppercase;opacity:0.78;">InboxAnchor</div>'
-                    ),
-                    (
-                        '<h1 style="margin:0.25rem 0 0.42rem 0;">'
-                        "Turn inbox overload into a real operations workflow</h1>"
-                    ),
-                    (
-                        '<p style="margin:0;max-width:760px;font-size:1rem;'
-                        'line-height:1.58;opacity:0.94;">'
-                        "Classify, prioritize, and clean up email safely with human approval, "
-                        "audit trails, and provider-ready infrastructure."
-                        "</p>"
-                    ),
-                    (
-                        '<div style="margin-top:0.95rem;">'
-                        '<span class="ia-chip ia-chip-dark">Account-aware</span>'
-                        '<span class="ia-chip ia-chip-dark">Human approval</span>'
-                        '<span class="ia-chip ia-chip-dark">Audit trail</span>'
-                        '<span class="ia-chip ia-chip-dark">Demo ready</span>'
-                        "</div>"
-                    ),
-                    "</div>",
-                ]
-            ),
-            unsafe_allow_html=True,
-        )
-        render_metric_bar(
-            [
-                {"label": "Workspace", "value": "Private", "note": "Sign in to continue"},
-                {"label": "Providers", "value": 5, "note": "Fake, Gmail, IMAP, Yahoo, Outlook"},
-                {"label": "Safety", "value": "On", "note": "Approval-first workflow"},
-                {"label": "Mode", "value": "Demo", "note": "Guest path still available"},
-            ]
-        )
-    with auth_col:
+    render_app_bar(
+        "InboxAnchor",
+        "Private inbox operations workspace",
+        (
+            "Sign in for a persistent workspace, or stay in demo mode while you validate "
+            "the triage flow, approvals, and provider setup."
+        ),
+        ["account-aware", "human approval", "audit trail", "demo ready"],
+    )
+    render_briefing(
+        "Access is required before InboxAnchor stores workspace state.",
+        (
+            "The auth flow is separate from inbox operations on purpose. Sign in when you "
+            "want private defaults, reminders, and run history to belong to a real account."
+        ),
+        kicker="Access",
+    )
+    render_metric_bar(
+        [
+            {"label": "Workspace", "value": "Private", "note": "Sign in to continue"},
+            {"label": "Providers", "value": 5, "note": "Fake, Gmail, IMAP, Yahoo, Outlook"},
+            {"label": "Safety", "value": "On", "note": "Approval-first workflow"},
+            {"label": "Mode", "value": "Demo", "note": "Guest path still available"},
+        ]
+    )
+
+    auth_shell_left, auth_shell_center, auth_shell_right = st.columns(
+        [0.2, 0.6, 0.2],
+        gap="medium",
+    )
+    del auth_shell_left, auth_shell_right
+    with auth_shell_center:
         with st.container(border=True):
             st.markdown("#### Account Access")
             st.caption(
@@ -683,11 +781,12 @@ def _render_auth_gate() -> bool:
                     email = st.text_input(
                         "Email",
                         placeholder="name@company.com",
+                        autocomplete="username",
                     )
                     password = st.text_input(
                         "Password",
-                        type="password",
                         placeholder="Enter your password",
+                        autocomplete="current-password",
                     )
                     st.caption("Secure sign-in for your private InboxAnchor workspace.")
                     submitted = st.form_submit_button("Log in", use_container_width=True)
@@ -702,27 +801,26 @@ def _render_auth_gate() -> bool:
             elif auth_view == "Sign Up":
                 _set_auth_view("signup")
                 with st.form("signup_form"):
-                    identity_col1, identity_col2 = st.columns(2, gap="medium")
-                    with identity_col1:
-                        full_name = st.text_input(
-                            "Full name",
-                            placeholder="Luca Craciun",
-                        )
-                    with identity_col2:
-                        email = st.text_input(
-                            "Email",
-                            placeholder="name@company.com",
-                        )
+                    full_name = st.text_input(
+                        "Full name",
+                        placeholder="Luca Craciun",
+                        autocomplete="name",
+                    )
+                    email = st.text_input(
+                        "Email",
+                        placeholder="name@company.com",
+                        autocomplete="email",
+                    )
                     st.markdown("##### Credentials")
                     password = st.text_input(
                         "Password",
-                        type="password",
                         placeholder="Minimum 8 characters",
+                        autocomplete="new-password",
                     )
                     password_confirm = st.text_input(
                         "Confirm password",
-                        type="password",
                         placeholder="Repeat password",
+                        autocomplete="new-password",
                     )
                     st.caption(
                         "Use a real email and a strong password. Passwords are hashed locally "
@@ -1119,56 +1217,46 @@ def _hero(result: Optional[TriageRunResult], service: Any) -> None:
     account_user = _current_account_user()
     demo_access = st.session_state.get("demo_access", False)
     if result is None:
-        highlights = [
-            ("Safe-by-default", "chip"),
-            ("Human approval", "chip"),
-            ("Audit trail", "chip"),
-            ("Provider-ready", "chip"),
-        ]
         subtitle = (
-            "Turn inbox overload into a controlled operations workflow. "
-            "InboxAnchor classifies, prioritizes, and recommends actions before "
-            "any mailbox change is allowed."
+            "Choose a provider, tune the scan window, and keep the workspace explicit about "
+            "what is safe, what needs review, and what stays blocked."
         )
+        tags = ["workspace ready", "approval-first", "provider-aware", "audit trail"]
     else:
         queued_count = len(_current_queue(service, result.run_id))
-        highlights = [
-            (f"{result.provider.upper()} provider", "chip"),
-            (f"{result.scanned_emails} scanned", "chip"),
-            (f"{result.total_emails} retained", "chip"),
-            (f"{queued_count} queued actions", "chip"),
-        ]
         subtitle = result.digest.summary
+        tags = [
+            f"{result.provider.upper()} provider",
+            f"{result.scanned_emails} scanned",
+            f"{result.total_emails} retained",
+            f"{queued_count} queued",
+        ]
 
-    chips = "".join(
-        f'<span class="ia-chip ia-chip-dark">{label}</span>' for label, _ in highlights
-    )
-    hero_col, account_col = st.columns([1.06, 0.54], gap="medium")
+    hero_col, account_col = st.columns([1.35, 0.65], gap="medium")
     with hero_col:
-        st.markdown(
-            "\n".join(
-                [
-                    '<div class="ia-hero">',
-                    (
-                        "<div "
-                        'style="font-size:0.8rem;letter-spacing:0.2em;'
-                        'text-transform:uppercase;opacity:0.78;">InboxAnchor</div>'
-                    ),
-                    (
-                        '<h1 style="margin:0.25rem 0 0.42rem 0;">'
-                        "The safe inbox operations workspace</h1>"
-                    ),
-                    (
-                        '<p style="margin:0;max-width:820px;font-size:1rem;'
-                        'line-height:1.58;opacity:0.94;">'
-                    ),
-                    subtitle,
-                    "</p>",
-                    f'<div style="margin-top:0.95rem;">{chips}</div>',
-                    "</div>",
-                ]
-            ),
-            unsafe_allow_html=True,
+        if account_user is not None:
+            workspace_title = f"{account_user.full_name.split()[0]}'s workspace"
+            workspace_copy = (
+                "Private settings, reminders, run history, and approval decisions are tied to "
+                "this signed-in account."
+            )
+        else:
+            workspace_title = "Demo workspace"
+            workspace_copy = (
+                "You are exploring the platform without persistence. Switch to an account when "
+                "you want saved defaults, reminders, and account-bound history."
+            )
+
+        render_app_bar(
+            "InboxAnchor",
+            "Safe inbox operations workspace",
+            subtitle,
+            tags,
+        )
+        render_briefing(
+            workspace_title,
+            workspace_copy,
+            kicker="Workspace status",
         )
     with account_col:
         with st.container(border=True):
@@ -1813,6 +1901,7 @@ def _render_focus_inbox(result: TriageRunResult) -> None:
 
 def _render_follow_up_radar(result: TriageRunResult, settings: Any) -> None:
     radar_entries = _build_follow_up_radar(result, settings)
+    active_reminders = _active_reminder_by_email()
     threshold_hours = getattr(settings, "follow_up_after_hours", 24)
     priority_floor = getattr(settings, "follow_up_priority_floor", "medium")
     card_open(
@@ -1847,11 +1936,14 @@ def _render_follow_up_radar(result: TriageRunResult, settings: Any) -> None:
         classification = entry["classification"]
         recommendation = entry.get("recommendation")
         items = entry.get("items", [])
+        active_reminder = active_reminders.get(email.id)
         pills = [
             (f"{entry['age_hours']}h old", "review"),
             (str(classification.priority).upper(), "review"),
             (str(classification.category), "chip"),
         ]
+        if active_reminder is not None:
+            pills.append((_format_due_label(active_reminder.due_at), "safe"))
         if entry.get("has_draft"):
             pills.append(("draft ready", "safe"))
         if recommendation is not None:
@@ -1867,6 +1959,205 @@ def _render_follow_up_radar(result: TriageRunResult, settings: Any) -> None:
             else:
                 st.write(classification.reason)
             st.caption(email.snippet)
+            reminder_note = items[0].description if items else (
+                recommendation.reason if recommendation is not None else email.snippet
+            )
+            reminder_controls = st.columns(3, gap="small")
+            if active_reminder is None:
+                with reminder_controls[0]:
+                    if st.button(
+                        "Remind in 4h",
+                        key=f"reminder_4h_{email.id}",
+                        use_container_width=True,
+                    ):
+                        _schedule_follow_up_reminder(
+                            result=result,
+                            email=email,
+                            classification=classification,
+                            note=reminder_note,
+                            due_in_hours=4,
+                            source="follow_up_radar",
+                        )
+                        st.rerun()
+                with reminder_controls[1]:
+                    if st.button(
+                        "Tomorrow",
+                        key=f"reminder_24h_{email.id}",
+                        use_container_width=True,
+                    ):
+                        _schedule_follow_up_reminder(
+                            result=result,
+                            email=email,
+                            classification=classification,
+                            note=reminder_note,
+                            due_in_hours=24,
+                            source="follow_up_radar",
+                        )
+                        st.rerun()
+                with reminder_controls[2]:
+                    if st.button(
+                        "In 3 days",
+                        key=f"reminder_72h_{email.id}",
+                        use_container_width=True,
+                    ):
+                        _schedule_follow_up_reminder(
+                            result=result,
+                            email=email,
+                            classification=classification,
+                            note=reminder_note,
+                            due_in_hours=72,
+                            source="follow_up_radar",
+                        )
+                        st.rerun()
+            else:
+                st.caption("Reminder already active for this thread.")
+                with reminder_controls[0]:
+                    if st.button(
+                        "Done",
+                        key=f"reminder_done_{active_reminder.id}",
+                        use_container_width=True,
+                    ):
+                        _update_follow_up_reminder(active_reminder.id, "completed")
+                        st.rerun()
+                with reminder_controls[1]:
+                    if st.button(
+                        "Dismiss",
+                        key=f"reminder_dismiss_{active_reminder.id}",
+                        use_container_width=True,
+                    ):
+                        _update_follow_up_reminder(active_reminder.id, "dismissed")
+                        st.rerun()
+                with reminder_controls[2]:
+                    if st.button(
+                        "Push +24h",
+                        key=f"reminder_push_{active_reminder.id}",
+                        use_container_width=True,
+                    ):
+                        _schedule_follow_up_reminder(
+                            result=result,
+                            email=email,
+                            classification=classification,
+                            note=active_reminder.note or reminder_note,
+                            due_in_hours=24,
+                            source="follow_up_radar",
+                        )
+                        st.rerun()
+    card_close()
+
+
+def _render_reminder_center() -> None:
+    active_reminders = _list_follow_up_reminders(status="active", limit=16)
+    completed_reminders = _list_follow_up_reminders(status="completed", limit=8)
+    due_now = [
+        reminder
+        for reminder in active_reminders
+        if reminder.due_at <= datetime.now(timezone.utc)
+    ]
+    upcoming = [
+        reminder
+        for reminder in active_reminders
+        if reminder.due_at > datetime.now(timezone.utc)
+    ]
+    card_open(
+        "Reminder Center",
+        (
+            "Persistent follow-up reminders for threads you do not want to lose. "
+            "This turns the radar into a real resurfacing workflow."
+        ),
+    )
+    render_pill_row(
+        [
+            (f"{len(due_now)} due now", "review" if due_now else "chip"),
+            (f"{len(upcoming)} upcoming", "chip"),
+            (f"{len(completed_reminders)} completed", "safe" if completed_reminders else "chip"),
+        ]
+    )
+    tabs = st.tabs(["Due Now", "Upcoming", "Completed"])
+    tab_payloads = [
+        (due_now, "No reminders are due right now."),
+        (upcoming, "No reminders are scheduled yet."),
+        (completed_reminders, "No reminders have been completed yet."),
+    ]
+    for tab, (items, empty_message) in zip(tabs, tab_payloads):
+        with tab:
+            if not items:
+                st.info(empty_message)
+                continue
+            for reminder in items[:6]:
+                with st.container(border=True):
+                    st.markdown(f"**{reminder.subject}**")
+                    render_pill_row(
+                        [
+                            (
+                                _format_due_label(reminder.due_at),
+                                "review" if reminder.status == "active" else "safe",
+                            ),
+                            (str(reminder.priority).upper(), "review"),
+                            (str(reminder.category), "chip"),
+                        ]
+                    )
+                    st.caption(reminder.sender)
+                    if reminder.note:
+                        st.write(reminder.note)
+                    elif reminder.preview:
+                        st.write(reminder.preview)
+                    if reminder.status == "active":
+                        action_cols = st.columns(3, gap="small")
+                        with action_cols[0]:
+                            if st.button(
+                                "Done",
+                                key=f"reminder_center_done_{reminder.id}",
+                                use_container_width=True,
+                            ):
+                                _update_follow_up_reminder(reminder.id, "completed")
+                                st.rerun()
+                        with action_cols[1]:
+                            if st.button(
+                                "Dismiss",
+                                key=f"reminder_center_dismiss_{reminder.id}",
+                                use_container_width=True,
+                            ):
+                                _update_follow_up_reminder(reminder.id, "dismissed")
+                                st.rerun()
+                        with action_cols[2]:
+                            if st.button(
+                                "Push +24h",
+                                key=f"reminder_center_push_{reminder.id}",
+                                use_container_width=True,
+                            ):
+                                fake_result = SimpleNamespace(
+                                    provider=reminder.provider,
+                                    run_id=reminder.run_id or "",
+                                )
+                                fake_email = SimpleNamespace(
+                                    id=reminder.email_id,
+                                    thread_id=reminder.thread_id,
+                                    sender=reminder.sender,
+                                    subject=reminder.subject,
+                                    snippet=reminder.preview,
+                                    body_preview=reminder.preview,
+                                )
+                                fake_classification = SimpleNamespace(
+                                    priority=reminder.priority,
+                                    category=reminder.category,
+                                )
+                                _schedule_follow_up_reminder(
+                                    result=fake_result,
+                                    email=fake_email,
+                                    classification=fake_classification,
+                                    note=reminder.note or reminder.preview,
+                                    due_in_hours=24,
+                                    source="reminder_center",
+                                )
+                                st.rerun()
+                    elif reminder.completed_at is not None:
+                        completed_label = reminder.completed_at.astimezone(
+                            timezone.utc
+                        ).strftime("%Y-%m-%d %H:%M UTC")
+                        st.caption(
+                            "Completed "
+                            f"{completed_label}"
+                        )
     card_close()
 
 
@@ -2432,6 +2723,7 @@ def main() -> None:
         with content_col:
             _render_recommendations(result, service)
         with side_col:
+            _render_reminder_center()
             _render_action_items(result)
             _render_suggested_replies(result)
             _render_provider_profile(result.provider, service)

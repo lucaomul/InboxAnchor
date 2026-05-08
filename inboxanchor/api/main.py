@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Optional
 
@@ -13,7 +13,13 @@ from inboxanchor.api.v1.routers.webhooks import router as webhook_router
 from inboxanchor.bootstrap import InboxAnchorService, list_provider_profiles
 from inboxanchor.infra.database import session_scope
 from inboxanchor.infra.repository import InboxRepository
-from inboxanchor.models import ProviderConnectionState, WorkspacePolicy, WorkspaceSettings
+from inboxanchor.models import (
+    FollowUpReminder,
+    FollowUpReminderStatus,
+    ProviderConnectionState,
+    WorkspacePolicy,
+    WorkspaceSettings,
+)
 
 APPROVAL_REGISTRY: dict[str, set[str]] = {}
 
@@ -61,6 +67,23 @@ class ProviderConnectionRequest(BaseModel):
     sync_enabled: bool = False
     dry_run_only: bool = True
     notes: str = ""
+
+
+class FollowUpReminderRequest(BaseModel):
+    provider: str
+    email_id: str
+    owner_email: str = "workspace@inboxanchor.local"
+    sender: str
+    subject: str
+    due_in_hours: int = Field(default=24, ge=1, le=720)
+    due_at: Optional[datetime] = None
+    thread_id: str = ""
+    run_id: Optional[str] = None
+    preview: str = ""
+    priority: str = "medium"
+    category: str = "unknown"
+    note: str = ""
+    source: str = "dashboard"
 
 
 @lru_cache
@@ -128,6 +151,77 @@ def save_provider_connection(provider: str, payload: ProviderConnectionRequest):
         **payload.model_dump(),
     )
     saved = service.save_provider_connection(state)
+    return saved.model_dump(mode="json")
+
+
+@app.get("/reminders")
+def list_follow_up_reminders(
+    owner_email: Optional[str] = None,
+    status: str = "active",
+    due_only: bool = False,
+    limit: int = 25,
+):
+    normalized_status = None if status in {"", "all"} else status
+    due_before = datetime.now(timezone.utc) if due_only else None
+    with session_scope() as session:
+        items = InboxRepository(session).list_follow_up_reminders(
+            owner_email=owner_email,
+            status=normalized_status,
+            due_before=due_before,
+            limit=limit,
+        )
+    return {
+        "count": len(items),
+        "items": [item.model_dump(mode="json") for item in items],
+    }
+
+
+@app.post("/reminders")
+def create_follow_up_reminder(payload: FollowUpReminderRequest):
+    due_at = payload.due_at or (
+        datetime.now(timezone.utc) + timedelta(hours=payload.due_in_hours)
+    )
+    reminder = FollowUpReminder(
+        provider=payload.provider,
+        email_id=payload.email_id,
+        owner_email=payload.owner_email,
+        thread_id=payload.thread_id,
+        run_id=payload.run_id,
+        sender=payload.sender,
+        subject=payload.subject,
+        preview=payload.preview,
+        priority=payload.priority,
+        category=payload.category,
+        note=payload.note,
+        source=payload.source,
+        due_at=due_at,
+    )
+    with session_scope() as session:
+        saved = InboxRepository(session).upsert_follow_up_reminder(reminder)
+    return saved.model_dump(mode="json")
+
+
+@app.post("/reminders/{reminder_id}/complete")
+def complete_follow_up_reminder(reminder_id: int):
+    with session_scope() as session:
+        saved = InboxRepository(session).update_follow_up_reminder_status(
+            reminder_id,
+            FollowUpReminderStatus.completed,
+        )
+    if saved is None:
+        raise HTTPException(status_code=404, detail="Reminder not found")
+    return saved.model_dump(mode="json")
+
+
+@app.post("/reminders/{reminder_id}/dismiss")
+def dismiss_follow_up_reminder(reminder_id: int):
+    with session_scope() as session:
+        saved = InboxRepository(session).update_follow_up_reminder_status(
+            reminder_id,
+            FollowUpReminderStatus.dismissed,
+        )
+    if saved is None:
+        raise HTTPException(status_code=404, detail="Reminder not found")
     return saved.model_dump(mode="json")
 
 

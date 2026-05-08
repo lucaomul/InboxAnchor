@@ -210,6 +210,71 @@ def test_provider_connection_roundtrip():
     assert payload["sync_enabled"] is True
 
 
+def test_follow_up_reminders_can_be_created_rescheduled_and_completed():
+    create_response = client.post(
+        "/reminders",
+        json={
+            "provider": "fake",
+            "email_id": "msg_003",
+            "owner_email": "luca@example.com",
+            "sender": "ceo@clientco.com",
+            "subject": "Urgent: contract review before 4 PM",
+            "preview": "Please review the latest contract redlines.",
+            "priority": "high",
+            "category": "work",
+            "note": "Follow up if no answer arrives.",
+            "due_in_hours": 4,
+        },
+    )
+
+    assert create_response.status_code == 200
+    first_payload = create_response.json()
+    assert first_payload["status"] == "active"
+
+    reschedule_response = client.post(
+        "/reminders",
+        json={
+            "provider": "fake",
+            "email_id": "msg_003",
+            "owner_email": "luca@example.com",
+            "sender": "ceo@clientco.com",
+            "subject": "Urgent: contract review before 4 PM",
+            "preview": "Please review the latest contract redlines.",
+            "priority": "high",
+            "category": "work",
+            "note": "Push this to tomorrow morning.",
+            "due_in_hours": 24,
+        },
+    )
+
+    assert reschedule_response.status_code == 200
+    rescheduled_payload = reschedule_response.json()
+    assert rescheduled_payload["id"] == first_payload["id"]
+    assert rescheduled_payload["note"] == "Push this to tomorrow morning."
+
+    list_response = client.get(
+        "/reminders",
+        params={"owner_email": "luca@example.com", "status": "active"},
+    )
+    assert list_response.status_code == 200
+    assert list_response.json()["count"] == 1
+
+    complete_response = client.post(f"/reminders/{first_payload['id']}/complete")
+    assert complete_response.status_code == 200
+    assert complete_response.json()["status"] == "completed"
+
+    active_after = client.get(
+        "/reminders",
+        params={"owner_email": "luca@example.com", "status": "active"},
+    )
+    completed_after = client.get(
+        "/reminders",
+        params={"owner_email": "luca@example.com", "status": "completed"},
+    )
+    assert active_after.json()["count"] == 0
+    assert completed_after.json()["count"] == 1
+
+
 def test_triage_pagination_endpoints_expose_totals():
     run_response = client.post(
         "/triage/run",

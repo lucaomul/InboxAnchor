@@ -12,7 +12,7 @@ InboxAnchor is a safety-first inbox triage system for overloaded email accounts.
 - Runs a safety verifier before any mailbox action is executed
 - Separates recommendations into safe, requires-approval, and blocked lanes
 - Persists triage runs, recommendations, audit history, provider state, and workspace settings
-- Supports bulk lane actions, operator playbooks, focus views, and follow-up radar in the dashboard
+- Supports bulk lane actions, operator playbooks, focus views, follow-up radar, and reminder center workflows in the dashboard
 - Exposes a FastAPI backend and a Streamlit workspace on top of the same core engine
 
 ## Architecture
@@ -202,6 +202,10 @@ The Streamlit workspace is account-aware and requires sign-in unless you intenti
 - `PUT /settings/workspace` — save workspace defaults and policy
 - `GET /providers/{provider}/connection` — get stored provider connection state
 - `PUT /providers/{provider}/connection` — save provider connection state
+- `GET /reminders` — list follow-up reminders for the current workspace actor
+- `POST /reminders` — create or reschedule a follow-up reminder
+- `POST /reminders/{reminder_id}/complete` — mark a reminder as completed
+- `POST /reminders/{reminder_id}/dismiss` — remove a reminder from the active queue
 
 ### Triage and Execution
 
@@ -241,6 +245,7 @@ The Streamlit workspace currently includes:
 - approval center and decision lanes
 - focus inbox split into reply pressure, approvals, sensitive mail, and cleanup
 - follow-up radar for stale reply pressure
+- reminder center for persistent resurfacing, done states, and soft dismissals
 - action items and suggested replies
 - workspace settings, policy studio, and provider setup
 - run explorer and audit timeline

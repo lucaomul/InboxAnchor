@@ -159,8 +159,12 @@ def inject_styles() -> None:
             background: rgba(248,250,252,0.74);
             border: 1px solid rgba(148,163,184,0.18);
             border-radius: 18px;
-            padding: 0.95rem 1rem 0.7rem 1rem;
+            padding: 1rem 1rem 0.82rem 1rem;
             overflow: hidden;
+        }
+        div[data-testid="stForm"] div[data-testid="stHorizontalBlock"] {
+            align-items: flex-start;
+            gap: 0.85rem;
         }
         div[data-testid="stRadio"] {
             margin: 0.15rem 0 0.65rem 0;
@@ -181,20 +185,79 @@ def inject_styles() -> None:
             font-weight: 700;
         }
         div[data-testid="stForm"] [data-testid="stTextInputRootElement"] {
-            margin-bottom: 0.25rem;
+            margin-bottom: 0.38rem;
         }
         div[data-testid="stForm"] .stTextInput {
-            margin-bottom: 0.28rem;
+            margin-bottom: 0.5rem;
+            width: 100%;
+        }
+        div[data-testid="stForm"] [data-baseweb="input"] {
+            width: 100%;
+            align-items: center;
+        }
+        div[data-testid="stForm"] [data-baseweb="input"] > div {
+            min-height: auto;
+        }
+        div[data-testid="stForm"] [data-baseweb="input"] input {
+            min-height: 1.35rem;
+            padding-top: 0.82rem !important;
+            padding-bottom: 0.82rem !important;
+            padding-right: 1rem !important;
+            color: #111827 !important;
+            caret-color: #0f172a !important;
+        }
+        div[data-testid="stForm"] [data-baseweb="input"] input::placeholder {
+            color: rgba(15, 23, 42, 0.44) !important;
+            opacity: 1 !important;
+        }
+        div[data-testid="stForm"] input::-webkit-credentials-auto-fill-button,
+        div[data-testid="stForm"] input::-webkit-contacts-auto-fill-button,
+        div[data-testid="stForm"] input::-webkit-strong-password-auto-fill-button {
+            visibility: hidden !important;
+            display: none !important;
+            pointer-events: none !important;
+            width: 0 !important;
+            margin: 0 !important;
+        }
+        div[data-testid="stForm"] [data-testid="InputInstructions"] {
+            display: none !important;
         }
         div[data-testid="stForm"] [data-testid="stCaptionContainer"] {
-            margin-top: 0.15rem;
-            margin-bottom: 0.55rem;
+            margin-top: 0.05rem;
+            margin-bottom: 0.65rem;
         }
         div[data-testid="stForm"] [data-testid="stFormSubmitButton"] {
-            margin-top: 0.1rem;
+            margin-top: 0.2rem;
+        }
+        div[data-testid="stForm"] [data-testid="stFormSubmitButton"] button {
+            color: #f8fafc !important;
+            font-weight: 700 !important;
+        }
+        div[data-testid="stForm"] [data-testid="stFormSubmitButton"] button p,
+        div[data-testid="stForm"] [data-testid="stFormSubmitButton"] button span {
+            color: #f8fafc !important;
+            font-weight: 700 !important;
+        }
+        div[data-testid="stForm"] [data-testid="stFormSubmitButton"] button:disabled {
+            opacity: 1 !important;
+            color: #cbd5e1 !important;
+        }
+        div[data-testid="stForm"] [data-testid="stFormSubmitButton"] button:disabled p,
+        div[data-testid="stForm"] [data-testid="stFormSubmitButton"] button:disabled span {
+            color: #cbd5e1 !important;
+        }
+        div[data-testid="stForm"] h5,
+        div[data-testid="stForm"] h4 {
+            margin: 0.15rem 0 0.55rem 0;
         }
         input[type="password"] {
             letter-spacing: normal;
+        }
+        div[data-testid="stForm"] input[placeholder="Enter your password"],
+        div[data-testid="stForm"] input[placeholder="Minimum 8 characters"],
+        div[data-testid="stForm"] input[placeholder="Repeat password"] {
+            -webkit-text-security: disc;
+            text-security: disc;
         }
         div[data-testid="stExpander"] {
             border-radius: 18px;
@@ -263,6 +326,80 @@ def inject_styles() -> None:
         div[data-testid="stPopover"] * {
             color: #0f172a !important;
         }
+        .ia-app-bar {
+            background: linear-gradient(180deg, rgba(15,23,42,0.98), rgba(17,24,39,0.96));
+            color: white;
+            border-radius: 24px;
+            padding: 1rem 1.2rem;
+            box-shadow: 0 18px 42px rgba(15, 23, 42, 0.18);
+            margin-bottom: 0.75rem;
+            border: 1px solid rgba(255,255,255,0.06);
+        }
+        .ia-app-bar-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1.15fr) minmax(280px, 0.85fr);
+            gap: 1rem;
+            align-items: center;
+        }
+        .ia-app-kicker {
+            font-size: 0.76rem;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            color: rgba(226,232,240,0.72);
+            font-weight: 800;
+            margin-bottom: 0.35rem;
+        }
+        .ia-app-title {
+            font-size: 1.5rem;
+            font-weight: 800;
+            line-height: 1.1;
+            margin: 0;
+            color: rgba(248,250,252,0.98);
+        }
+        .ia-app-copy {
+            margin-top: 0.4rem;
+            color: rgba(226,232,240,0.82);
+            font-size: 0.92rem;
+            line-height: 1.5;
+            max-width: 760px;
+        }
+        .ia-app-meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.45rem;
+            justify-content: flex-end;
+            align-items: center;
+        }
+        .ia-briefing {
+            background: rgba(255,255,255,0.9);
+            border: 1px solid var(--ia-line);
+            border-radius: 22px;
+            padding: 1rem 1.1rem;
+            box-shadow: 0 14px 34px rgba(15, 23, 42, 0.08);
+            margin-bottom: 0.9rem;
+        }
+        .ia-briefing-kicker {
+            font-size: 0.74rem;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            color: #64748b;
+            font-weight: 800;
+            margin-bottom: 0.35rem;
+        }
+        .ia-briefing-title {
+            font-size: 1.02rem;
+            line-height: 1.3;
+            font-weight: 800;
+            color: #0f172a;
+            margin: 0;
+        }
+        .ia-briefing-copy {
+            margin-top: 0.32rem;
+            color: #475569;
+            font-size: 0.9rem;
+            line-height: 1.5;
+            max-width: 820px;
+        }
         .ia-hero {
             background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 70%, #2563eb 100%);
             color: white;
@@ -283,6 +420,7 @@ def inject_styles() -> None:
             background: rgba(255,255,255,0.11);
             filter: blur(2px);
         }
+        .ia-app-bar *,
         .ia-hero h1,
         .ia-hero p,
         .ia-hero span,
@@ -875,7 +1013,8 @@ def inject_styles() -> None:
             color: #525252 !important;
         }
         .ia-hero,
-        .ia-stick-stage {
+        .ia-stick-stage,
+        .ia-app-bar {
             background: #111111 !important;
             color: #ffffff !important;
             border: 1px solid rgba(255,255,255,0.08) !important;
@@ -892,6 +1031,13 @@ def inject_styles() -> None:
         .ia-hero span,
         .ia-hero div,
         .ia-hero small,
+        .ia-app-bar h1,
+        .ia-app-bar h2,
+        .ia-app-bar h3,
+        .ia-app-bar p,
+        .ia-app-bar span,
+        .ia-app-bar div,
+        .ia-app-bar small,
         .ia-stick-stage h1,
         .ia-stick-stage h2,
         .ia-stick-stage h3,
@@ -915,6 +1061,12 @@ def inject_styles() -> None:
             background: rgba(255,255,255,0.08) !important;
             color: #ffffff !important;
             border: 1px solid rgba(255,255,255,0.18) !important;
+        }
+        .ia-app-bar-grid {
+            grid-template-columns: 1fr !important;
+        }
+        .ia-app-meta {
+            justify-content: flex-start !important;
         }
         .ia-callout-info,
         .ia-callout-warning,
@@ -967,6 +1119,29 @@ def inject_styles() -> None:
             background: #ffffff !important;
             color: #111111 !important;
             border: 1px solid rgba(17,17,17,0.18) !important;
+        }
+        body [data-baseweb="input"] > div {
+            overflow: hidden !important;
+        }
+        body [data-baseweb="input"] > div > div:last-child {
+            background: #ffffff !important;
+            border-left: 1px solid rgba(17,17,17,0.14) !important;
+        }
+        body [data-baseweb="input"] button {
+            background: #ffffff !important;
+            color: #111111 !important;
+            border: none !important;
+            box-shadow: none !important;
+            padding-left: 0.85rem !important;
+            padding-right: 0.85rem !important;
+            min-height: 100% !important;
+            border-radius: 0 !important;
+        }
+        body [data-baseweb="input"] button:hover,
+        body [data-baseweb="input"] button:focus,
+        body [data-baseweb="input"] button:active {
+            background: #f5f5f5 !important;
+            color: #111111 !important;
         }
         body [data-baseweb="select"] *,
         body [data-baseweb="input"] *,
@@ -1052,6 +1227,49 @@ def card_open(title: str, subtitle: Optional[str] = None) -> None:
 
 def card_close() -> None:
     st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_app_bar(
+    kicker: str,
+    title: str,
+    body: str,
+    tags: Iterable[str],
+) -> None:
+    pills = "".join(
+        f'<span class="ia-chip ia-chip-dark">{escape(tag)}</span>' for tag in tags if tag
+    )
+    st.markdown(
+        "\n".join(
+            [
+                '<div class="ia-app-bar">',
+                '<div class="ia-app-bar-grid">',
+                '<div>',
+                f'<div class="ia-app-kicker">{escape(kicker)}</div>',
+                f'<div class="ia-app-title">{escape(title)}</div>',
+                f'<div class="ia-app-copy">{escape(body)}</div>',
+                "</div>",
+                f'<div class="ia-app-meta">{pills}</div>',
+                "</div>",
+                "</div>",
+            ]
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def render_briefing(title: str, body: str, *, kicker: str = "Workspace") -> None:
+    st.markdown(
+        "\n".join(
+            [
+                '<div class="ia-briefing">',
+                f'<div class="ia-briefing-kicker">{escape(kicker)}</div>',
+                f'<div class="ia-briefing-title">{escape(title)}</div>',
+                f'<div class="ia-briefing-copy">{escape(body)}</div>',
+                "</div>",
+            ]
+        ),
+        unsafe_allow_html=True,
+    )
 
 
 def render_metric_bar(items: Iterable[dict]) -> None:

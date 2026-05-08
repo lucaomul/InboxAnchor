@@ -15,6 +15,7 @@ from inboxanchor.models.email import (
 )
 from inboxanchor.models.policy import WorkspacePolicy, WorkspaceSettings
 from inboxanchor.models.provider import ProviderConnectionState, ProviderProfile
+from inboxanchor.models.reminder import FollowUpReminder, FollowUpReminderStatus
 
 __all__ = [
     "AccountUser",
@@ -29,6 +30,8 @@ __all__ = [
     "InboxDigest",
     "PriorityLevel",
     "ProviderConnectionState",
+    "FollowUpReminder",
+    "FollowUpReminderStatus",
     "RecommendationStatus",
     "SafetyStatus",
     "TriageRunResult",

@@ -162,6 +162,32 @@ class ProviderCheckpointORM(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class FollowUpReminderORM(Base):
+    __tablename__ = "follow_up_reminders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(String(32), index=True)
+    email_id: Mapped[str] = mapped_column(String(128), index=True)
+    owner_email: Mapped[str] = mapped_column(String(255), index=True)
+    thread_id: Mapped[str] = mapped_column(String(128), default="")
+    run_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    sender: Mapped[str] = mapped_column(String(255))
+    subject: Mapped[str] = mapped_column(Text)
+    preview: Mapped[str] = mapped_column(Text, default="")
+    priority: Mapped[str] = mapped_column(String(16), default="medium")
+    category: Mapped[str] = mapped_column(String(32), default="unknown")
+    note: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(String(32), default="dashboard")
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    status: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+
 class AccountUserORM(Base):
     __tablename__ = "account_users"
 

@@ -10,6 +10,7 @@ from inboxanchor.infra.database import (
     AuditLogORM,
     ClassificationORM,
     EmailRecordORM,
+    FollowUpReminderORM,
     ProviderCheckpointORM,
     ProviderConnectionORM,
     RecommendationORM,
@@ -18,6 +19,8 @@ from inboxanchor.infra.database import (
 )
 from inboxanchor.models import (
     AuditLogEntry,
+    FollowUpReminder,
+    FollowUpReminderStatus,
     ProviderConnectionState,
     TriageRunResult,
     WorkspaceSettings,
@@ -27,6 +30,29 @@ from inboxanchor.models import (
 class InboxRepository:
     def __init__(self, session):
         self.session = session
+
+    @staticmethod
+    def _reminder_model(row: FollowUpReminderORM) -> FollowUpReminder:
+        return FollowUpReminder(
+            id=row.id,
+            provider=row.provider,
+            email_id=row.email_id,
+            owner_email=row.owner_email,
+            thread_id=row.thread_id,
+            run_id=row.run_id,
+            sender=row.sender,
+            subject=row.subject,
+            preview=row.preview,
+            priority=row.priority,
+            category=row.category,
+            note=row.note,
+            source=row.source,
+            due_at=row.due_at,
+            status=row.status,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+            completed_at=row.completed_at,
+        )
 
     def save_run(
         self,
@@ -211,6 +237,104 @@ class InboxRepository:
         else:
             row.checkpoint_value = checkpoint_value
             row.updated_at = datetime.now(timezone.utc)
+
+    def upsert_follow_up_reminder(
+        self,
+        reminder: FollowUpReminder,
+    ) -> FollowUpReminder:
+        row = (
+            self.session.query(FollowUpReminderORM)
+            .filter(
+                FollowUpReminderORM.provider == reminder.provider,
+                FollowUpReminderORM.email_id == reminder.email_id,
+                FollowUpReminderORM.owner_email == reminder.owner_email,
+                FollowUpReminderORM.status == FollowUpReminderStatus.active,
+            )
+            .order_by(FollowUpReminderORM.created_at.desc())
+            .first()
+        )
+        payload = reminder.model_dump(mode="json")
+        if row is None:
+            row = FollowUpReminderORM(
+                provider=payload["provider"],
+                email_id=payload["email_id"],
+                owner_email=payload["owner_email"],
+                thread_id=payload["thread_id"],
+                run_id=payload["run_id"],
+                sender=payload["sender"],
+                subject=payload["subject"],
+                preview=payload["preview"],
+                priority=payload["priority"],
+                category=payload["category"],
+                note=payload["note"],
+                source=payload["source"],
+                due_at=reminder.due_at,
+                status=payload["status"],
+                created_at=reminder.created_at,
+                updated_at=reminder.updated_at,
+                completed_at=reminder.completed_at,
+            )
+            self.session.add(row)
+            self.session.flush()
+            return self._reminder_model(row)
+
+        row.thread_id = payload["thread_id"]
+        row.run_id = payload["run_id"]
+        row.sender = payload["sender"]
+        row.subject = payload["subject"]
+        row.preview = payload["preview"]
+        row.priority = payload["priority"]
+        row.category = payload["category"]
+        row.note = payload["note"]
+        row.source = payload["source"]
+        row.due_at = reminder.due_at
+        row.status = payload["status"]
+        row.updated_at = reminder.updated_at
+        row.completed_at = reminder.completed_at
+        self.session.flush()
+        return self._reminder_model(row)
+
+    def list_follow_up_reminders(
+        self,
+        *,
+        owner_email: Optional[str] = None,
+        status: Optional[str] = None,
+        due_before: Optional[datetime] = None,
+        limit: int = 25,
+    ) -> list[FollowUpReminder]:
+        query = self.session.query(FollowUpReminderORM)
+        if owner_email:
+            query = query.filter(FollowUpReminderORM.owner_email == owner_email)
+        if status:
+            query = query.filter(FollowUpReminderORM.status == status)
+        if due_before is not None:
+            query = query.filter(FollowUpReminderORM.due_at <= due_before)
+        rows = (
+            query.order_by(
+                FollowUpReminderORM.due_at.asc(),
+                FollowUpReminderORM.updated_at.desc(),
+            )
+            .limit(limit)
+            .all()
+        )
+        return [self._reminder_model(row) for row in rows]
+
+    def update_follow_up_reminder_status(
+        self,
+        reminder_id: int,
+        status: str,
+    ) -> Optional[FollowUpReminder]:
+        row = self.session.get(FollowUpReminderORM, reminder_id)
+        if row is None:
+            return None
+        row.status = status
+        row.updated_at = datetime.now(timezone.utc)
+        if status == FollowUpReminderStatus.completed:
+            row.completed_at = row.updated_at
+        elif status == FollowUpReminderStatus.dismissed:
+            row.completed_at = None
+        self.session.flush()
+        return self._reminder_model(row)
 
     def list_run_emails(self, run_id: str, *, limit: int = 50, offset: int = 0) -> list[dict]:
         rows = (
