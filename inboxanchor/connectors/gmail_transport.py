@@ -17,6 +17,7 @@ from inboxanchor.connectors.gmail_client import GmailTransport
 from inboxanchor.connectors.oauth_flow import get_credentials
 from inboxanchor.core.time_windows import gmail_query_with_time_range, in_time_window
 from inboxanchor.infra.text_normalizer import normalize_email_body_text
+from inboxanchor.mail_intelligence import dedupe_labels
 from inboxanchor.models import EmailMessage
 
 logger = logging.getLogger(__name__)
@@ -498,17 +499,7 @@ class GoogleAPITransport(GmailTransport):
         if label_name in self._label_cache:
             return self._label_cache[label_name]
 
-        if self._service is not None:
-            service = self._build_service()
-            labels = self._execute_legacy(service.users().labels().list(userId=self.user_id)).get(
-                "labels",
-                [],
-            )
-        else:
-            labels = self._request_json("GET", "labels").get("labels", [])
-        for item in labels:
-            self._label_cache[item["name"]] = item["id"]
-
+        self._refresh_label_cache()
         if label_name in self._label_cache:
             return self._label_cache[label_name]
 
@@ -537,6 +528,37 @@ class GoogleAPITransport(GmailTransport):
         self._label_cache[label_name] = created["id"]
         return created["id"]
 
+    def _refresh_label_cache(self) -> None:
+        if self._service is not None:
+            service = self._build_service()
+            labels = self._execute_legacy(service.users().labels().list(userId=self.user_id)).get(
+                "labels",
+                [],
+            )
+        else:
+            labels = self._request_json("GET", "labels").get("labels", [])
+        self._label_cache.clear()
+        for item in labels:
+            self._label_cache[item["name"]] = item["id"]
+
+    def _existing_label_id(self, label_name: str) -> Optional[str]:
+        normalized = label_name.strip()
+        if not normalized:
+            return None
+        if normalized not in self._label_cache:
+            self._refresh_label_cache()
+        return self._label_cache.get(normalized)
+
+    @staticmethod
+    def _is_missing_label_error(exc: Exception) -> bool:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if status_code == 404:
+            return True
+        legacy_status = getattr(getattr(exc, "resp", None), "status", None)
+        if legacy_status == 404:
+            return True
+        return "404" in str(exc)
+
     def apply_labels(self, email_ids: list[str], labels: list[str]) -> None:
         if not labels:
             return
@@ -548,6 +570,40 @@ class GoogleAPITransport(GmailTransport):
             return
         label_ids = [self._label_name_to_id(label) for label in labels]
         self._batch_modify(email_ids, remove_label_ids=label_ids)
+
+    def _delete_label(self, label_id: str) -> None:
+        if self._service is not None:
+            service = self._build_service()
+            self._execute_legacy(
+                service.users().labels().delete(
+                    userId=self.user_id,
+                    id=label_id,
+                )
+            )
+            return
+        self._request_json(
+            "DELETE",
+            f"labels/{quote(label_id, safe='')}",
+        )
+
+    def delete_labels(self, labels: list[str]) -> None:
+        if not labels:
+            return
+        for label_name in dedupe_labels(labels):
+            normalized = label_name.strip()
+            if not normalized:
+                continue
+            label_id = self._existing_label_id(normalized)
+            if not label_id:
+                continue
+            try:
+                self._delete_label(label_id)
+            except Exception as exc:
+                if self._is_missing_label_error(exc):
+                    self._label_cache.pop(normalized, None)
+                    continue
+                raise
+            self._label_cache.pop(normalized, None)
 
     def _list_filters(self) -> list[dict]:
         if self._service is not None:

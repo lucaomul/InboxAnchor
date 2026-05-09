@@ -191,6 +191,25 @@ class FakeEmailProvider(EmailProvider):
             details=f"Removed labels: {', '.join(labels)}",
         )
 
+    def delete_labels(
+        self,
+        labels: list[str],
+        *,
+        dry_run: bool = True,
+    ) -> ProviderActionResult:
+        if not dry_run:
+            for email in self._emails.values():
+                existing = {label for label in email.labels if label not in labels}
+                email.labels = sorted(existing)
+        return ProviderActionResult(
+            provider=self.provider_name,
+            action="delete_labels",
+            email_ids=[],
+            dry_run=dry_run,
+            executed=not dry_run,
+            details=f"Deleted label definitions: {', '.join(labels)}",
+        )
+
     def supports_outbound_email(self) -> bool:
         return True
 

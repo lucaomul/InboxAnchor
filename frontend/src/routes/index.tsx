@@ -85,12 +85,22 @@ function CommandCenter() {
     cleanLabelsMutation.isPending ||
     cleanupMutation.isPending ||
     fullAnchorMutation.isPending;
-  const { data: progress } = useOpsProgress(timeRange, isLoading || busy);
+  const shouldPollProgress =
+    isLoading ||
+    busy ||
+    overview?.providerStatus === "checking" ||
+    Boolean(overview?.mailboxMemory && !overview.mailboxMemory.completed);
+  const { data: progress } = useOpsProgress(timeRange, shouldPollProgress);
   const showLoader =
     isLoading ||
     busy ||
     progress?.status === "running" ||
     overview?.providerStatus === "checking";
+  const showPausedMailboxMemory =
+    !showLoader &&
+    overview?.liveConnected &&
+    progress?.mode === "backfill" &&
+    progress?.status === "paused";
   const progressStats = progress
     ? progress.mode === "backfill"
       ? [
@@ -287,6 +297,37 @@ function CommandCenter() {
                       activity={progressActivity}
                       message={progressMessage}
                     />
+                  </div>
+                )}
+                {showPausedMailboxMemory && (
+                  <div className="rounded-2xl border border-border bg-background/70 p-4">
+                    <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                      <div className="space-y-2">
+                        <p className="text-sm font-medium text-foreground">
+                          Live mailbox connected. Historical mailbox memory is paused, not broken.
+                        </p>
+                        <p className="text-sm leading-6 text-muted-foreground">
+                          InboxAnchor can already see the real unread set, and it has cached{" "}
+                          <span className="font-medium text-foreground">{progress.cached_count}</span>{" "}
+                          emails so far with{" "}
+                          <span className="font-medium text-foreground">{progress.hydrated_count}</span>{" "}
+                          full bodies ready instantly. Resume the backfill any time to keep working
+                          deeper into the archive.
+                        </p>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <Badge variant="outline">
+                          {progress.processed_count} / {progress.target_count} cached
+                        </Badge>
+                        <Button
+                          variant="outline"
+                          onClick={() => backfillMutation.mutate(timeRange)}
+                          disabled={busy}
+                        >
+                          Continue mailbox memory
+                        </Button>
+                      </div>
+                    </div>
                   </div>
                 )}
               </div>

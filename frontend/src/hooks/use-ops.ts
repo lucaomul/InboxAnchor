@@ -108,8 +108,13 @@ export function useRunLabelCleanup() {
     mutationFn: (timeRange: MailboxTimeRange) => runLabelCleanup(timeRange),
     onSuccess: (result) => {
       invalidate();
+      const deletedLabelCount =
+        typeof result.deletedLabelCount === "number" ? result.deletedLabelCount : 0;
       toast.success("InboxAnchor labels removed", {
-        description: `${result.count || 0} emails had InboxAnchor-generated labels removed without touching the messages.`,
+        description:
+          deletedLabelCount > 0
+            ? `${result.count || 0} emails were cleaned, and ${deletedLabelCount} InboxAnchor label definitions were deleted from the mailbox too.`
+            : `${result.count || 0} emails had InboxAnchor-generated labels removed without touching the messages.`,
       });
     },
     onError: (err) => toast.error(`Failed to clean labels: ${err.message}`),

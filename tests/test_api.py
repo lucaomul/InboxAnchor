@@ -618,6 +618,8 @@ def test_frontend_clean_labels_removes_inboxanchor_labels_only():
     cleanup_response = client.post("/ops/clean-labels", json={"force_refresh": True})
     assert cleanup_response.status_code == 200
     assert cleanup_response.json()["count"] >= 1
+    assert cleanup_response.json()["deletedLabelCount"] >= 1
+    assert cleanup_response.json()["deletedLabels"]
 
     emails_after_cleanup = client.get("/emails").json()["emails"]
     generated_labels_after = {
@@ -631,6 +633,85 @@ def test_frontend_clean_labels_removes_inboxanchor_labels_only():
     assert sum(len(labels) for labels in generated_labels_after.values()) < sum(
         len(labels) for labels in generated_labels_before.values()
     )
+
+
+def test_frontend_clean_labels_uses_fast_gmail_delete_path_without_rescan(monkeypatch):
+    from inboxanchor.api.v1.routers import frontend as frontend_router
+
+    ensure_calls: list[tuple[str | None, bool, str | None]] = []
+    delete_calls: list[list[str]] = []
+
+    def fake_ensure_frontend_run(*, provider=None, force=False, time_range=None):
+        ensure_calls.append((provider, force, time_range))
+        return "gmail-run-1", "gmail"
+
+    monkeypatch.setattr(frontend_router, "_ensure_frontend_run", fake_ensure_frontend_run)
+    monkeypatch.setattr(
+        frontend_router,
+        "_load_email_details",
+        lambda run_id: [
+            {
+                "email_id": "msg-1",
+                "subject": "LinkedIn Jobs",
+                "labels": ["jobs/alert", "priority/high"],
+                "classification": {"confidence": 0.96},
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_labels_to_remove_for_email",
+        lambda detail: ["jobs/alert", "priority/high"],
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_record_label_removal_decision",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_remove_provider_labels",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Gmail fast cleanup should not unlabel messages one by one.")
+        ),
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_delete_provider_labels",
+        lambda provider_name, labels: (
+            delete_calls.append(labels)
+            or {
+                "provider": provider_name,
+                "action": "delete_labels",
+                "deletedLabels": labels,
+                "deletedCount": len(labels),
+                "details": "Deleted Gmail labels directly.",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_build_ops_overview",
+        lambda provider_name, run_id, time_range=None: {
+            "provider": provider_name,
+            "runId": run_id,
+            "timeRange": "all_time",
+            "timeRangeLabel": "All time",
+        },
+    )
+
+    response = client.post(
+        "/ops/clean-labels",
+        json={"provider": "gmail", "force_refresh": True, "time_range": "all_time"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["count"] == 1
+    assert payload["deletedLabelCount"] == 2
+    assert payload["deletedLabels"] == ["jobs/alert", "priority/high"]
+    assert ensure_calls == [("gmail", False, "all_time")]
+    assert delete_calls == [["jobs/alert"], ["priority/high"]]
 
 
 def test_frontend_ops_backfill_builds_mailbox_memory_cache():
@@ -1088,6 +1169,72 @@ def test_frontend_ops_progress_reflects_registry_state():
     assert payload["processed_count"] == 12
     assert payload["read_count"] == 16
     assert payload["latest_subject"] == "Quarterly budget review"
+
+
+def test_frontend_ops_progress_reconciles_empty_stale_scan(monkeypatch):
+    frontend_router.FRONTEND_PROGRESS["gmail::all_time"] = {
+        "provider": "gmail",
+        "time_range": "all_time",
+        "time_range_label": "All time",
+        "mode": "scan",
+        "status": "running",
+        "stage": "starting",
+        "target_count": 10000,
+        "processed_count": 0,
+        "read_count": 0,
+        "action_item_count": 0,
+        "recommendation_count": 0,
+        "batch_count": 0,
+        "cached_count": 0,
+        "hydrated_count": 0,
+        "labeled_count": 0,
+        "labels_removed_count": 0,
+        "archived_count": 0,
+        "marked_read_count": 0,
+        "trashed_count": 0,
+        "reply_sent_count": 0,
+        "latest_subject": None,
+        "latest_action": None,
+        "run_id": None,
+        "error": None,
+        "updated_at": "2026-05-09T08:00:00Z",
+    }
+    frontend_router.FRONTEND_ACTIVE_RUNS.clear()
+    monkeypatch.setattr(
+        frontend_router,
+        "_get_cached_or_latest_run_id",
+        lambda provider_name, time_range=None: "live-run-123",
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_build_ops_overview",
+        lambda provider_name, run_id, time_range=None: {
+            "provider": provider_name,
+            "timeRange": "all_time",
+            "timeRangeLabel": "All time",
+            "unreadCount": 245,
+            "safeCleanupCount": 18,
+            "needsApprovalCount": 7,
+            "blockedCount": 3,
+            "cachedEmailsCount": 612,
+            "hydratedEmailsCount": 401,
+            "oldestCachedAt": "2026-05-01T10:00:00Z",
+            "newestCachedAt": "2026-05-09T10:00:00Z",
+        },
+    )
+
+    response = client.get("/ops/progress", params={"provider": "gmail"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "complete"
+    assert payload["stage"] == "ready"
+    assert payload["run_id"] == "live-run-123"
+    assert payload["processed_count"] == 245
+    assert payload["read_count"] == 245
+    assert payload["recommendation_count"] == 28
+    assert payload["cached_count"] == 612
+    assert payload["hydrated_count"] == 401
 
 
 def test_frontend_ensure_run_reuses_inflight_provider_job(monkeypatch):

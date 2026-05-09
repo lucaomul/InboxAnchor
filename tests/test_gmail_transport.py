@@ -366,6 +366,88 @@ def test_google_api_transport_apply_labels_uses_batch_modify_endpoint():
     assert session.calls[1][3]["addLabelIds"] == ["Label_1"]
 
 
+def test_google_api_transport_can_delete_labels_from_gmail():
+    session = StubSession(
+        [
+            StubResponse(
+                {
+                    "labels": [
+                        {"id": "Label_1", "name": "priority/high"},
+                        {"id": "Label_2", "name": "jobs/alert"},
+                    ]
+                }
+            ),
+            StubResponse({}),
+            StubResponse({}),
+        ]
+    )
+    transport = GoogleAPITransport(
+        credentials_path="~/credentials.json",
+        token_path="~/token.json",
+        session=session,
+    )
+
+    transport.delete_labels(["priority/high", "jobs/alert"])
+
+    assert session.calls[0][0] == "GET"
+    assert session.calls[0][1].endswith("/users/me/labels")
+    assert session.calls[1][0] == "DELETE"
+    assert session.calls[1][1].endswith("/users/me/labels/Label_1")
+    assert session.calls[2][0] == "DELETE"
+    assert session.calls[2][1].endswith("/users/me/labels/Label_2")
+
+
+def test_google_api_transport_skips_missing_labels_during_delete():
+    session = StubSession(
+        [
+            StubResponse(
+                {
+                    "labels": [
+                        {"id": "Label_1", "name": "priority/high"},
+                    ]
+                }
+            ),
+            StubResponse({}),
+        ]
+    )
+    transport = GoogleAPITransport(
+        credentials_path="~/credentials.json",
+        token_path="~/token.json",
+        session=session,
+    )
+
+    transport.delete_labels(["priority/high", "jobs/alert"])
+
+    assert session.calls[0][0] == "GET"
+    assert session.calls[1][0] == "DELETE"
+    assert len(session.calls) == 2
+
+
+def test_google_api_transport_ignores_404_when_label_was_already_deleted():
+    session = StubSession(
+        [
+            StubResponse(
+                {
+                    "labels": [
+                        {"id": "Label_1", "name": "priority/high"},
+                    ]
+                }
+            ),
+            StubResponse({}, status_code=404),
+        ]
+    )
+    transport = GoogleAPITransport(
+        credentials_path="~/credentials.json",
+        token_path="~/token.json",
+        session=session,
+    )
+
+    transport.delete_labels(["priority/high"])
+
+    assert session.calls[0][0] == "GET"
+    assert session.calls[1][0] == "DELETE"
+
+
 def test_google_api_transport_can_create_alias_routing_filter():
     session = StubSession(
         [

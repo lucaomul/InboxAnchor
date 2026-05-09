@@ -325,6 +325,54 @@ class InboxRepository:
         self.session.flush()
         return self._mailbox_email_payload(row)
 
+    def remove_labels_from_run_emails(
+        self,
+        run_id: str,
+        labels: list[str],
+        *,
+        email_ids: Optional[list[str]] = None,
+    ) -> int:
+        if not labels:
+            return 0
+        label_set = set(labels)
+        query = self.session.query(EmailRecordORM).filter(EmailRecordORM.run_id == run_id)
+        if email_ids:
+            query = query.filter(EmailRecordORM.email_id.in_(email_ids))
+        rows = query.all()
+        updated = 0
+        for row in rows:
+            next_labels = [label for label in row.labels if label not in label_set]
+            if next_labels == row.labels:
+                continue
+            row.labels = next_labels
+            updated += 1
+        self.session.flush()
+        return updated
+
+    def remove_labels_from_mailbox(
+        self,
+        provider: str,
+        labels: list[str],
+        *,
+        email_ids: Optional[list[str]] = None,
+    ) -> int:
+        if not labels:
+            return 0
+        label_set = set(labels)
+        query = self.session.query(MailboxEmailORM).filter(MailboxEmailORM.provider == provider)
+        if email_ids:
+            query = query.filter(MailboxEmailORM.email_id.in_(email_ids))
+        rows = query.all()
+        updated = 0
+        for row in rows:
+            next_labels = [label for label in row.labels if label not in label_set]
+            if next_labels == row.labels:
+                continue
+            row.labels = next_labels
+            updated += 1
+        self.session.flush()
+        return updated
+
     def get_mailbox_email(self, provider: str, email_id: str) -> Optional[dict]:
         row = (
             self.session.query(MailboxEmailORM)

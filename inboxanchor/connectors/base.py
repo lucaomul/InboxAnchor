@@ -150,6 +150,23 @@ class EmailProvider(ABC):
     ) -> ProviderActionResult:
         raise NotImplementedError
 
+    def delete_labels(
+        self,
+        labels: list[str],
+        *,
+        dry_run: bool = True,
+    ) -> ProviderActionResult:
+        return ProviderActionResult(
+            provider=self.provider_name,
+            action="delete_labels",
+            email_ids=[],
+            dry_run=dry_run,
+            executed=False,
+            details=(
+                f"{self.__class__.__name__} cannot delete label definitions from the provider."
+            ),
+        )
+
     def send_reply(
         self,
         email_id: str,

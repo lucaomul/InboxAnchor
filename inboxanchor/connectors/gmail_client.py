@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Optional, Protocol
 
 from inboxanchor.connectors.base import EmailProvider, ProviderActionResult
+from inboxanchor.core.time_windows import ALL_TIME_RANGE, normalize_time_range
 from inboxanchor.models import EmailMessage
 
 
@@ -13,7 +14,13 @@ class GmailTransport(Protocol):
         *,
         time_range: Optional[str] = None,
     ) -> list[EmailMessage]: ...
-    def list_unread_page(self, limit: int, offset: int) -> list[EmailMessage]: ...
+    def list_unread_page(
+        self,
+        limit: int,
+        offset: int,
+        *,
+        time_range: Optional[str] = None,
+    ) -> list[EmailMessage]: ...
     def get_message(self, email_id: str, include_body: bool = True) -> EmailMessage: ...
     def get_body(self, email_id: str) -> str: ...
     def iter_mailbox_batches(
@@ -31,6 +38,7 @@ class GmailTransport(Protocol):
     def trash(self, email_ids: list[str]) -> None: ...
     def apply_labels(self, email_ids: list[str], labels: list[str]) -> None: ...
     def remove_labels(self, email_ids: list[str], labels: list[str]) -> None: ...
+    def delete_labels(self, labels: list[str]) -> None: ...
     def ensure_alias_routing(self, alias_address: str, *, label_name: str) -> None: ...
     def remove_alias_routing(self, alias_address: str) -> None: ...
     def send_reply(
@@ -70,8 +78,9 @@ class GmailClient(EmailProvider):
         time_range: Optional[str] = None,
     ) -> list[EmailMessage]:
         transport = self._require_transport()
-        if time_range:
-            return transport.list_unread(limit, time_range=time_range)
+        normalized_time_range = normalize_time_range(time_range)
+        if normalized_time_range != ALL_TIME_RANGE:
+            return transport.list_unread(limit, time_range=normalized_time_range)
         return transport.list_unread(limit)
 
     def iter_unread_batches(
@@ -83,12 +92,18 @@ class GmailClient(EmailProvider):
         time_range: Optional[str] = None,
     ):
         transport = self._require_transport()
+        normalized_time_range = normalize_time_range(time_range)
         if hasattr(transport, "list_unread_page"):
-            if not time_range:
+            if normalized_time_range == ALL_TIME_RANGE:
                 fetched = 0
                 offset = 0
+                page_fetch_size = min(batch_size, 25 if include_body else batch_size)
                 while fetched < limit:
-                    page = transport.list_unread_page(min(batch_size, limit - fetched), offset)
+                    page = transport.list_unread_page(
+                        min(page_fetch_size, limit - fetched),
+                        offset,
+                        time_range=normalized_time_range,
+                    )
                     if not page:
                         break
                     yield page
@@ -97,8 +112,8 @@ class GmailClient(EmailProvider):
                 return
 
         emails = (
-            transport.list_unread(limit, time_range=time_range)
-            if time_range
+            transport.list_unread(limit, time_range=normalized_time_range)
+            if normalized_time_range != ALL_TIME_RANGE
             else transport.list_unread(limit)
         )
         for start in range(0, len(emails), batch_size):
@@ -285,6 +300,23 @@ class GmailClient(EmailProvider):
             dry_run=dry_run,
             executed=not dry_run,
             details=f"Gmail label removal prepared: {', '.join(labels)}",
+        )
+
+    def delete_labels(
+        self,
+        labels: list[str],
+        *,
+        dry_run: bool = True,
+    ) -> ProviderActionResult:
+        if not dry_run:
+            self._require_transport().delete_labels(labels)
+        return ProviderActionResult(
+            provider=self.provider_name,
+            action="delete_labels",
+            email_ids=[],
+            dry_run=dry_run,
+            executed=not dry_run,
+            details=f"Gmail label deletion prepared: {', '.join(labels)}",
         )
 
     def ensure_alias_routing(

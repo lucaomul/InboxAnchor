@@ -223,7 +223,23 @@ def _provider_runtime_error_message(provider_name: str, exc: Exception) -> str:
             "The connected Gmail token is missing a required permission. Reconnect Gmail from "
             "Settings so InboxAnchor can request the latest scopes for reply sending."
         )
-    if "gmail.googleapis.com" in message:
+    gmail_network_markers = (
+        "httpsconnectionpool",
+        "max retries exceeded",
+        "failed to establish a new connection",
+        "name or service not known",
+        "temporary failure in name resolution",
+        "newconnectionerror",
+        "nameresolutionerror",
+        "getaddrinfo failed",
+        "connection aborted",
+        "connection refused",
+        "connection reset",
+    )
+    lowered = message.lower()
+    if "gmail.googleapis.com" in lowered and any(
+        marker in lowered for marker in gmail_network_markers
+    ):
         return (
             "Gmail connected, but InboxAnchor could not reach gmail.googleapis.com from the "
             "backend, so the unread scan never completed. Check the backend machine's "
@@ -894,6 +910,12 @@ def _load_mailbox_sync_state(
         )
 
 
+def _has_active_frontend_job(scope_key: str) -> bool:
+    with FRONTEND_ACTIVE_RUNS_LOCK:
+        job = FRONTEND_ACTIVE_RUNS.get(scope_key)
+    return job is not None and not job.event.is_set()
+
+
 def _get_cached_or_latest_run_id(
     provider_name: str,
     *,
@@ -949,6 +971,68 @@ def _load_digest(run_id: str) -> dict:
     if not payload:
         raise HTTPException(status_code=404, detail="Run not found")
     return payload["digest"]
+
+
+def _synthesized_complete_progress(
+    provider_name: str,
+    run_id: str,
+    *,
+    time_range: Optional[str] = None,
+    previous: Optional[dict] = None,
+) -> dict:
+    overview = _build_ops_overview(provider_name, run_id, time_range=time_range)
+    recommendation_count = (
+        int(overview["safeCleanupCount"])
+        + int(overview["needsApprovalCount"])
+        + int(overview["blockedCount"])
+    )
+    previous = previous or {}
+    return {
+        "provider": provider_name,
+        "time_range": overview["timeRange"],
+        "time_range_label": overview["timeRangeLabel"],
+        "mode": previous.get("mode", "scan"),
+        "status": "complete",
+        "stage": "ready",
+        "target_count": int(overview["unreadCount"]),
+        "processed_count": int(overview["unreadCount"]),
+        "read_count": int(overview["unreadCount"]),
+        "action_item_count": int(previous.get("action_item_count", 0)),
+        "recommendation_count": recommendation_count,
+        "batch_count": int(previous.get("batch_count", 0)),
+        "cached_count": int(overview["cachedEmailsCount"]),
+        "hydrated_count": int(overview["hydratedEmailsCount"]),
+        "labeled_count": int(previous.get("labeled_count", 0)),
+        "labels_removed_count": int(previous.get("labels_removed_count", 0)),
+        "archived_count": int(previous.get("archived_count", 0)),
+        "marked_read_count": int(previous.get("marked_read_count", 0)),
+        "trashed_count": int(previous.get("trashed_count", 0)),
+        "reply_sent_count": int(previous.get("reply_sent_count", 0)),
+        "oldest_cached_at": overview["oldestCachedAt"],
+        "newest_cached_at": overview["newestCachedAt"],
+        "latest_subject": previous.get("latest_subject"),
+        "latest_action": previous.get("latest_action"),
+        "resume_offset": int(previous.get("resume_offset", 0)),
+        "remaining_count": 0,
+        "completed": True,
+        "run_id": run_id,
+        "error": None,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _should_reconcile_stale_scan_progress(progress: dict, scope_key: str) -> bool:
+    if progress.get("status") != "running":
+        return False
+    if progress.get("mode") not in {None, "", "scan"}:
+        return False
+    if progress.get("run_id"):
+        return False
+    if _has_active_frontend_job(scope_key):
+        return False
+    processed_count = int(progress.get("processed_count") or 0)
+    read_count = int(progress.get("read_count") or 0)
+    return processed_count == 0 and read_count == 0
 
 
 def _load_action_items(run_id: str, email_id: str) -> list[dict]:
@@ -1055,6 +1139,60 @@ def _remove_provider_labels(
     except Exception as exc:
         _raise_provider_runtime_error(provider_name, exc)
 
+    _record_label_removal_decision(
+        email_id,
+        reason=reason,
+        confidence=confidence,
+        approved_by_user=approved_by_user,
+        safety_status=safety_status,
+    )
+    return {
+        "emailId": email_id,
+        "action": "remove_labels",
+        "finalAction": "labels_removed",
+        "labelsRemoved": labels,
+    }
+
+
+def _delete_provider_labels(
+    provider_name: str,
+    labels: list[str],
+) -> dict:
+    deduped = dedupe_labels(labels)
+    if not deduped:
+        return {
+            "provider": provider_name,
+            "action": "delete_labels",
+            "deletedLabels": [],
+            "deletedCount": 0,
+            "details": "No InboxAnchor label definitions needed pruning.",
+        }
+
+    service = _service_for_provider(provider_name)
+    provider = service.provider
+    try:
+        result = provider.delete_labels(deduped, dry_run=False)
+    except Exception as exc:
+        _raise_provider_runtime_error(provider_name, exc)
+
+    deleted_count = len(deduped) if result.executed else 0
+    return {
+        "provider": provider_name,
+        "action": "delete_labels",
+        "deletedLabels": deduped if result.executed else [],
+        "deletedCount": deleted_count,
+        "details": result.details,
+    }
+
+
+def _record_label_removal_decision(
+    email_id: str,
+    *,
+    reason: str,
+    confidence: float,
+    approved_by_user: bool,
+    safety_status: str,
+) -> None:
     decision = AutomationDecision(
         email_id=email_id,
         proposed_action="remove_labels",
@@ -1068,12 +1206,6 @@ def _remove_provider_labels(
     audit_entry = audit_logger.create_entry(decision)
     with session_scope() as session:
         InboxRepository(session).add_audit_entry(audit_entry)
-    return {
-        "emailId": email_id,
-        "action": "remove_labels",
-        "finalAction": "labels_removed",
-        "labelsRemoved": labels,
-    }
 
 
 def _build_ops_overview(
@@ -1589,6 +1721,25 @@ def frontend_ops_progress(provider: str = "", time_range: str = ""):
     scope_key = _scope_key(provider_name, normalized_time_range)
     progress = FRONTEND_PROGRESS.get(scope_key)
     if progress:
+        if _should_reconcile_stale_scan_progress(progress, scope_key):
+            run_id = _get_cached_or_latest_run_id(
+                provider_name,
+                time_range=normalized_time_range,
+            )
+            if run_id:
+                try:
+                    synthesized = _synthesized_complete_progress(
+                        provider_name,
+                        run_id,
+                        time_range=normalized_time_range,
+                        previous=progress,
+                    )
+                except HTTPException:
+                    synthesized = None
+                if synthesized is not None:
+                    FRONTEND_PROGRESS[scope_key] = synthesized
+                    FRONTEND_PROVIDER_ERRORS.pop(scope_key, None)
+                    return synthesized
         return progress
     cache_stats = _load_mailbox_cache_stats(provider_name, time_range=normalized_time_range)
     sync_state = _load_mailbox_sync_state(provider_name, time_range=normalized_time_range)
@@ -2072,13 +2223,16 @@ def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
     ]
     targets = [(detail, labels) for detail, labels in targets if labels]
     removed: list[dict] = []
+    removed_label_names = dedupe_labels(
+        [label for _, labels in targets for label in labels]
+    )
     _update_frontend_progress(
         provider_name,
         {
             "mode": "workflow",
             "status": "running",
             "stage": "cleaning_labels",
-            "limit": len(targets),
+            "limit": len(removed_label_names) if provider_name == "gmail" else len(targets),
             "processed_emails": 0,
             "read_count": len(details),
             "labeled_count": 0,
@@ -2092,40 +2246,134 @@ def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
         },
         time_range=payload.time_range,
     )
-    for index, (detail, labels) in enumerate(targets, start=1):
-        classification = detail["classification"]
-        removed.append(
-            _remove_provider_labels(
+    use_global_label_delete = provider_name == "gmail"
+    if use_global_label_delete:
+        deleted_label_names: list[str] = []
+        for index, label_name in enumerate(removed_label_names, start=1):
+            deleted = _delete_provider_labels(provider_name, [label_name])
+            deleted_label_names.extend(deleted["deletedLabels"])
+            _update_frontend_progress(
                 provider_name,
-                detail["email_id"],
-                labels,
-                reason="Removed InboxAnchor-generated labels without changing the email itself.",
-                confidence=classification["confidence"],
-                approved_by_user=True,
-                safety_status=SafetyStatus.allowed,
+                {
+                    "mode": "workflow",
+                    "status": "running",
+                    "stage": "deleting_label_definitions",
+                    "limit": len(removed_label_names),
+                    "processed_emails": index,
+                    "read_count": len(details),
+                    "labels_removed_count": 0,
+                    "latest_subject": label_name,
+                    "latest_action": "remove_labels",
+                },
+                time_range=payload.time_range,
             )
-        )
+        deleted_label_names = dedupe_labels(deleted_label_names)
+        deleted_labels = {
+            "provider": provider_name,
+            "action": "delete_labels",
+            "deletedLabels": deleted_label_names,
+            "deletedCount": len(deleted_label_names),
+            "details": (
+                "Deleted InboxAnchor Gmail label definitions directly."
+                if deleted_label_names
+                else "No InboxAnchor Gmail label definitions needed pruning."
+            ),
+        }
         _update_frontend_progress(
             provider_name,
             {
                 "mode": "workflow",
                 "status": "running",
-                "stage": "cleaning_labels",
-                "limit": len(targets),
-                "processed_emails": index,
+                "stage": "syncing_local_cache",
+                "limit": len(removed_label_names),
+                "processed_emails": deleted_labels["deletedCount"],
                 "read_count": len(details),
-                "labels_removed_count": index,
-                "latest_subject": detail["subject"],
+                "labels_removed_count": len(targets),
+                "latest_subject": (
+                    f"Deleted {deleted_labels['deletedCount']} Gmail label definitions"
+                ),
                 "latest_action": "remove_labels",
             },
             time_range=payload.time_range,
         )
+        for detail, labels in targets:
+            classification = detail["classification"]
+            _record_label_removal_decision(
+                detail["email_id"],
+                reason=(
+                    "Deleted InboxAnchor-generated Gmail label definitions so they disappear "
+                    "from the mailbox globally."
+                ),
+                confidence=classification["confidence"],
+                approved_by_user=True,
+                safety_status=SafetyStatus.allowed,
+            )
+            removed.append(
+                {
+                    "emailId": detail["email_id"],
+                    "action": "remove_labels",
+                    "finalAction": "labels_removed",
+                    "labelsRemoved": labels,
+                }
+            )
+        with session_scope() as session:
+            repository = InboxRepository(session)
+            repository.remove_labels_from_run_emails(
+                run_id,
+                deleted_labels["deletedLabels"],
+            )
+            repository.remove_labels_from_mailbox(
+                provider_name,
+                deleted_labels["deletedLabels"],
+            )
+    else:
+        for index, (detail, labels) in enumerate(targets, start=1):
+            classification = detail["classification"]
+            removed.append(
+                _remove_provider_labels(
+                    provider_name,
+                    detail["email_id"],
+                    labels,
+                    reason=(
+                        "Removed InboxAnchor-generated labels without changing the "
+                        "email itself."
+                    ),
+                    confidence=classification["confidence"],
+                    approved_by_user=True,
+                    safety_status=SafetyStatus.allowed,
+                )
+            )
+            _update_frontend_progress(
+                provider_name,
+                {
+                    "mode": "workflow",
+                    "status": "running",
+                    "stage": "cleaning_labels",
+                    "limit": len(targets),
+                    "processed_emails": index,
+                    "read_count": len(details),
+                    "labels_removed_count": index,
+                    "latest_subject": detail["subject"],
+                    "latest_action": "remove_labels",
+                },
+                time_range=payload.time_range,
+            )
+        deleted_labels = _delete_provider_labels(provider_name, removed_label_names)
+        target_email_ids = [detail["email_id"] for detail, _ in targets]
+        with session_scope() as session:
+            repository = InboxRepository(session)
+            repository.remove_labels_from_run_emails(
+                run_id,
+                removed_label_names,
+                email_ids=target_email_ids,
+            )
+            repository.remove_labels_from_mailbox(
+                provider_name,
+                removed_label_names,
+                email_ids=target_email_ids,
+            )
 
-    refreshed_run_id, _ = _ensure_frontend_run(
-        provider=provider_name,
-        force=payload.force_refresh,
-        time_range=payload.time_range,
-    )
+    refreshed_run_id = run_id
     overview = _build_ops_overview(
         provider_name,
         refreshed_run_id,
@@ -2141,6 +2389,11 @@ def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
             "processed_emails": len(targets),
             "read_count": len(details),
             "labels_removed_count": len(removed),
+            "latest_subject": (
+                f"Deleted {deleted_labels['deletedCount']} label definitions"
+                if deleted_labels["deletedCount"]
+                else None
+            ),
             "latest_action": "remove_labels",
             "error": None,
         },
@@ -2152,9 +2405,16 @@ def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
             "provider": provider_name,
             "run_id": refreshed_run_id,
             "count": len(removed),
+            "deleted_labels": deleted_labels["deletedCount"],
         }
     )
-    return {"applied": removed, "count": len(removed), "overview": overview}
+    return {
+        "applied": removed,
+        "count": len(removed),
+        "deletedLabelCount": deleted_labels["deletedCount"],
+        "deletedLabels": deleted_labels["deletedLabels"],
+        "overview": overview,
+    }
 
 
 @router.post("/ops/safe-cleanup")

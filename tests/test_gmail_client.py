@@ -10,6 +10,7 @@ class StubGmailTransport:
         self.archived: list[str] = []
         self.trashed: list[str] = []
         self.labels_applied: list[tuple[list[str], list[str]]] = []
+        self.labels_deleted: list[list[str]] = []
         self.alias_routes_created: list[tuple[str, str]] = []
         self.alias_routes_removed: list[str] = []
         self.replies_sent: list[tuple[str, str, str | None]] = []
@@ -48,6 +49,9 @@ class StubGmailTransport:
     def apply_labels(self, email_ids: list[str], labels: list[str]):
         self.labels_applied.append((email_ids, labels))
 
+    def delete_labels(self, labels: list[str]):
+        self.labels_deleted.append(labels)
+
     def ensure_alias_routing(self, alias_address: str, *, label_name: str):
         self.alias_routes_created.append((alias_address, label_name))
 
@@ -75,6 +79,16 @@ def test_gmail_connector_mocked_behavior():
     assert result.executed is True
     assert transport.marked_read == ["gmail-1"]
     assert transport.labels_applied == [(["gmail-1"], ["review"])]
+
+
+def test_gmail_connector_can_delete_label_definitions_through_transport():
+    transport = StubGmailTransport()
+    client = GmailClient(transport=transport)
+
+    result = client.delete_labels(["priority/high", "jobs/alert"], dry_run=False)
+
+    assert result.executed is True
+    assert transport.labels_deleted == [["priority/high", "jobs/alert"]]
 
 
 def test_gmail_connector_can_send_reply_through_transport():
@@ -114,3 +128,63 @@ def test_gmail_connector_can_manage_alias_routing_through_transport():
         ("owner+ia-travel1234567@gmail.com", "InboxAnchor/Aliases/Travel")
     ]
     assert transport.alias_routes_removed == ["owner+ia-travel1234567@gmail.com"]
+
+
+def test_gmail_iter_unread_batches_uses_paged_path_for_all_time():
+    calls: list[tuple[int, int, str | None]] = []
+
+    class PagedTransport(StubGmailTransport):
+        def list_unread(self, limit: int, *, time_range=None):
+            raise AssertionError("all_time should use list_unread_page, not list_unread")
+
+        def list_unread_page(self, limit: int, offset: int, *, time_range=None):
+            calls.append((limit, offset, time_range))
+            if offset >= 4:
+                return []
+            return [
+                self.message.model_copy(update={"id": f"gmail-{offset + index}"})
+                for index in range(limit)
+            ]
+
+    client = GmailClient(transport=PagedTransport())
+
+    batches = list(client.iter_unread_batches(limit=4, batch_size=100, time_range="all_time"))
+
+    assert len(batches) == 1
+    assert len(batches[0]) == 4
+    assert calls == [(4, 0, "all_time")]
+
+
+def test_gmail_iter_unread_batches_caps_initial_page_size_when_fetching_bodies():
+    calls: list[tuple[int, int, str | None]] = []
+
+    class PagedTransport(StubGmailTransport):
+        def list_unread(self, limit: int, *, time_range=None):
+            raise AssertionError("all_time should use list_unread_page, not list_unread")
+
+        def list_unread_page(self, limit: int, offset: int, *, time_range=None):
+            calls.append((limit, offset, time_range))
+            remaining = max(0, 60 - offset)
+            count = min(limit, remaining)
+            return [
+                self.message.model_copy(update={"id": f"gmail-{offset + index}"})
+                for index in range(count)
+            ]
+
+    client = GmailClient(transport=PagedTransport())
+
+    batches = list(
+        client.iter_unread_batches(
+            limit=60,
+            batch_size=100,
+            include_body=True,
+            time_range="all_time",
+        )
+    )
+
+    assert [len(batch) for batch in batches] == [25, 25, 10]
+    assert calls == [
+        (25, 0, "all_time"),
+        (25, 25, "all_time"),
+        (10, 50, "all_time"),
+    ]

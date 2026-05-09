@@ -527,6 +527,8 @@ export interface WorkflowMutationResult {
   cleanupApplied?: number;
   cachedCount?: number;
   hydratedCount?: number;
+  deletedLabelCount?: number;
+  deletedLabels?: string[];
   overview: OpsOverview;
 }
 
@@ -605,7 +607,7 @@ export async function runAutoLabel(timeRange?: MailboxTimeRange): Promise<Workfl
 export async function runLabelCleanup(timeRange?: MailboxTimeRange): Promise<WorkflowMutationResult> {
   return apiFetch<WorkflowMutationResult>("/ops/clean-labels", {
     method: "POST",
-    body: JSON.stringify({ force_refresh: true, time_range: timeRange }),
+    body: JSON.stringify({ force_refresh: false, time_range: timeRange }),
   });
 }
 
