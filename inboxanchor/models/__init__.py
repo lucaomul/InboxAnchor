@@ -1,3 +1,4 @@
+from inboxanchor.models.alias import EmailAlias, EmailAliasStatus
 from inboxanchor.models.auth import AccountUser, AuthSession
 from inboxanchor.models.email import (
     AuditLogEntry,
@@ -22,6 +23,8 @@ __all__ = [
     "AuditLogEntry",
     "AuthSession",
     "AutomationDecision",
+    "EmailAlias",
+    "EmailAliasStatus",
     "EmailActionItem",
     "EmailClassification",
     "EmailMessage",

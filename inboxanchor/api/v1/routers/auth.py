@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from inboxanchor.api.v1.routers.frontend import mark_frontend_provider_dirty
 from inboxanchor.config.settings import SETTINGS
-from inboxanchor.connectors.gmail_transport import GMAIL_MODIFY_SCOPE
+from inboxanchor.connectors.gmail_transport import GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE
 from inboxanchor.connectors.oauth_flow import build_authorization_url, exchange_code_for_token
 from inboxanchor.infra.auth import AuthError, AuthService
 from inboxanchor.infra.database import session_scope
@@ -18,6 +18,7 @@ from inboxanchor.infra.repository import InboxRepository
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 GMAIL_PKCE_REGISTRY: dict[str, dict[str, str]] = {}
+GMAIL_AUTH_SCOPES = [GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE]
 
 
 class SignupRequest(BaseModel):
@@ -195,10 +196,10 @@ def gmail_auth_url(request: Request):
     try:
         auth_url, state, code_verifier = _normalize_auth_url_result(
             build_authorization_url(
-            str(credentials_path),
-            [GMAIL_MODIFY_SCOPE],
-            redirect_uri=_resolve_frontend_redirect_uri(request),
-        )
+                str(credentials_path),
+                GMAIL_AUTH_SCOPES,
+                redirect_uri=_resolve_frontend_redirect_uri(request),
+            )
         )
         if code_verifier:
             GMAIL_PKCE_REGISTRY[state] = {
@@ -243,7 +244,7 @@ def gmail_auth_callback(payload: GmailCodeExchangeRequest, request: Request):
         credentials = exchange_code_for_token(
             SETTINGS.gmail_credentials_path,
             token_path,
-            [GMAIL_MODIFY_SCOPE],
+            GMAIL_AUTH_SCOPES,
             code=payload.code,
             redirect_uri=redirect_uri,
             state=payload.state,

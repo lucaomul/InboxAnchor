@@ -15,6 +15,7 @@ import {
   blockRecommendation,
   applyAllSafe,
   fetchWebhookHealth,
+  sendReply,
   type FetchEmailsParams,
   type StreamStatus,
 } from "@/lib/api-client";
@@ -240,5 +241,27 @@ export function useWebhookHealth() {
     },
     staleTime: 15_000,
     refetchInterval: 30_000,
+  });
+}
+
+export function useSendReply() {
+  const invalidate = useInvalidateAll();
+  return useMutation({
+    mutationFn: ({
+      emailId,
+      body,
+      timeRange,
+    }: {
+      emailId: string;
+      body: string;
+      timeRange: MailboxTimeRange;
+    }) => sendReply(emailId, body, timeRange),
+    onSuccess: (result) => {
+      invalidate();
+      toast.success("Reply sent", {
+        description: `Delivered to ${result.toAddress}.`,
+      });
+    },
+    onError: (err) => toast.error(`Failed to send reply: ${err.message}`),
   });
 }

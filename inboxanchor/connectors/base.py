@@ -20,6 +20,9 @@ class ProviderActionResult(BaseModel):
 class EmailProvider(ABC):
     provider_name: str
 
+    def supports_outbound_email(self) -> bool:
+        return False
+
     def iter_unread_batches(
         self,
         *,
@@ -136,3 +139,15 @@ class EmailProvider(ABC):
         dry_run: bool = True,
     ) -> ProviderActionResult:
         raise NotImplementedError
+
+    def send_reply(
+        self,
+        email_id: str,
+        body: str,
+        *,
+        from_address: Optional[str] = None,
+        dry_run: bool = True,
+    ) -> ProviderActionResult:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support sending replies."
+        )

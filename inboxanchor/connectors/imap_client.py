@@ -180,3 +180,17 @@ class IMAPEmailClient(EmailProvider):
             executed=not dry_run,
             details=f"IMAP labels prepared: {', '.join(labels)}",
         )
+
+    def send_reply(
+        self,
+        email_id: str,
+        body: str,
+        *,
+        from_address: Optional[str] = None,
+        dry_run: bool = True,
+    ) -> ProviderActionResult:
+        del email_id, body, from_address, dry_run
+        raise NotImplementedError(
+            "Direct sending for IMAP-family inboxes is not configured yet. "
+            "Use Gmail for in-app replies for now."
+        )

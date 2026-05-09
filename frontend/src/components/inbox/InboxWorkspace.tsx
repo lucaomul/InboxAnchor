@@ -124,7 +124,10 @@ export function InboxWorkspace() {
     }
   }, [emailsData?.total, page]);
 
-  const selectedEmail = emails.find((e) => e.id === selectedEmailId) || selectedEmailDetail || null;
+  const selectedEmailSummary = emails.find((e) => e.id === selectedEmailId) || null;
+  const selectedEmail = selectedEmailSummary
+    ? { ...selectedEmailSummary, ...(selectedEmailDetail || {}) }
+    : selectedEmailDetail || null;
   const selectedClassification = selectedEmail?.classification || null;
   const selectedRecs = selectedEmailId
     ? recs.filter((r) => r.emailId === selectedEmailId)
@@ -149,6 +152,13 @@ export function InboxWorkspace() {
           { label: "Hydrated", value: progress.hydrated_count },
           { label: "Batches", value: progress.batch_count },
         ]
+      : progress.mode === "workflow"
+        ? [
+            { label: "Emails read", value: progress.read_count },
+            { label: "Labeled", value: progress.labeled_count },
+            { label: "Archived", value: progress.archived_count },
+            { label: "Marked read", value: progress.marked_read_count },
+          ]
       : [
           { label: "Emails read", value: progress.read_count },
           { label: "Processed", value: progress.processed_count },
@@ -156,6 +166,18 @@ export function InboxWorkspace() {
           { label: "Suggestions", value: progress.recommendation_count },
         ]
     : [];
+  const progressActivity = progress?.latest_subject
+    ? `${progress.latest_action ? `${String(progress.latest_action).replaceAll("_", " ")} · ` : ""}${progress.latest_subject}`
+    : undefined;
+  const workspaceLoaderMessage = progress?.mode === "backfill"
+    ? `Building mailbox memory. ${progress.cached_count} emails are cached so far, and ${progress.hydrated_count} already have full bodies ready.`
+    : progress?.mode === "workflow"
+      ? `InboxAnchor is applying live mailbox actions inside ${MAILBOX_TIME_RANGE_OPTIONS.find((option) => option.value === timeRange)?.label.toLowerCase() || "the selected window"}.`
+      : progress?.target_count
+        ? `Syncing unread mail. ${progress.read_count} emails read and ${progress.processed_count} processed out of ${progress.target_count} in this live batch.`
+        : progress?.status === "running"
+          ? "Connecting the live mailbox and preparing the unread working set."
+          : "Syncing unread mail. Use W, S, the arrow keys, or space while InboxAnchor caches the batch."
   const workspaceError =
     (emailsQueryError instanceof Error && emailsQueryError.message) ||
     (recommendationsError instanceof Error && recommendationsError.message) ||
@@ -413,15 +435,8 @@ export function InboxWorkspace() {
                     playful
                     stage={progress?.stage ? `Stage: ${progress.stage}` : undefined}
                     stats={progressStats}
-                    message={
-                      progress?.mode === "backfill"
-                        ? `Building mailbox memory. ${progress.cached_count} emails are cached so far, and ${progress.hydrated_count} already have full bodies ready.`
-                        : progress?.target_count
-                          ? `Syncing unread mail. ${progress.read_count} emails read and ${progress.processed_count} processed out of ${progress.target_count} in this live batch.`
-                        : progress?.status === "running"
-                            ? "Connecting the live mailbox and preparing the unread working set."
-                          : "Syncing unread mail. Use W, S, the arrow keys, or space while InboxAnchor caches the batch."
-                    }
+                    activity={progressActivity}
+                    message={workspaceLoaderMessage}
                   />
                 </div>
               ) : emailsError ? (

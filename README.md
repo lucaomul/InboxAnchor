@@ -8,6 +8,7 @@ InboxAnchor is a safety-first inbox triage system for overloaded email accounts.
 - Classifies unread mail into actionable categories such as work, finance, promo, newsletter, personal, and opportunity
 - Scores priority and surfaces urgent reply pressure
 - Extracts action items and drafts suggested replies
+- Lets operators send Gmail replies from inside the app instead of bouncing back out to the provider UI
 - Recommends cleanup actions such as mark-as-read, archive, trash, and label application
 - Runs a safety verifier before any mailbox action is executed
 - Separates recommendations into safe, requires-approval, and blocked lanes
@@ -15,6 +16,7 @@ InboxAnchor is a safety-first inbox triage system for overloaded email accounts.
 - Builds a local mailbox-memory cache for older email history, resumes historical syncs, and hydrates full bodies lazily when needed
 - Scopes scans, labeling, cleanup, and mailbox-memory backfill to practical windows such as today, last month, last year, or 10+ years ago
 - Supports bulk lane actions, operator playbooks, focus views, follow-up radar, and reminder center workflows in the dashboard
+- Generates and manages privacy aliases for Gmail-style plus-addressing so users can shield their primary inbox address
 - Exposes a FastAPI backend and a Streamlit workspace on top of the same core engine
 - Includes a full React frontend in `frontend/` with a premium command center, welcome/auth flow, inbox workspace, and settings surface wired to the FastAPI backend
 
@@ -51,7 +53,7 @@ inboxanchor/
   connectors/     Demo provider, Gmail client/transport, IMAP client/transport, OAuth helpers
   core/           Triage engine, incremental triage wrapper, and rules engine
   infra/          Auth service, database ORM, repository, retry layer, LLM client/providers, audit log
-  models/         Pydantic models for email, providers, policy, auth, and run results
+  models/         Pydantic models for email, providers, policy, auth, aliases, and run results
 tests/            Offline test suite for engine, auth, providers, API, dashboard helpers, and fallbacks
 docs/             Gmail setup and internal engineering prompts
 frontend/         TanStack/React product UI, frontend routes, and modern component system
@@ -87,7 +89,7 @@ InboxAnchor is built around conservative defaults.
 - The safety verifier can downgrade or block risky recommendations before execution.
 - Finance, personal, attachment-heavy, and other sensitive threads stay gated for review under default policy.
 - Every executed action is written to the audit log.
-- Suggested replies are drafts only. InboxAnchor does not send emails automatically.
+- Suggested replies never send automatically. Human-triggered Gmail replies can be sent from the app once the operator confirms the final text.
 
 ## LLM Providers
 

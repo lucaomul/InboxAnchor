@@ -95,13 +95,32 @@ function CommandCenter() {
           { label: "Hydrated", value: progress.hydrated_count },
           { label: "Batches", value: progress.batch_count },
         ]
-      : [
-          { label: "Emails read", value: progress.read_count },
-          { label: "Processed", value: progress.processed_count },
-          { label: "Actions", value: progress.action_item_count },
-          { label: "Suggestions", value: progress.recommendation_count },
-        ]
+      : progress.mode === "workflow"
+        ? [
+            { label: "Emails read", value: progress.read_count },
+            { label: "Labeled", value: progress.labeled_count },
+            { label: "Archived", value: progress.archived_count },
+            { label: "Marked read", value: progress.marked_read_count },
+          ]
+        : [
+            { label: "Emails read", value: progress.read_count },
+            { label: "Processed", value: progress.processed_count },
+            { label: "Actions", value: progress.action_item_count },
+            { label: "Suggestions", value: progress.recommendation_count },
+          ]
     : [];
+  const progressActivity = progress?.latest_subject
+    ? `${progress.latest_action ? `${String(progress.latest_action).replaceAll("_", " ")} · ` : ""}${progress.latest_subject}`
+    : undefined;
+  const progressMessage = progress?.mode === "backfill"
+    ? `Building mailbox memory. ${progress.cached_count} emails are cached so far, and ${progress.hydrated_count} already have full bodies ready.`
+    : progress?.mode === "workflow"
+      ? `Applying live mailbox changes in ${overview?.timeRangeLabel?.toLowerCase() || "the selected window"}. Labels, archive actions, and read-state updates will keep moving while you wait.`
+      : progress?.target_count
+        ? `Mapping the unread working set. ${progress.processed_count} of ${progress.target_count} emails have been processed so far.`
+        : overview?.providerStatus === "checking"
+          ? "Connecting the live mailbox and preparing the unread scan."
+          : "Mapping your mailbox. Use W, S, the arrow keys, or space while the unread cache settles.";
 
   const metricCards = overview
     ? [
@@ -254,15 +273,8 @@ function CommandCenter() {
                       playful
                       stage={progress?.stage ? `Stage: ${progress.stage}` : undefined}
                       stats={progressStats}
-                      message={
-                        progress?.mode === "backfill"
-                          ? `Building mailbox memory. ${progress.cached_count} emails are cached so far, and ${progress.hydrated_count} already have full bodies ready.`
-                          : progress?.target_count
-                            ? `Mapping the unread working set. ${progress.processed_count} of ${progress.target_count} emails have been processed so far.`
-                          : overview?.providerStatus === "checking"
-                            ? "Connecting the live mailbox and preparing the unread scan."
-                            : "Mapping your mailbox. Use W, S, the arrow keys, or space while the unread cache settles."
-                      }
+                      activity={progressActivity}
+                      message={progressMessage}
                     />
                   </div>
                 )}

@@ -6,7 +6,8 @@ import logging
 import re
 import time
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
+from email.message import EmailMessage as MimeEmailMessage
+from email.utils import parseaddr, parsedate_to_datetime
 from html import unescape
 from pathlib import Path
 from typing import Iterable, Optional
@@ -20,6 +21,7 @@ from inboxanchor.models import EmailMessage
 logger = logging.getLogger(__name__)
 
 GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
+GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 GMAIL_API_BASE_URL = "https://gmail.googleapis.com/gmail/v1"
 
 
@@ -36,7 +38,7 @@ class GoogleAPITransport(GmailTransport):
     ):
         self.credentials_path = str(Path(credentials_path).expanduser())
         self.token_path = str(Path(token_path).expanduser())
-        self.scopes = list(scopes or [GMAIL_MODIFY_SCOPE])
+        self.scopes = list(scopes or [GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE])
         self.user_id = user_id
         self._service = service
         self._session = session
@@ -534,6 +536,65 @@ class GoogleAPITransport(GmailTransport):
             return
         label_ids = [self._label_name_to_id(label) for label in labels]
         self._batch_modify(email_ids, add_label_ids=label_ids)
+
+    def send_reply(
+        self,
+        email_id: str,
+        body: str,
+        *,
+        from_address: Optional[str] = None,
+    ) -> dict:
+        message = self._fetch_message_resource(email_id, include_body=False)
+        payload = message.get("payload", {})
+        headers = self._extract_headers(payload)
+        target_address = parseaddr(headers.get("reply-to") or headers.get("from", ""))[1]
+        if not target_address:
+            raise ValueError("InboxAnchor could not determine who this reply should go to.")
+
+        original_subject = headers.get("subject", "").strip()
+        reply_subject = (
+            original_subject
+            if original_subject.lower().startswith("re:")
+            else f"Re: {original_subject}"
+        )
+        mime = MimeEmailMessage()
+        mime["To"] = target_address
+        mime["Subject"] = reply_subject
+        if from_address:
+            mime["From"] = from_address
+
+        message_id = headers.get("message-id", "").strip()
+        references = headers.get("references", "").strip()
+        if message_id:
+            mime["In-Reply-To"] = message_id
+            reply_references = " ".join(
+                candidate for candidate in (references, message_id) if candidate
+            ).strip()
+            if reply_references:
+                mime["References"] = reply_references
+
+        mime.set_content(body.strip())
+        raw_message = base64.urlsafe_b64encode(mime.as_bytes()).decode("utf-8")
+        request_body = {"raw": raw_message}
+        if message.get("threadId"):
+            request_body["threadId"] = message["threadId"]
+
+        if self._service is not None:
+            service = self._build_service()
+            request = service.users().messages().send(
+                userId=self.user_id,
+                body=request_body,
+            )
+            self._execute_legacy(request)
+        else:
+            self._request_json("POST", "messages/send", json_body=request_body)
+
+        return {
+            "email_id": email_id,
+            "thread_id": message.get("threadId"),
+            "to_address": target_address,
+            "subject": reply_subject,
+        }
 
     def list_changed_message_ids(
         self,

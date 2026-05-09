@@ -1,5 +1,7 @@
+import { useEffect, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
 import {
   type EmailMessage,
   type EmailClassification,
@@ -14,6 +16,7 @@ import {
   useApplyRecommendation,
   useApproveRecommendation,
   useBlockRecommendation,
+  useSendReply,
 } from "@/hooks/use-inbox-data";
 
 interface EmailDetailProps {
@@ -58,7 +61,17 @@ export function EmailDetail({
   const applyMutation = useApplyRecommendation();
   const approveMutation = useApproveRecommendation();
   const blockMutation = useBlockRecommendation();
+  const sendReplyMutation = useSendReply();
   const fullBody = email.bodyFull?.trim() || email.bodyPreview?.trim() || email.snippet;
+  const initialReplyDraft = email.replyDraft?.trim() || "";
+  const [replyBody, setReplyBody] = useState(initialReplyDraft);
+  const canReply = Boolean(email.canReply);
+  const replyTarget = email.replyToAddress || email.sender;
+  const replySuggested = actionItems.some((item) => item.requiresReply) || !!initialReplyDraft;
+
+  useEffect(() => {
+    setReplyBody(initialReplyDraft);
+  }, [email.id, initialReplyDraft]);
 
   return (
     <div className="flex flex-col gap-5 p-5">
@@ -113,6 +126,62 @@ export function EmailDetail({
                 </div>
               </div>
             ))}
+          </div>
+        </div>
+      )}
+
+      {(canReply || replySuggested) && (
+        <div>
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-semibold text-foreground">Reply from InboxAnchor</h3>
+              <p className="text-xs text-muted-foreground">
+                {canReply
+                  ? `Send a reply to ${replyTarget} without leaving the app.`
+                  : "Draft review is available here, but this provider does not support sending from InboxAnchor yet."}
+              </p>
+            </div>
+            {initialReplyDraft ? (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setReplyBody(initialReplyDraft)}
+              >
+                Use draft
+              </Button>
+            ) : null}
+          </div>
+          <div className="rounded-lg border border-border bg-card p-3">
+            <Textarea
+              value={replyBody}
+              onChange={(event) => setReplyBody(event.target.value)}
+              placeholder="Write a short, human reply."
+              className="min-h-[140px] resize-y text-sm"
+            />
+            <div className="mt-3 flex items-center justify-between gap-3">
+              <p className="text-[11px] leading-5 text-muted-foreground">
+                {canReply
+                  ? "InboxAnchor will send this through the connected provider and keep the thread context intact."
+                  : "Sending is disabled on this provider. You can still use the draft as guidance."}
+              </p>
+              <Button
+                disabled={!canReply || sendReplyMutation.isPending || !replyBody.trim()}
+                onClick={() =>
+                  sendReplyMutation.mutate({
+                    emailId: email.id,
+                    body: replyBody,
+                    timeRange,
+                  })
+                }
+              >
+                {sendReplyMutation.isPending ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <Reply className="mr-2 h-4 w-4" />
+                )}
+                Send reply
+              </Button>
+            </div>
           </div>
         </div>
       )}

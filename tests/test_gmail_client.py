@@ -10,6 +10,7 @@ class StubGmailTransport:
         self.archived: list[str] = []
         self.trashed: list[str] = []
         self.labels_applied: list[tuple[list[str], list[str]]] = []
+        self.replies_sent: list[tuple[str, str, str | None]] = []
         self.message = EmailMessage(
             id="gmail-1",
             thread_id="thread-1",
@@ -45,6 +46,14 @@ class StubGmailTransport:
     def apply_labels(self, email_ids: list[str], labels: list[str]):
         self.labels_applied.append((email_ids, labels))
 
+    def send_reply(self, email_id: str, body: str, *, from_address=None):
+        self.replies_sent.append((email_id, body, from_address))
+        return {
+            "email_id": email_id,
+            "to_address": "hello@example.com",
+            "subject": "Re: Hello",
+        }
+
 
 def test_gmail_connector_mocked_behavior():
     transport = StubGmailTransport()
@@ -58,3 +67,20 @@ def test_gmail_connector_mocked_behavior():
     assert result.executed is True
     assert transport.marked_read == ["gmail-1"]
     assert transport.labels_applied == [(["gmail-1"], ["review"])]
+
+
+def test_gmail_connector_can_send_reply_through_transport():
+    transport = StubGmailTransport()
+    client = GmailClient(transport=transport)
+
+    result = client.send_reply(
+        "gmail-1",
+        "Thanks, I will send an update today.",
+        from_address="alias@example.com",
+        dry_run=False,
+    )
+
+    assert result.executed is True
+    assert transport.replies_sent == [
+        ("gmail-1", "Thanks, I will send an update today.", "alias@example.com")
+    ]

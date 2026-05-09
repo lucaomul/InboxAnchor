@@ -309,3 +309,37 @@ def test_google_api_transport_apply_labels_uses_batch_modify_endpoint():
     assert session.calls[1][1].endswith("/users/me/messages/batchModify")
     assert session.calls[1][3]["ids"] == ["msg-1", "msg-2"]
     assert session.calls[1][3]["addLabelIds"] == ["Label_1"]
+
+
+def test_google_api_transport_can_send_reply_via_authorized_session():
+    session = StubSession(
+        [
+            StubResponse(
+                {
+                    "id": "msg-1",
+                    "threadId": "thread-1",
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "CEO <ceo@example.com>"},
+                            {"name": "Subject", "value": "Contract review"},
+                            {"name": "Message-ID", "value": "<msg-1@example.com>"},
+                        ],
+                    },
+                }
+            ),
+            StubResponse({"id": "sent-1"}),
+        ]
+    )
+    transport = GoogleAPITransport(
+        credentials_path="~/credentials.json",
+        token_path="~/token.json",
+        session=session,
+    )
+
+    payload = transport.send_reply("msg-1", "Thanks, I will review this today.")
+
+    assert payload["to_address"] == "ceo@example.com"
+    assert payload["subject"] == "Re: Contract review"
+    assert session.calls[1][0] == "POST"
+    assert session.calls[1][1].endswith("/users/me/messages/send")
+    assert "raw" in session.calls[1][3]

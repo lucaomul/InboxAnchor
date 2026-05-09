@@ -218,6 +218,26 @@ class FollowUpReminderORM(Base):
     )
 
 
+class EmailAliasORM(Base):
+    __tablename__ = "email_aliases"
+    __table_args__ = (
+        UniqueConstraint("owner_email", "alias_address", name="uq_email_alias_owner_address"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_email: Mapped[str] = mapped_column(String(255), index=True)
+    provider: Mapped[str] = mapped_column(String(32), index=True)
+    alias_address: Mapped[str] = mapped_column(String(255), index=True)
+    target_email: Mapped[str] = mapped_column(String(255))
+    alias_type: Mapped[str] = mapped_column(String(32), default="plus")
+    label: Mapped[str] = mapped_column(String(128), default="")
+    purpose: Mapped[str] = mapped_column(Text, default="")
+    note: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class AccountUserORM(Base):
     __tablename__ = "account_users"
 

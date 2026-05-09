@@ -54,7 +54,7 @@ export function useOpsProgress(timeRange: MailboxTimeRange, enabled: boolean = t
     },
     enabled: isApiConfigured() && enabled,
     refetchInterval: (query) =>
-      query.state.data && query.state.data.status === "running" ? 1_000 : 3_000,
+      !query.state.data || query.state.data.status === "running" ? 800 : 3_000,
     staleTime: 500,
   });
 }

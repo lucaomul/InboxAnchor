@@ -10,6 +10,7 @@ from inboxanchor.infra.database import (
     ActionItemORM,
     AuditLogORM,
     ClassificationORM,
+    EmailAliasORM,
     EmailRecordORM,
     FollowUpReminderORM,
     MailboxEmailORM,
@@ -22,6 +23,8 @@ from inboxanchor.infra.database import (
 )
 from inboxanchor.models import (
     AuditLogEntry,
+    EmailAlias,
+    EmailAliasStatus,
     FollowUpReminder,
     FollowUpReminderStatus,
     ProviderConnectionState,
@@ -118,6 +121,23 @@ class InboxRepository:
             created_at=row.created_at,
             updated_at=row.updated_at,
             completed_at=row.completed_at,
+        )
+
+    @staticmethod
+    def _alias_model(row: EmailAliasORM) -> EmailAlias:
+        return EmailAlias(
+            id=row.id,
+            owner_email=row.owner_email,
+            provider=row.provider,
+            alias_address=row.alias_address,
+            target_email=row.target_email,
+            alias_type=row.alias_type,
+            label=row.label,
+            purpose=row.purpose,
+            note=row.note,
+            status=row.status,
+            created_at=row.created_at,
+            revoked_at=row.revoked_at,
         )
 
     def save_run(
@@ -566,6 +586,53 @@ class InboxRepository:
         )
         if row is not None:
             self.session.delete(row)
+
+    def list_email_aliases(
+        self,
+        *,
+        owner_email: str,
+        status: Optional[str] = None,
+    ) -> list[EmailAlias]:
+        query = self.session.query(EmailAliasORM).filter(
+            EmailAliasORM.owner_email == owner_email
+        )
+        if status:
+            query = query.filter(EmailAliasORM.status == status)
+        rows = query.order_by(EmailAliasORM.created_at.desc()).all()
+        return [self._alias_model(row) for row in rows]
+
+    def create_email_alias(self, alias: EmailAlias) -> EmailAlias:
+        row = EmailAliasORM(
+            owner_email=alias.owner_email,
+            provider=alias.provider,
+            alias_address=alias.alias_address,
+            target_email=alias.target_email,
+            alias_type=alias.alias_type,
+            label=alias.label,
+            purpose=alias.purpose,
+            note=alias.note,
+            status=alias.status,
+            created_at=alias.created_at,
+            revoked_at=alias.revoked_at,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return self._alias_model(row)
+
+    def get_email_alias(self, alias_id: int) -> Optional[EmailAlias]:
+        row = self.session.get(EmailAliasORM, alias_id)
+        if row is None:
+            return None
+        return self._alias_model(row)
+
+    def revoke_email_alias(self, alias_id: int) -> Optional[EmailAlias]:
+        row = self.session.get(EmailAliasORM, alias_id)
+        if row is None:
+            return None
+        row.status = EmailAliasStatus.revoked
+        row.revoked_at = datetime.now(timezone.utc)
+        self.session.flush()
+        return self._alias_model(row)
 
     def upsert_follow_up_reminder(
         self,

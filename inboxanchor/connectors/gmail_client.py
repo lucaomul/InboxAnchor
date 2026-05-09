@@ -30,6 +30,13 @@ class GmailTransport(Protocol):
     def archive(self, email_ids: list[str]) -> None: ...
     def trash(self, email_ids: list[str]) -> None: ...
     def apply_labels(self, email_ids: list[str], labels: list[str]) -> None: ...
+    def send_reply(
+        self,
+        email_id: str,
+        body: str,
+        *,
+        from_address: Optional[str] = None,
+    ) -> dict: ...
 
 
 class GmailClient(EmailProvider):
@@ -173,6 +180,9 @@ class GmailClient(EmailProvider):
     def fetch_email_body(self, email_id: str) -> str:
         return self._require_transport().get_body(email_id)
 
+    def supports_outbound_email(self) -> bool:
+        return True
+
     def batch_mark_as_read(
         self,
         email_ids: list[str],
@@ -254,4 +264,32 @@ class GmailClient(EmailProvider):
             dry_run=dry_run,
             executed=not dry_run,
             details=f"Gmail labels prepared: {', '.join(labels)}",
+        )
+
+    def send_reply(
+        self,
+        email_id: str,
+        body: str,
+        *,
+        from_address: Optional[str] = None,
+        dry_run: bool = True,
+    ) -> ProviderActionResult:
+        details = "Gmail reply prepared."
+        if not dry_run:
+            result = self._require_transport().send_reply(
+                email_id,
+                body,
+                from_address=from_address,
+            )
+            details = (
+                f"Reply sent to {result.get('to_address', 'recipient')} "
+                f"with subject {result.get('subject', 'reply')}."
+            )
+        return ProviderActionResult(
+            provider=self.provider_name,
+            action="reply",
+            email_ids=[email_id],
+            dry_run=dry_run,
+            executed=not dry_run,
+            details=details,
         )

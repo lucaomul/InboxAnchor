@@ -487,6 +487,10 @@ def test_frontend_compat_endpoints_expose_react_contract():
     assert actions_response.status_code == 200
     assert isinstance(actions_response.json(), list)
 
+    email_detail_response = client.get(f"/emails/{first_email['id']}")
+    assert email_detail_response.status_code == 200
+    assert {"replyDraft", "canReply", "replyToAddress"} <= set(email_detail_response.json().keys())
+
     assert digest_response.status_code == 200
     assert digest_response.json()["totalUnread"] >= 1
 
@@ -587,6 +591,13 @@ def test_frontend_ops_workflows_expose_mailbox_upgrade_features():
     assert payload["cleanupApplied"] >= 0
     assert payload["overview"]["provider"] == overview["provider"]
 
+    progress_response = client.get("/ops/progress")
+    assert progress_response.status_code == 200
+    progress_payload = progress_response.json()
+    assert {"labeled_count", "archived_count", "marked_read_count", "reply_sent_count"} <= set(
+        progress_payload.keys()
+    )
+
 
 def test_frontend_ops_backfill_builds_mailbox_memory_cache():
     response = client.post(
@@ -606,6 +617,74 @@ def test_frontend_ops_backfill_builds_mailbox_memory_cache():
     assert payload["processedTotal"] >= payload["count"]
     assert payload["overview"]["cachedEmailsCount"] >= payload["count"]
     assert "mailboxMemory" in payload["overview"]
+
+
+def test_frontend_reply_send_works_for_supported_provider():
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "full_name": "Reply Operator",
+            "email": "reply@example.com",
+            "password": "reply-secret-pass",
+        },
+    )
+    token = signup.json()["token"]
+    first_email = client.get("/emails").json()["emails"][0]
+
+    response = client.post(
+        f"/emails/{first_email['id']}/reply",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"body": "Thanks, I reviewed this and will get back to you today."},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["provider"] == "fake"
+    assert payload["toAddress"]
+
+
+def test_frontend_gmail_aliases_can_be_generated_and_revoked():
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "full_name": "Alias Operator",
+            "email": "alias-owner@example.com",
+            "password": "alias-secret-pass",
+        },
+    )
+    token = signup.json()["token"]
+    client.put(
+        "/providers/gmail/connection",
+        json={
+            "status": "connected",
+            "account_hint": "owner@gmail.com",
+            "sync_enabled": True,
+            "dry_run_only": False,
+            "notes": "Connected for alias generation tests.",
+        },
+    )
+
+    generated = client.post(
+        "/aliases/generate",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"label": "travel", "purpose": "airlines"},
+    )
+    assert generated.status_code == 200
+    generated_payload = generated.json()
+    assert "+ia-travel-" in generated_payload["alias_address"]
+    assert generated_payload["status"] == "active"
+
+    listed = client.get("/aliases", headers={"Authorization": f"Bearer {token}"})
+    assert listed.status_code == 200
+    assert listed.json()["count"] == 1
+
+    revoked = client.post(
+        f"/aliases/{generated_payload['id']}/revoke",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert revoked.status_code == 200
+    assert revoked.json()["status"] == "revoked"
 
 
 def test_frontend_ops_backfill_can_resume_from_saved_offset(monkeypatch):

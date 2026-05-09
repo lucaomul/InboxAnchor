@@ -22,7 +22,7 @@ from inboxanchor.infra.audit_log import AuditLogger
 from inboxanchor.infra.auth import AuthService
 from inboxanchor.infra.database import session_scope
 from inboxanchor.infra.repository import InboxRepository
-from inboxanchor.models import AutomationDecision, SafetyStatus, WorkspaceSettings
+from inboxanchor.models import AutomationDecision, EmailAlias, SafetyStatus, WorkspaceSettings
 
 router = APIRouter(tags=["frontend-compat"])
 
@@ -77,6 +77,10 @@ class FrontendRecommendationActionRequest(BaseModel):
     action: str
 
 
+class FrontendReplySendRequest(BaseModel):
+    body: str = Field(min_length=2, max_length=12000)
+
+
 class FrontendProviderWorkflowRequest(BaseModel):
     provider: Optional[str] = None
     force_refresh: bool = True
@@ -91,6 +95,11 @@ class FrontendMailboxBackfillRequest(BaseModel):
     include_body: bool = False
     unread_only: bool = False
     time_range: Optional[str] = None
+
+
+class FrontendAliasGenerateRequest(BaseModel):
+    label: str = Field(default="", max_length=128)
+    purpose: str = Field(default="", max_length=512)
 
 
 def _scope_key(provider_name: str, time_range: Optional[str]) -> str:
@@ -121,6 +130,17 @@ def _current_actor_email(authorization: Optional[str]) -> str:
         auth_session = AuthService(session).get_session(token)
     if auth_session is None:
         return "workspace@inboxanchor.local"
+    return auth_session.user.email
+
+
+def _require_actor_email(authorization: Optional[str]) -> str:
+    token = _extract_bearer_token(authorization)
+    if not token:
+        raise HTTPException(status_code=401, detail="Log in to use this feature.")
+    with session_scope() as session:
+        auth_session = AuthService(session).get_session(token)
+    if auth_session is None:
+        raise HTTPException(status_code=401, detail="Your session expired. Log in again.")
     return auth_session.user.email
 
 
@@ -169,6 +189,11 @@ def mark_frontend_provider_dirty(provider_name: str) -> None:
 
 def _provider_runtime_error_message(provider_name: str, exc: Exception) -> str:
     message = str(exc).strip() or exc.__class__.__name__
+    if "insufficient authentication scopes" in message.lower():
+        return (
+            "The connected Gmail token is missing a required permission. Reconnect Gmail from "
+            "Settings so InboxAnchor can request the latest scopes for reply sending."
+        )
     if "gmail.googleapis.com" in message:
         return (
             "Gmail connected, but InboxAnchor could not reach gmail.googleapis.com from the "
@@ -214,9 +239,15 @@ def _update_frontend_progress(
         "batch_count": previous.get("batch_count", 0),
         "cached_count": previous.get("cached_count", 0),
         "hydrated_count": previous.get("hydrated_count", 0),
+        "labeled_count": previous.get("labeled_count", 0),
+        "archived_count": previous.get("archived_count", 0),
+        "marked_read_count": previous.get("marked_read_count", 0),
+        "trashed_count": previous.get("trashed_count", 0),
+        "reply_sent_count": previous.get("reply_sent_count", 0),
         "oldest_cached_at": previous.get("oldest_cached_at"),
         "newest_cached_at": previous.get("newest_cached_at"),
         "latest_subject": previous.get("latest_subject"),
+        "latest_action": previous.get("latest_action"),
         "resume_offset": previous.get("resume_offset", 0),
         "remaining_count": previous.get("remaining_count", 0),
         "completed": previous.get("completed", False),
@@ -246,12 +277,24 @@ def _update_frontend_progress(
         progress["cached_count"] = payload["cached_count"]
     if "hydrated_count" in payload:
         progress["hydrated_count"] = payload["hydrated_count"]
+    if "labeled_count" in payload:
+        progress["labeled_count"] = payload["labeled_count"]
+    if "archived_count" in payload:
+        progress["archived_count"] = payload["archived_count"]
+    if "marked_read_count" in payload:
+        progress["marked_read_count"] = payload["marked_read_count"]
+    if "trashed_count" in payload:
+        progress["trashed_count"] = payload["trashed_count"]
+    if "reply_sent_count" in payload:
+        progress["reply_sent_count"] = payload["reply_sent_count"]
     if "oldest_cached_at" in payload:
         progress["oldest_cached_at"] = payload["oldest_cached_at"]
     if "newest_cached_at" in payload:
         progress["newest_cached_at"] = payload["newest_cached_at"]
     if "latest_subject" in payload:
         progress["latest_subject"] = payload["latest_subject"]
+    if "latest_action" in payload:
+        progress["latest_action"] = payload["latest_action"]
     if "resume_offset" in payload:
         progress["resume_offset"] = payload["resume_offset"]
     if "remaining_count" in payload:
@@ -416,6 +459,11 @@ def _ensure_frontend_run(
             "action_item_count": 0,
             "recommendation_count": 0,
             "batch_count": 0,
+            "labeled_count": 0,
+            "archived_count": 0,
+            "marked_read_count": 0,
+            "trashed_count": 0,
+            "reply_sent_count": 0,
             "run_id": latest_run_id,
             "error": None,
         },
@@ -498,6 +546,11 @@ def _ensure_frontend_run(
             "action_item_count": sum(len(items) for items in action_items.values()),
             "recommendation_count": len(recommendations),
             "batch_count": batch_count,
+            "labeled_count": 0,
+            "archived_count": 0,
+            "marked_read_count": 0,
+            "trashed_count": 0,
+            "reply_sent_count": 0,
             "run_id": result.run_id,
             "error": None,
         },
@@ -593,7 +646,51 @@ def _recommended_labels_for_email(detail: dict) -> list[str]:
     return _dedupe_labels(labels)
 
 
-def _frontend_email_payload(detail: dict, mailbox_email: Optional[dict] = None) -> dict:
+def _reply_draft_for_email(run_id: str, email_id: str) -> Optional[str]:
+    with session_scope() as session:
+        payload = InboxRepository(session).get_run(run_id) or {}
+    drafts = payload.get("reply_drafts", {})
+    draft = drafts.get(email_id)
+    if isinstance(draft, str) and draft.strip():
+        return draft.strip()
+    return None
+
+
+def _reply_target_for_detail(detail: dict) -> str:
+    sender = detail.get("sender", "")
+    if "<" in sender and ">" in sender:
+        candidate = sender.rsplit("<", 1)[-1].split(">", 1)[0].strip()
+        if candidate:
+            return candidate
+    return sender.strip()
+
+
+def _provider_supports_reply(service: InboxAnchorService) -> bool:
+    supports = getattr(service.provider, "supports_outbound_email", None)
+    return bool(callable(supports) and supports())
+
+
+def _generate_plus_alias(target_email: str, *, label: str = "", purpose: str = "") -> str:
+    local_part, _, domain = target_email.partition("@")
+    base_local = local_part.split("+", 1)[0]
+    slug_source = label or purpose or "mail"
+    slug = "".join(
+        character.lower()
+        for character in slug_source
+        if character.isalnum()
+    )[:18] or "mail"
+    timestamp = datetime.now(timezone.utc).strftime("%y%m%d%H%M%S")
+    return f"{base_local}+ia-{slug}-{timestamp}@{domain}"
+
+
+def _frontend_email_payload(
+    detail: dict,
+    mailbox_email: Optional[dict] = None,
+    *,
+    reply_draft: Optional[str] = None,
+    can_reply: Optional[bool] = None,
+    reply_to_address: Optional[str] = None,
+) -> dict:
     body_preview = detail.get("body_preview", "")
     body_full = (mailbox_email or {}).get("body_full", body_preview)
     return {
@@ -609,6 +706,9 @@ def _frontend_email_payload(detail: dict, mailbox_email: Optional[dict] = None) 
         "hasAttachments": detail["has_attachments"],
         "unread": detail["unread"],
         "classification": _frontend_classification_payload(detail),
+        "replyDraft": reply_draft,
+        "canReply": can_reply,
+        "replyToAddress": reply_to_address,
     }
 
 
@@ -955,6 +1055,7 @@ def frontend_emails(
 @router.get("/emails/{email_id}")
 def frontend_email(email_id: str, time_range: str = ""):
     run_id, provider_name = _ensure_frontend_run(time_range=time_range or None)
+    service = _service_for_provider(provider_name)
     with session_scope() as session:
         detail = InboxRepository(session).get_run_email_detail(run_id, email_id)
     if detail is None:
@@ -966,7 +1067,13 @@ def frontend_email(email_id: str, time_range: str = ""):
         detail,
         mailbox_map.get(email_id),
     )
-    return _frontend_email_payload(detail, mailbox_email)
+    return _frontend_email_payload(
+        detail,
+        mailbox_email,
+        reply_draft=_reply_draft_for_email(run_id, email_id),
+        can_reply=_provider_supports_reply(service),
+        reply_to_address=_reply_target_for_detail(detail),
+    )
 
 
 @router.get("/classifications")
@@ -1008,6 +1115,166 @@ def frontend_action_items(email_id: str, time_range: str = ""):
         }
         for item in items
     ]
+
+
+@router.post("/emails/{email_id}/reply")
+def frontend_send_reply(
+    email_id: str,
+    payload: FrontendReplySendRequest,
+    authorization: Optional[str] = Header(default=None),
+    time_range: str = "",
+):
+    actor_email = _require_actor_email(authorization)
+    body = payload.body.strip()
+    if not body:
+        raise HTTPException(status_code=400, detail="Reply body cannot be empty.")
+
+    run_id, provider_name = _ensure_frontend_run(time_range=time_range or None)
+    service = _service_for_provider(provider_name)
+    if not _provider_supports_reply(service):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This provider can be cleaned and labeled from InboxAnchor, but in-app "
+                "reply sending is only available on supported providers like Gmail right now."
+            ),
+        )
+
+    with session_scope() as session:
+        detail = InboxRepository(session).get_run_email_detail(run_id, email_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    try:
+        result = service.provider.send_reply(email_id, body, dry_run=False)
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        _raise_provider_runtime_error(provider_name, exc)
+
+    decision = AutomationDecision(
+        email_id=email_id,
+        proposed_action="reply",
+        final_action="reply_sent",
+        approved_by_user=True,
+        reason="Reply sent manually from InboxAnchor.",
+        confidence=1.0,
+        safety_verifier_status=SafetyStatus.allowed,
+    )
+    with session_scope() as session:
+        InboxRepository(session).add_audit_entry(AuditLogger().create_entry(decision))
+
+    _update_frontend_progress(
+        provider_name,
+        {
+            "mode": "workflow",
+            "status": "complete",
+            "stage": "reply_sent",
+            "limit": 1,
+            "processed_emails": 1,
+            "read_count": 1,
+            "reply_sent_count": 1,
+            "latest_subject": detail["subject"],
+            "latest_action": "reply",
+            "error": None,
+        },
+        time_range=time_range or None,
+    )
+    STREAM_HUB.emit(
+        {
+            "type": "reply_sent",
+            "provider": provider_name,
+            "email_id": email_id,
+            "actor": actor_email,
+        }
+    )
+    return {
+        "ok": True,
+        "emailId": email_id,
+        "provider": provider_name,
+        "toAddress": _reply_target_for_detail(detail),
+        "details": result.details,
+    }
+
+
+@router.get("/aliases")
+def frontend_list_aliases(
+    authorization: Optional[str] = Header(default=None),
+    status: str = "",
+):
+    actor_email = _require_actor_email(authorization)
+    with session_scope() as session:
+        aliases = InboxRepository(session).list_email_aliases(
+            owner_email=actor_email,
+            status=status or None,
+        )
+    return {
+        "items": [alias.model_dump(mode="json") for alias in aliases],
+        "count": len(aliases),
+    }
+
+
+@router.post("/aliases/generate")
+def frontend_generate_alias(
+    payload: FrontendAliasGenerateRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    actor_email = _require_actor_email(authorization)
+    connection = InboxAnchorService().load_provider_connection("gmail")
+    target_email = (connection.account_hint or actor_email).strip().lower()
+    if connection.status != "connected" or "@" not in target_email:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Connect Gmail first before generating privacy aliases. "
+                "InboxAnchor currently creates aliases through Gmail plus-addressing."
+            ),
+        )
+
+    alias = _generate_plus_alias(
+        target_email,
+        label=payload.label,
+        purpose=payload.purpose,
+    )
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        stored = repository.create_email_alias(
+            EmailAlias(
+                owner_email=actor_email,
+                provider="gmail",
+                alias_address=alias,
+                target_email=target_email,
+                alias_type="plus",
+                label=payload.label.strip(),
+                purpose=payload.purpose.strip(),
+                note=(
+                    "Routes into the connected Gmail inbox through plus-addressing. "
+                    "Revoking it in InboxAnchor stops future reuse here, but Gmail still "
+                    "controls delivery for addresses that were already shared."
+                ),
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+    return stored.model_dump(mode="json")
+
+
+@router.post("/aliases/{alias_id}/revoke")
+def frontend_revoke_alias(
+    alias_id: int,
+    authorization: Optional[str] = Header(default=None),
+):
+    actor_email = _require_actor_email(authorization)
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        alias = repository.get_email_alias(alias_id)
+        if alias is None:
+            raise HTTPException(status_code=404, detail="Alias not found.")
+        if alias.owner_email != actor_email:
+            raise HTTPException(status_code=403, detail="You can only revoke your own aliases.")
+        revoked = repository.revoke_email_alias(alias_id)
+    if revoked is None:
+        raise HTTPException(status_code=404, detail="Alias not found.")
+    return revoked.model_dump(mode="json")
 
 
 @router.get("/digest")
@@ -1061,9 +1328,15 @@ def frontend_ops_progress(provider: str = "", time_range: str = ""):
             "batch_count": int(sync_state.get("batch_count") or 0),
             "cached_count": cache_stats["cached_count"],
             "hydrated_count": cache_stats["hydrated_count"],
+            "labeled_count": int(sync_state.get("labeled_count") or 0),
+            "archived_count": int(sync_state.get("archived_count") or 0),
+            "marked_read_count": int(sync_state.get("marked_read_count") or 0),
+            "trashed_count": int(sync_state.get("trashed_count") or 0),
+            "reply_sent_count": int(sync_state.get("reply_sent_count") or 0),
             "oldest_cached_at": cache_stats["oldest_cached_at"],
             "newest_cached_at": cache_stats["newest_cached_at"],
             "latest_subject": sync_state.get("latest_subject"),
+            "latest_action": sync_state.get("latest_action"),
             "resume_offset": resume_offset,
             "remaining_count": max(target_count - resume_offset, 0),
             "completed": completed,
@@ -1086,9 +1359,15 @@ def frontend_ops_progress(provider: str = "", time_range: str = ""):
         "batch_count": 0,
         "cached_count": 0,
         "hydrated_count": 0,
+        "labeled_count": 0,
+        "archived_count": 0,
+        "marked_read_count": 0,
+        "trashed_count": 0,
+        "reply_sent_count": 0,
         "oldest_cached_at": None,
         "newest_cached_at": None,
         "latest_subject": None,
+        "latest_action": None,
         "resume_offset": 0,
         "remaining_count": 0,
         "completed": False,
@@ -1403,11 +1682,32 @@ def frontend_ops_auto_label(payload: FrontendProviderWorkflowRequest):
         time_range=payload.time_range,
     )
     details = _load_email_details(run_id)
+    targets = [
+        (detail, _recommended_labels_for_email(detail))
+        for detail in details
+    ]
+    targets = [(detail, labels) for detail, labels in targets if labels]
     applied: list[dict] = []
-    for detail in details:
-        labels = _recommended_labels_for_email(detail)
-        if not labels:
-            continue
+    _update_frontend_progress(
+        provider_name,
+        {
+            "mode": "workflow",
+            "status": "running",
+            "stage": "applying_labels",
+            "limit": len(targets),
+            "processed_emails": 0,
+            "read_count": len(details),
+            "labeled_count": 0,
+            "archived_count": 0,
+            "marked_read_count": 0,
+            "trashed_count": 0,
+            "reply_sent_count": 0,
+            "latest_action": "label",
+            "error": None,
+        },
+        time_range=payload.time_range,
+    )
+    for index, (detail, labels) in enumerate(targets, start=1):
         classification = detail["classification"]
         applied.append(
             _apply_provider_action(
@@ -1421,6 +1721,21 @@ def frontend_ops_auto_label(payload: FrontendProviderWorkflowRequest):
                 safety_status=SafetyStatus.allowed,
             )
         )
+        _update_frontend_progress(
+            provider_name,
+            {
+                "mode": "workflow",
+                "status": "running",
+                "stage": "applying_labels",
+                "limit": len(targets),
+                "processed_emails": index,
+                "read_count": len(details),
+                "labeled_count": index,
+                "latest_subject": detail["subject"],
+                "latest_action": "label",
+            },
+            time_range=payload.time_range,
+        )
 
     refreshed_run_id, _ = _ensure_frontend_run(
         provider=provider_name,
@@ -1430,6 +1745,21 @@ def frontend_ops_auto_label(payload: FrontendProviderWorkflowRequest):
     overview = _build_ops_overview(
         provider_name,
         refreshed_run_id,
+        time_range=payload.time_range,
+    )
+    _update_frontend_progress(
+        provider_name,
+        {
+            "mode": "workflow",
+            "status": "complete",
+            "stage": "labels_ready",
+            "limit": len(targets),
+            "processed_emails": len(targets),
+            "read_count": len(details),
+            "labeled_count": len(applied),
+            "latest_action": "label",
+            "error": None,
+        },
         time_range=payload.time_range,
     )
     STREAM_HUB.emit(
@@ -1449,20 +1779,47 @@ def frontend_ops_safe_cleanup(payload: FrontendProviderWorkflowRequest):
         provider=payload.provider,
         time_range=payload.time_range,
     )
+    existing_progress = FRONTEND_PROGRESS.get(
+        _scope_key(provider_name, payload.time_range),
+        {},
+    )
     blocked = FRONTEND_BLOCK_REGISTRY.setdefault(provider_name, set())
     details = _load_recommendation_details(run_id)
+    detail_map = {detail["email_id"]: detail for detail in details}
+    safe_targets = [
+        _frontend_recommendation_payload(detail, blocked=detail["email_id"] in blocked)
+        for detail in details
+    ]
+    safe_targets = [item for item in safe_targets if item["status"] == "safe"]
     applied: list[dict] = []
-    for detail in details:
-        recommendation = _frontend_recommendation_payload(
-            detail,
-            blocked=detail["email_id"] in blocked,
-        )
-        if recommendation["status"] != "safe":
-            continue
+    labeled_count = int(existing_progress.get("labeled_count", 0))
+    archived_count = 0
+    marked_read_count = 0
+    trashed_count = 0
+    _update_frontend_progress(
+        provider_name,
+        {
+            "mode": "workflow",
+            "status": "running",
+            "stage": "safe_cleanup",
+            "limit": len(safe_targets),
+            "processed_emails": 0,
+            "read_count": len(details),
+            "labeled_count": labeled_count,
+            "archived_count": 0,
+            "marked_read_count": 0,
+            "trashed_count": 0,
+            "reply_sent_count": 0,
+            "latest_action": "cleanup",
+            "error": None,
+        },
+        time_range=payload.time_range,
+    )
+    for index, recommendation in enumerate(safe_targets, start=1):
         applied.append(
             _apply_provider_action(
                 provider_name,
-                detail["email_id"],
+                recommendation["emailId"],
                 recommendation["recommendedAction"],
                 recommendation["proposedLabels"],
                 reason=recommendation["reason"],
@@ -1470,6 +1827,37 @@ def frontend_ops_safe_cleanup(payload: FrontendProviderWorkflowRequest):
                 approved_by_user=True,
                 safety_status=SafetyStatus.allowed,
             )
+        )
+        if recommendation["proposedLabels"]:
+            labeled_count += 1
+        if recommendation["recommendedAction"] == "archive":
+            archived_count += 1
+        elif recommendation["recommendedAction"] == "mark_read":
+            marked_read_count += 1
+        elif recommendation["recommendedAction"] == "trash":
+            trashed_count += 1
+        _update_frontend_progress(
+            provider_name,
+            {
+                "mode": "workflow",
+                "status": "running",
+                "stage": "safe_cleanup",
+                "limit": len(safe_targets),
+                "processed_emails": index,
+                "read_count": len(details),
+                "labeled_count": labeled_count,
+                "archived_count": archived_count,
+                "marked_read_count": marked_read_count,
+                "trashed_count": trashed_count,
+                "latest_subject": (
+                    detail_map[recommendation["emailId"]].get("subject")
+                    or detail_map[recommendation["emailId"]]
+                    .get("email", {})
+                    .get("subject")
+                ),
+                "latest_action": recommendation["recommendedAction"],
+            },
+            time_range=payload.time_range,
         )
 
     refreshed_run_id, _ = _ensure_frontend_run(
@@ -1480,6 +1868,24 @@ def frontend_ops_safe_cleanup(payload: FrontendProviderWorkflowRequest):
     overview = _build_ops_overview(
         provider_name,
         refreshed_run_id,
+        time_range=payload.time_range,
+    )
+    _update_frontend_progress(
+        provider_name,
+        {
+            "mode": "workflow",
+            "status": "complete",
+            "stage": "cleanup_ready",
+            "limit": len(safe_targets),
+            "processed_emails": len(safe_targets),
+            "read_count": len(details),
+            "labeled_count": labeled_count,
+            "archived_count": archived_count,
+            "marked_read_count": marked_read_count,
+            "trashed_count": trashed_count,
+            "latest_action": "cleanup",
+            "error": None,
+        },
         time_range=payload.time_range,
     )
     STREAM_HUB.emit(

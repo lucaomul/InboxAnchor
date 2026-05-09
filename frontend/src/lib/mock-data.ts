@@ -16,6 +16,9 @@ export interface EmailMessage {
   hasAttachments: boolean;
   unread: boolean;
   classification?: EmailClassification;
+  replyDraft?: string | null;
+  canReply?: boolean | null;
+  replyToAddress?: string | null;
 }
 
 export interface EmailClassification {

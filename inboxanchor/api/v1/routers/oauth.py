@@ -10,13 +10,14 @@ from fastapi import APIRouter
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from inboxanchor.config.settings import SETTINGS
-from inboxanchor.connectors.gmail_transport import GMAIL_MODIFY_SCOPE
+from inboxanchor.connectors.gmail_transport import GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE
 from inboxanchor.connectors.oauth_flow import build_authorization_url, exchange_code_for_token
 from inboxanchor.infra.database import session_scope
 from inboxanchor.infra.repository import InboxRepository
 
 router = APIRouter(prefix="/oauth", tags=["oauth"])
 GMAIL_PKCE_REGISTRY: dict[str, str] = {}
+GMAIL_AUTH_SCOPES = [GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE]
 
 
 def _resolve_token_path() -> str:
@@ -74,7 +75,7 @@ def gmail_oauth_start():
         auth_url, state, code_verifier = _normalize_auth_url_result(
             build_authorization_url(
                 str(credentials_path),
-                [GMAIL_MODIFY_SCOPE],
+                GMAIL_AUTH_SCOPES,
                 redirect_uri=SETTINGS.gmail_redirect_uri,
                 state=secrets.token_urlsafe(24),
             )
@@ -112,7 +113,7 @@ def gmail_oauth_callback(
         exchange_code_for_token(
             SETTINGS.gmail_credentials_path,
             token_path,
-            [GMAIL_MODIFY_SCOPE],
+            GMAIL_AUTH_SCOPES,
             code=code,
             redirect_uri=SETTINGS.gmail_redirect_uri,
             state=state,

@@ -170,3 +170,29 @@ class FakeEmailProvider(EmailProvider):
             executed=not dry_run,
             details=f"Labels: {', '.join(labels)}",
         )
+
+    def supports_outbound_email(self) -> bool:
+        return True
+
+    def send_reply(
+        self,
+        email_id: str,
+        body: str,
+        *,
+        from_address: Optional[str] = None,
+        dry_run: bool = True,
+    ) -> ProviderActionResult:
+        del body, from_address
+        if not dry_run and email_id in self._emails:
+            labels = set(self._emails[email_id].labels)
+            labels.add("replied")
+            self._emails[email_id].labels = sorted(labels)
+            self._emails[email_id].unread = False
+        return ProviderActionResult(
+            provider=self.provider_name,
+            action="reply",
+            email_ids=[email_id],
+            dry_run=dry_run,
+            executed=not dry_run,
+            details="Reply drafted for preview." if dry_run else "Reply sent in preview mode.",
+        )

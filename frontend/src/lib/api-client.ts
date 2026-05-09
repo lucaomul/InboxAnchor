@@ -353,6 +353,28 @@ export async function fetchEmailById(
   return apiFetch<EmailMessage>(`/emails/${emailId}${query ? `?${query}` : ""}`);
 }
 
+export interface ReplySendResponse {
+  ok: boolean;
+  emailId: string;
+  provider: string;
+  toAddress: string;
+  details: string;
+}
+
+export async function sendReply(
+  emailId: string,
+  body: string,
+  timeRange?: MailboxTimeRange,
+): Promise<ReplySendResponse> {
+  const qs = new URLSearchParams();
+  if (timeRange) qs.set("time_range", timeRange);
+  const query = qs.toString();
+  return apiFetch<ReplySendResponse>(`/emails/${emailId}/reply${query ? `?${query}` : ""}`, {
+    method: "POST",
+    body: JSON.stringify({ body }),
+  });
+}
+
 // --- Classifications ---
 
 export async function fetchClassifications(
@@ -512,8 +534,8 @@ export interface OpsProgress {
   provider: string;
   time_range: MailboxTimeRange;
   time_range_label: string;
-  mode: "scan" | "backfill";
-  status: "idle" | "running" | "complete" | "error";
+  mode: "scan" | "backfill" | "workflow";
+  status: "idle" | "running" | "complete" | "error" | "paused";
   stage: string;
   target_count: number;
   processed_count: number;
@@ -523,9 +545,15 @@ export interface OpsProgress {
   batch_count: number;
   cached_count: number;
   hydrated_count: number;
+  labeled_count: number;
+  archived_count: number;
+  marked_read_count: number;
+  trashed_count: number;
+  reply_sent_count: number;
   oldest_cached_at?: string | null;
   newest_cached_at?: string | null;
   latest_subject?: string | null;
+  latest_action?: string | null;
   run_id?: string | null;
   error?: string | null;
   updated_at: string;
@@ -588,6 +616,49 @@ export async function runFullAnchorWorkflow(
   return apiFetch<WorkflowMutationResult>("/ops/full-anchor", {
     method: "POST",
     body: JSON.stringify({ force_refresh: true, time_range: timeRange }),
+  });
+}
+
+export interface EmailAlias {
+  id: number;
+  owner_email: string;
+  provider: string;
+  alias_address: string;
+  target_email: string;
+  alias_type: string;
+  label: string;
+  purpose: string;
+  note: string;
+  status: "active" | "revoked";
+  created_at: string;
+  revoked_at?: string | null;
+}
+
+export interface EmailAliasListResponse {
+  items: EmailAlias[];
+  count: number;
+}
+
+export async function fetchEmailAliases(status?: "active" | "revoked"): Promise<EmailAliasListResponse> {
+  const qs = new URLSearchParams();
+  if (status) qs.set("status", status);
+  const query = qs.toString();
+  return apiFetch<EmailAliasListResponse>(`/aliases${query ? `?${query}` : ""}`);
+}
+
+export async function generateEmailAlias(payload: {
+  label?: string;
+  purpose?: string;
+}): Promise<EmailAlias> {
+  return apiFetch<EmailAlias>("/aliases/generate", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function revokeEmailAlias(aliasId: number): Promise<EmailAlias> {
+  return apiFetch<EmailAlias>(`/aliases/${aliasId}/revoke`, {
+    method: "POST",
   });
 }
 

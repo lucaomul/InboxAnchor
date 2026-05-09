@@ -125,11 +125,13 @@ export function StickmanLoader({
   message = "Loading your inbox...",
   playful = false,
   stage,
+  activity,
   stats = [],
 }: {
   message?: string;
   playful?: boolean;
   stage?: string;
+  activity?: string;
   stats?: LoaderStat[];
 }) {
   const { mode, setMode, isFunMode } = useLoaderMode();
@@ -181,6 +183,9 @@ export function StickmanLoader({
             <p className="text-[11px] uppercase tracking-[0.18em] text-primary/80">{stage}</p>
           ) : null}
           <p className="text-sm leading-6 text-muted-foreground">{message}</p>
+          {activity ? (
+            <p className="text-xs leading-5 text-foreground/80">{activity}</p>
+          ) : null}
           {stats.length > 0 ? (
             <div className="grid grid-cols-2 gap-2 text-left sm:grid-cols-4">
               {stats.map((stat) => (

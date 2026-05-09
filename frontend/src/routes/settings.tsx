@@ -7,9 +7,13 @@ import { toast } from "sonner";
 import {
   activateGmailWorkspace,
   fetchProviderConnection,
+  fetchEmailAliases,
   fetchWorkspaceSettings,
+  generateEmailAlias,
   getApiUrl,
+  getAuthEmail,
   getGmailAuthUrl,
+  revokeEmailAlias,
   setApiUrl,
   saveWorkspaceSettings,
   setAuthSession,
@@ -40,14 +44,29 @@ function SettingsPage() {
   const [webhookStatus, setWebhookStatus] = useState<string | null>(null);
   const [webhookLoading, setWebhookLoading] = useState(false);
   const [webhookDetails, setWebhookDetails] = useState<{ uptime: number; clients: number; lastEvent: string | null } | null>(null);
+  const [aliasLabel, setAliasLabel] = useState("");
+  const [aliasPurpose, setAliasPurpose] = useState("");
+  const [aliasItems, setAliasItems] = useState<Array<{
+    id: number;
+    alias_address: string;
+    label: string;
+    purpose: string;
+    note: string;
+    status: "active" | "revoked";
+    created_at: string;
+  }>>([]);
+  const [aliasLoading, setAliasLoading] = useState(false);
+  const [aliasError, setAliasError] = useState("");
   const frontendLoginRedirect =
     typeof window === "undefined" ? "http://127.0.0.1:4173/login" : `${window.location.origin}/login`;
+  const authEmail = getAuthEmail();
 
   useEffect(() => {
     const currentApiUrl = getApiUrl();
     setApiUrlState(currentApiUrl);
     if (currentApiUrl) {
       void loadGmailConnection();
+      void loadAliases();
     }
   }, []);
 
@@ -71,6 +90,7 @@ function SettingsPage() {
         .catch((err) => setGmailError(err.message))
         .finally(async () => {
           await loadGmailConnection();
+          await loadAliases();
           setGmailLoading(false);
         });
     }
@@ -87,6 +107,20 @@ function SettingsPage() {
     }
   };
 
+  const loadAliases = async () => {
+    if (!getApiUrl() || !getAuthEmail()) {
+      setAliasItems([]);
+      return;
+    }
+    try {
+      const response = await fetchEmailAliases();
+      setAliasItems(response.items);
+      setAliasError("");
+    } catch (err) {
+      setAliasError(err instanceof Error ? err.message : "Unable to load aliases");
+    }
+  };
+
   const handleSaveApi = () => {
     setApiError("");
     try {
@@ -94,6 +128,7 @@ function SettingsPage() {
       setSaved(true);
       toast.success("API URL saved");
       void loadGmailConnection();
+      void loadAliases();
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
       setApiError(err instanceof Error ? err.message : "Invalid URL format. Must be a valid http:// or https:// URL.");
@@ -160,11 +195,60 @@ function SettingsPage() {
       }
       setGmailConnected(false);
       setGmailAccountHint("");
+      setAliasItems([]);
       toast.success("Gmail provider disconnected");
     } catch (err) {
       setGmailError(err instanceof Error ? err.message : "Unable to disconnect Gmail");
     } finally {
       setGmailLoading(false);
+    }
+  };
+
+  const handleGenerateAlias = async () => {
+    setAliasLoading(true);
+    setAliasError("");
+    try {
+      const created = await generateEmailAlias({
+        label: aliasLabel,
+        purpose: aliasPurpose,
+      });
+      setAliasItems((previous) => [created, ...previous]);
+      setAliasLabel("");
+      setAliasPurpose("");
+      toast.success("Privacy alias created");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unable to create alias";
+      setAliasError(message);
+      toast.error(message);
+    } finally {
+      setAliasLoading(false);
+    }
+  };
+
+  const handleRevokeAlias = async (aliasId: number) => {
+    setAliasLoading(true);
+    setAliasError("");
+    try {
+      const revoked = await revokeEmailAlias(aliasId);
+      setAliasItems((previous) =>
+        previous.map((item) => (item.id === revoked.id ? revoked : item)),
+      );
+      toast.success("Alias revoked");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unable to revoke alias";
+      setAliasError(message);
+      toast.error(message);
+    } finally {
+      setAliasLoading(false);
+    }
+  };
+
+  const handleCopyAlias = async (aliasAddress: string) => {
+    try {
+      await navigator.clipboard.writeText(aliasAddress);
+      toast.success("Alias copied");
+    } catch {
+      toast.error("Could not copy the alias address");
     }
   };
 
@@ -328,6 +412,98 @@ function SettingsPage() {
             )}
             {!apiUrl && !gmailConnected && (
               <p className="text-xs text-warning">Set the API URL above first to enable Gmail connection.</p>
+            )}
+          </section>
+
+          <section className="rounded-lg border border-border bg-card p-5 space-y-4">
+            <div className="flex items-center gap-2">
+              <Mail className="w-5 h-5 text-primary" />
+              <h2 className="text-sm font-semibold text-foreground">Privacy Aliases</h2>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Generate disposable Gmail-style aliases so you can share a safer address for signups,
+              newsletters, or vendors without handing out the core inbox address everywhere.
+            </p>
+            <div className="rounded-md border border-border bg-secondary/30 p-3 text-xs leading-5 text-muted-foreground">
+              Gmail plus aliases still land in your normal inbox automatically. Revoking one in
+              InboxAnchor stops future reuse here, but Gmail still controls delivery for addresses
+              that were already shared externally.
+            </div>
+            {!authEmail ? (
+              <p className="text-xs text-warning">Log in to manage privacy aliases.</p>
+            ) : !gmailConnected ? (
+              <p className="text-xs text-warning">Connect Gmail first to generate privacy aliases.</p>
+            ) : (
+              <>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <Input
+                    value={aliasLabel}
+                    onChange={(e) => setAliasLabel(e.target.value)}
+                    placeholder="Alias label (example: travel)"
+                  />
+                  <Input
+                    value={aliasPurpose}
+                    onChange={(e) => setAliasPurpose(e.target.value)}
+                    placeholder="Purpose (example: airline promos)"
+                  />
+                </div>
+                <Button onClick={handleGenerateAlias} disabled={aliasLoading}>
+                  {aliasLoading ? "Generating..." : "Generate privacy alias"}
+                </Button>
+                {aliasError ? (
+                  <p className="text-xs text-destructive">{aliasError}</p>
+                ) : null}
+                <div className="space-y-3">
+                  {aliasItems.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">
+                      No aliases created yet. Generate one for newsletters, marketplaces, or any
+                      source that does not need your main address.
+                    </p>
+                  ) : (
+                    aliasItems.map((alias) => (
+                      <div
+                        key={alias.id}
+                        className="rounded-lg border border-border bg-secondary/20 p-3"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <div>
+                            <p className="text-sm font-medium text-foreground">{alias.alias_address}</p>
+                            <p className="text-[11px] text-muted-foreground">
+                              {alias.label || "Unlabeled"}{alias.purpose ? ` · ${alias.purpose}` : ""}
+                            </p>
+                          </div>
+                          <Badge
+                            variant={alias.status === "active" ? "safe" : "muted"}
+                            className="text-[10px]"
+                          >
+                            {alias.status}
+                          </Badge>
+                        </div>
+                        <p className="mt-2 text-[11px] leading-5 text-muted-foreground">{alias.note}</p>
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => handleCopyAlias(alias.alias_address)}
+                          >
+                            Copy alias
+                          </Button>
+                          {alias.status === "active" ? (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              onClick={() => handleRevokeAlias(alias.id)}
+                              disabled={aliasLoading}
+                            >
+                              Revoke
+                            </Button>
+                          ) : null}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </>
             )}
           </section>
         </div>
