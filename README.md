@@ -2,6 +2,12 @@
 
 InboxAnchor is a safety-first inbox triage system for overloaded email accounts. It classifies, prioritizes, summarizes, drafts, and recommends cleanup actions while keeping a human in the loop for anything risky. The project is intentionally opinionated: it is not an auto-delete bot, and it treats approval, auditability, and rollback-friendly behavior as product features, not afterthoughts.
 
+## Demo
+
+![InboxAnchor demo reel](docs/assets/inboxanchor-demo.gif)
+
+The demo reel shows the command center, live unread-scan progress, the stickman loading game, inbox triage, mailbox upgrade actions, and managed privacy aliases in one short product loop.
+
 ## What It Does
 
 - Connects to demo, Gmail, and IMAP-family provider paths through a shared provider abstraction

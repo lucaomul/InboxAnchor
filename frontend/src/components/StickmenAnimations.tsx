@@ -1,4 +1,7 @@
-import { StickmanInboxRunner } from "@/components/StickmanInboxRunner";
+import {
+  StickmanInboxRunner,
+  type StickmanInboxRunnerProps,
+} from "@/components/StickmanInboxRunner";
 import { useLoaderMode } from "@/hooks/use-loader-mode";
 
 type LoaderStat = {
@@ -127,44 +130,54 @@ export function StickmanLoader({
   stage,
   activity,
   stats = [],
+  modeOverride,
+  runnerProps,
+  showModeToggle = true,
 }: {
   message?: string;
   playful?: boolean;
   stage?: string;
   activity?: string;
   stats?: LoaderStat[];
+  modeOverride?: "fun" | "serious";
+  runnerProps?: StickmanInboxRunnerProps;
+  showModeToggle?: boolean;
 }) {
   const { mode, setMode, isFunMode } = useLoaderMode();
+  const resolvedMode = modeOverride ?? mode;
+  const resolvedFunMode = modeOverride ? modeOverride === "fun" : isFunMode;
 
   if (playful) {
     return (
       <div className="flex flex-col items-center justify-center gap-3 py-6 text-muted-foreground">
-        <div className="flex items-center gap-2 rounded-full border border-border bg-card/70 p-1">
-          <button
-            type="button"
-            onClick={() => setMode("fun")}
-            className={`rounded-full px-3 py-1 text-[10px] font-medium uppercase tracking-[0.18em] transition-colors ${
-              mode === "fun"
-                ? "bg-primary text-primary-foreground"
-                : "text-muted-foreground hover:bg-secondary hover:text-foreground"
-            }`}
-          >
-            Fun Mode
-          </button>
-          <button
-            type="button"
-            onClick={() => setMode("serious")}
-            className={`rounded-full px-3 py-1 text-[10px] font-medium uppercase tracking-[0.18em] transition-colors ${
-              mode === "serious"
-                ? "bg-primary text-primary-foreground"
-                : "text-muted-foreground hover:bg-secondary hover:text-foreground"
-            }`}
-          >
-            Serious Mode
-          </button>
-        </div>
-        {isFunMode ? (
-          <StickmanInboxRunner />
+        {showModeToggle ? (
+          <div className="flex items-center gap-2 rounded-full border border-border bg-card/70 p-1">
+            <button
+              type="button"
+              onClick={() => setMode("fun")}
+              className={`rounded-full px-3 py-1 text-[10px] font-medium uppercase tracking-[0.18em] transition-colors ${
+                resolvedMode === "fun"
+                  ? "bg-primary text-primary-foreground"
+                  : "text-muted-foreground hover:bg-secondary hover:text-foreground"
+              }`}
+            >
+              Fun Mode
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode("serious")}
+              className={`rounded-full px-3 py-1 text-[10px] font-medium uppercase tracking-[0.18em] transition-colors ${
+                resolvedMode === "serious"
+                  ? "bg-primary text-primary-foreground"
+                  : "text-muted-foreground hover:bg-secondary hover:text-foreground"
+              }`}
+            >
+              Serious Mode
+            </button>
+          </div>
+        ) : null}
+        {resolvedFunMode ? (
+          <StickmanInboxRunner autoplay {...runnerProps} />
         ) : (
           <div className="flex w-full max-w-[360px] flex-col items-center gap-4 rounded-2xl border border-border bg-background/80 p-6 shadow-sm">
             <div className="h-12 w-12 animate-spin rounded-full border-4 border-border border-t-primary" />

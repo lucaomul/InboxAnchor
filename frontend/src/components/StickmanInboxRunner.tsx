@@ -18,6 +18,12 @@ type RunnerState = {
   obstacles: Obstacle[];
 };
 
+export type StickmanInboxRunnerProps = {
+  autoplay?: boolean;
+  className?: string;
+  showControlsHint?: boolean;
+};
+
 const WIDTH = 320;
 const HEIGHT = 152;
 const GROUND_Y = 116;
@@ -64,18 +70,30 @@ function intersects(a: { left: number; right: number; top: number; bottom: numbe
   return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
 }
 
-export function StickmanInboxRunner({ className = "" }: { className?: string }) {
+export function StickmanInboxRunner({
+  autoplay = false,
+  className = "",
+  showControlsHint = true,
+}: StickmanInboxRunnerProps) {
   const [game, setGame] = useState<RunnerState>(() => initialState());
   const containerRef = useRef<HTMLDivElement | null>(null);
   const jumpQueuedRef = useRef(0);
   const crouchActiveRef = useRef(false);
   const obstacleIdRef = useRef(0);
-  const spawnCooldownRef = useRef(900);
+  const autoplayPatternRef = useRef<ObstacleKind[]>(["envelope", "thread", "envelope", "thread"]);
+  const autoplayPatternIndexRef = useRef(0);
+  const spawnCooldownRef = useRef(autoplay ? 460 : 900);
   const spawnElapsedRef = useRef(0);
 
   useEffect(() => {
     containerRef.current?.focus();
   }, []);
+
+  useEffect(() => {
+    spawnCooldownRef.current = autoplay ? 460 : 900;
+    spawnElapsedRef.current = 0;
+    autoplayPatternIndexRef.current = 0;
+  }, [autoplay]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent | ReactKeyboardEvent<HTMLDivElement>) => {
@@ -144,7 +162,51 @@ export function StickmanInboxRunner({ className = "" }: { className?: string }) 
       setGame((previous) => {
         let y = previous.y;
         let velocityY = previous.velocityY;
+        const speed = 3.25 * timeScale;
+        let obstacles = previous.obstacles
+          .map((obstacle) => ({ ...obstacle, x: obstacle.x - speed }))
+          .filter((obstacle) => obstacle.x > -60);
+
+        spawnElapsedRef.current += dt;
+        if (spawnElapsedRef.current >= spawnCooldownRef.current) {
+          obstacleIdRef.current += 1;
+          const kind: ObstacleKind = autoplay
+            ? autoplayPatternRef.current[
+                autoplayPatternIndexRef.current++ % autoplayPatternRef.current.length
+              ]
+            : Math.random() > 0.32
+              ? "envelope"
+              : "thread";
+          obstacles = [...obstacles, { id: obstacleIdRef.current, kind, x: WIDTH + 16 }];
+          spawnElapsedRef.current = 0;
+          spawnCooldownRef.current = autoplay ? 640 : 900 + Math.random() * 700;
+        }
+
         const grounded = y <= 0.001;
+        const nextObstacle = obstacles.find((obstacle) => {
+          const box = obstacleBox(obstacle);
+          return box.right >= PLAYER_X - 6;
+        });
+        const nextObstacleBox = nextObstacle ? obstacleBox(nextObstacle) : null;
+        const autoplayCrouch =
+          autoplay &&
+          grounded &&
+          nextObstacle?.kind === "thread" &&
+          nextObstacleBox !== null &&
+          nextObstacleBox.left <= PLAYER_X + PLAYER_WIDTH + 26 &&
+          nextObstacleBox.right >= PLAYER_X - 4;
+
+        if (
+          autoplay &&
+          grounded &&
+          nextObstacle?.kind === "envelope" &&
+          nextObstacleBox !== null &&
+          nextObstacleBox.left <= PLAYER_X + PLAYER_WIDTH + 34
+        ) {
+          jumpQueuedRef.current = Math.max(jumpQueuedRef.current, 1);
+          velocityY = Math.max(velocityY, 11.2);
+          jumpQueuedRef.current = 0;
+        }
 
         if (grounded && jumpQueuedRef.current > 0) {
           velocityY = Math.max(velocityY, 11.2);
@@ -157,21 +219,7 @@ export function StickmanInboxRunner({ className = "" }: { className?: string }) 
           velocityY = 0;
         }
 
-        const crouching = crouchActiveRef.current && y === 0;
-        const speed = 3.25 * timeScale;
-        let obstacles = previous.obstacles
-          .map((obstacle) => ({ ...obstacle, x: obstacle.x - speed }))
-          .filter((obstacle) => obstacle.x > -60);
-
-        spawnElapsedRef.current += dt;
-        if (spawnElapsedRef.current >= spawnCooldownRef.current) {
-          obstacleIdRef.current += 1;
-          const kind: ObstacleKind = Math.random() > 0.32 ? "envelope" : "thread";
-          obstacles = [...obstacles, { id: obstacleIdRef.current, kind, x: WIDTH + 16 }];
-          spawnElapsedRef.current = 0;
-          spawnCooldownRef.current = 900 + Math.random() * 700;
-        }
-
+        const crouching = (crouchActiveRef.current || autoplayCrouch) && y === 0;
         const playerHeight = crouching ? CROUCH_HEIGHT : STANDING_HEIGHT;
         const playerBox = {
           left: PLAYER_X,
@@ -291,9 +339,13 @@ export function StickmanInboxRunner({ className = "" }: { className?: string }) 
         <span>Best {Math.max(game.best, score)}</span>
         <span>Resets {game.crashes}</span>
       </div>
-      <p className="mt-1 text-center text-[10px] uppercase tracking-[0.18em] text-muted-foreground/80">
-        Click or hover here, then press W, S, arrows, or space.
-      </p>
+      {showControlsHint ? (
+        <p className="mt-1 text-center text-[10px] uppercase tracking-[0.18em] text-muted-foreground/80">
+          {autoplay
+            ? "Autoplay is on. Press W, S, arrows, or space to take over."
+            : "Click or hover here, then press W, S, arrows, or space."}
+        </p>
+      ) : null}
     </div>
   );
 }
