@@ -7,6 +7,7 @@ InboxAnchor is a safety-first inbox triage system for overloaded email accounts.
 ![InboxAnchor demo reel](docs/assets/inboxanchor-demo.gif)
 
 The demo reel shows the command center, live unread-scan progress, the stickman loading game, inbox triage, mailbox upgrade actions, and managed privacy aliases in one short product loop.
+It intentionally uses curated demo data for privacy, so the capture never exposes sensitive content from a real mailbox.
 
 ## What It Does
 

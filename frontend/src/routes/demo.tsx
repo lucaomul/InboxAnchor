@@ -205,6 +205,10 @@ function DemoRoute() {
                 <Sparkles className="h-3 w-3" />
                 Demo workspace
               </Badge>
+              <Badge variant="outline" className="gap-1">
+                <ShieldCheck className="h-3 w-3" />
+                Privacy-safe demo
+              </Badge>
               <Badge variant="muted">Last 3 years</Badge>
               <Link
                 to="/"
@@ -263,6 +267,16 @@ function DemoRoute() {
                     </div>
                   ))}
                 </div>
+              </div>
+
+              <div className="rounded-3xl border border-border bg-card p-5">
+                <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+                  Privacy note
+                </p>
+                <p className="mt-3 text-sm leading-6 text-muted-foreground">
+                  This reel uses curated demo data and product-owned alias examples so no sensitive
+                  content from a real mailbox appears in the capture.
+                </p>
               </div>
 
               <div className="rounded-3xl border border-border bg-card p-5">

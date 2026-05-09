@@ -20,7 +20,7 @@ rm -f "$TMP_DIR"/frame-*.png
 osascript \
   -e 'tell application "Safari" to activate' \
   -e 'tell application "Safari" to if (count of windows) = 0 then make new document' \
-  -e "tell application \"Safari\" to set URL of document 1 to \"$URL\"" \
+  -e "tell application \"Safari\" to set URL of front document to \"$URL\"" \
   -e "tell application \"Safari\" to set bounds of front window to $WINDOW_BOUNDS"
 
 sleep 1.5
