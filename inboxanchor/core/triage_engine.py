@@ -27,6 +27,7 @@ from inboxanchor.models import (
     WorkspacePolicy,
 )
 from inboxanchor.models.email import RecommendationStatus, SafetyStatus
+from inboxanchor.sender_intelligence import SenderIntelligenceResolver
 
 
 class TriageEngine:
@@ -59,6 +60,9 @@ class TriageEngine:
         dry_run: bool = True,
         limit: int = 50,
         batch_size: int = 100,
+        include_body: bool = True,
+        extract_actions: bool = True,
+        draft_replies: bool = True,
         category_filters: Optional[list[str]] = None,
         confidence_threshold: float = 0.65,
         email_preview_limit: int = 100,
@@ -76,6 +80,7 @@ class TriageEngine:
         batch_count = 0
         scanned_emails = 0
         total_action_items = 0
+        sender_intelligence = SenderIntelligenceResolver(self.provider.provider_name)
 
         if progress_callback:
             progress_callback(
@@ -84,6 +89,7 @@ class TriageEngine:
                     "provider": self.provider.provider_name,
                     "limit": limit,
                     "batch_size": batch_size,
+                    "include_body": include_body,
                     "scanned_emails": 0,
                     "processed_emails": 0,
                     "read_count": 0,
@@ -96,7 +102,7 @@ class TriageEngine:
         for batch in self.provider.iter_unread_batches(
             limit=limit,
             batch_size=batch_size,
-            include_body=True,
+            include_body=include_body,
             time_range=time_range,
         ):
             batch_count += 1
@@ -107,6 +113,7 @@ class TriageEngine:
                         "provider": self.provider.provider_name,
                         "limit": limit,
                         "batch_size": batch_size,
+                        "include_body": include_body,
                         "scanned_emails": scanned_emails,
                         "processed_emails": len(all_emails),
                         "read_count": len(all_emails),
@@ -117,10 +124,12 @@ class TriageEngine:
                 )
             for email in batch:
                 scanned_emails += 1
+                intelligence = sender_intelligence.resolve(email)
                 classification = self.priority_agent.prioritize(
                     email,
-                    self.classifier.classify(email),
+                    self.classifier.classify(email, intelligence=intelligence),
                 )
+                sender_intelligence.observe(email, context=intelligence)
                 if category_filters and classification.category not in category_filters:
                     continue
                 if classification.confidence < confidence_threshold and not email.has_attachments:
@@ -133,9 +142,13 @@ class TriageEngine:
                         }
                     )
 
-                items = self.action_extractor.extract(
-                    email,
-                    classification=classification,
+                items = (
+                    self.action_extractor.extract(
+                        email,
+                        classification=classification,
+                    )
+                    if extract_actions
+                    else []
                 )
                 recommendation = self.safety_verifier.verify(
                     email,
@@ -152,7 +165,7 @@ class TriageEngine:
                 classifications[email.id] = classification
                 action_items[email.id].extend(items)
                 total_action_items += len(items)
-                if items:
+                if draft_replies and items:
                     draft = self.reply_drafter.draft(
                         email,
                         items,
@@ -169,6 +182,7 @@ class TriageEngine:
                             "provider": self.provider.provider_name,
                             "limit": limit,
                             "batch_size": batch_size,
+                            "include_body": include_body,
                             "scanned_emails": scanned_emails,
                             "processed_emails": len(all_emails),
                             "read_count": len(all_emails),
@@ -254,6 +268,7 @@ class TriageEngine:
                     "provider": self.provider.provider_name,
                     "limit": limit,
                     "batch_size": batch_size,
+                    "include_body": include_body,
                     "scanned_emails": scanned_emails,
                     "processed_emails": len(all_emails),
                     "read_count": len(all_emails),

@@ -343,15 +343,18 @@ class GoogleAPITransport(GmailTransport):
         self,
         limit: int,
         *,
+        include_body: bool = True,
         time_range: Optional[str] = None,
     ) -> list[EmailMessage]:
         emails: list[EmailMessage] = []
         fetched = 0
         self._page_tokens = {0: None}
+        page_size = 100 if include_body else 500
         while fetched < limit:
             page = self.list_unread_page(
-                min(100, limit - fetched),
+                min(page_size, limit - fetched),
                 fetched,
+                include_body=include_body,
                 time_range=time_range,
             )
             if not page:
@@ -365,6 +368,7 @@ class GoogleAPITransport(GmailTransport):
         limit: int,
         offset: int,
         *,
+        include_body: bool = True,
         time_range: Optional[str] = None,
     ) -> list[EmailMessage]:
         page_token = self._page_tokens.get(offset)
@@ -384,7 +388,10 @@ class GoogleAPITransport(GmailTransport):
         refs = response.get("messages", []) or []
         self._page_tokens[offset + len(refs)] = response.get("nextPageToken")
         return [
-            self._message_to_email(self._fetch_message_resource(item["id"], include_body=True))
+            self._message_to_email(
+                self._fetch_message_resource(item["id"], include_body=include_body),
+                include_body=include_body,
+            )
             for item in refs
         ]
 
@@ -549,6 +556,10 @@ class GoogleAPITransport(GmailTransport):
             self._refresh_label_cache()
         return self._label_cache.get(normalized)
 
+    def list_labels(self) -> list[str]:
+        self._refresh_label_cache()
+        return sorted(self._label_cache.keys())
+
     @staticmethod
     def _is_missing_label_error(exc: Exception) -> bool:
         status_code = getattr(getattr(exc, "response", None), "status_code", None)
@@ -589,11 +600,15 @@ class GoogleAPITransport(GmailTransport):
     def delete_labels(self, labels: list[str]) -> None:
         if not labels:
             return
-        for label_name in dedupe_labels(labels):
-            normalized = label_name.strip()
-            if not normalized:
-                continue
-            label_id = self._existing_label_id(normalized)
+        deduped = dedupe_labels(labels)
+        if not self._label_cache:
+            self._refresh_label_cache()
+        label_ids = {
+            label_name.strip(): self._label_cache.get(label_name.strip())
+            for label_name in deduped
+            if label_name.strip()
+        }
+        for normalized, label_id in label_ids.items():
             if not label_id:
                 continue
             try:

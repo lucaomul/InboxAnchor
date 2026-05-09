@@ -10,27 +10,40 @@ from inboxanchor.infra.database import (
     ActionItemORM,
     AuditLogORM,
     ClassificationORM,
+    DomainProfileORM,
     EmailAliasORM,
     EmailRecordORM,
     FollowUpReminderORM,
+    MailboxActionItemORM,
+    MailboxClassificationORM,
     MailboxEmailORM,
+    MailboxRecommendationORM,
     ProviderCheckpointORM,
     ProviderConnectionORM,
     ProviderSyncStateORM,
     RecommendationORM,
+    SenderProfileORM,
     TriageRunORM,
     WorkspaceSettingsORM,
 )
 from inboxanchor.infra.text_normalizer import normalize_email_body_text
 from inboxanchor.models import (
     AuditLogEntry,
+    EmailActionItem,
     EmailAlias,
     EmailAliasStatus,
+    EmailClassification,
+    EmailRecommendation,
     FollowUpReminder,
     FollowUpReminderStatus,
     ProviderConnectionState,
     TriageRunResult,
     WorkspaceSettings,
+)
+from inboxanchor.sender_intelligence import (
+    observe_profile_email,
+    sender_address,
+    sender_domain,
 )
 
 
@@ -100,6 +113,64 @@ class InboxRepository:
             "unread": row.unread,
             "last_synced_at": row.last_synced_at.isoformat(),
         }
+
+    @staticmethod
+    def _mailbox_classification_payload(row: MailboxClassificationORM) -> dict:
+        return {
+            "email_id": row.email_id,
+            "classification": {
+                "category": row.category,
+                "priority": row.priority,
+                "confidence": row.confidence,
+                "reason": row.reason,
+            },
+            "source": row.source,
+            "run_id": row.run_id,
+            "updated_at": row.updated_at.isoformat(),
+        }
+
+    @staticmethod
+    def _mailbox_action_item_payload(row: MailboxActionItemORM) -> dict:
+        return {
+            "email_id": row.email_id,
+            "action_type": row.action_type,
+            "description": row.description,
+            "due_hint": row.due_hint,
+            "requires_reply": row.requires_reply,
+            "source": row.source,
+            "run_id": row.run_id,
+            "updated_at": row.updated_at.isoformat(),
+        }
+
+    @staticmethod
+    def _mailbox_recommendation_payload(row: MailboxRecommendationORM) -> dict:
+        return {
+            "email_id": row.email_id,
+            "recommended_action": row.recommended_action,
+            "reason": row.reason,
+            "confidence": row.confidence,
+            "status": row.status,
+            "requires_approval": row.requires_approval,
+            "blocked_reason": row.blocked_reason,
+            "proposed_labels": row.proposed_labels,
+            "source": row.source,
+            "run_id": row.run_id,
+            "updated_at": row.updated_at.isoformat(),
+        }
+
+    @staticmethod
+    def _sender_profile_payload(row: SenderProfileORM) -> dict:
+        payload = dict(row.payload or {})
+        payload["provider"] = row.provider
+        payload["sender_address"] = row.sender_address
+        return payload
+
+    @staticmethod
+    def _domain_profile_payload(row: DomainProfileORM) -> dict:
+        payload = dict(row.payload or {})
+        payload["provider"] = row.provider
+        payload["domain"] = row.domain
+        return payload
 
     @staticmethod
     def _reminder_model(row: FollowUpReminderORM) -> FollowUpReminder:
@@ -196,6 +267,20 @@ class InboxRepository:
                     reason=classification.reason,
                 )
             )
+            self.upsert_mailbox_classification(
+                result.provider,
+                email.id,
+                classification,
+                source="run",
+                run_id=result.run_id,
+            )
+            self.replace_mailbox_action_items(
+                result.provider,
+                email.id,
+                action_items.get(email.id, []),
+                source="run",
+                run_id=result.run_id,
+            )
 
             for action_item in action_items.get(email.id, []):
                 self.session.add(
@@ -223,6 +308,13 @@ class InboxRepository:
                     proposed_labels=recommendation.proposed_labels,
                 )
             )
+            self.upsert_mailbox_recommendation(
+                result.provider,
+                recommendation.email_id,
+                recommendation,
+                source="run",
+                run_id=result.run_id,
+            )
 
     def get_run(self, run_id: str) -> Optional[dict]:
         run = self.session.get(TriageRunORM, run_id)
@@ -234,6 +326,95 @@ class InboxRepository:
             query = query.filter(TriageRunORM.provider == provider)
         row = query.order_by(TriageRunORM.started_at.desc()).first()
         return row.run_id if row else None
+
+    def get_sender_profile(self, provider: str, sender: str) -> Optional[dict]:
+        address = sender_address(sender)
+        if not address:
+            return None
+        row = (
+            self.session.query(SenderProfileORM)
+            .filter(
+                SenderProfileORM.provider == provider,
+                SenderProfileORM.sender_address == address,
+            )
+            .first()
+        )
+        return self._sender_profile_payload(row) if row else None
+
+    def get_domain_profile(self, provider: str, domain: str) -> Optional[dict]:
+        normalized = (domain or "").strip().lower()
+        if not normalized:
+            return None
+        row = (
+            self.session.query(DomainProfileORM)
+            .filter(
+                DomainProfileORM.provider == provider,
+                DomainProfileORM.domain == normalized,
+            )
+            .first()
+        )
+        return self._domain_profile_payload(row) if row else None
+
+    def _observe_sender_intelligence(self, provider: str, email, *, count_message: bool) -> None:
+        address = sender_address(email.sender)
+        domain = sender_domain(email.sender)
+        if address:
+            sender_row = (
+                self.session.query(SenderProfileORM)
+                .filter(
+                    SenderProfileORM.provider == provider,
+                    SenderProfileORM.sender_address == address,
+                )
+                .first()
+            )
+            sender_payload = observe_profile_email(
+                self._sender_profile_payload(sender_row) if sender_row else None,
+                provider=provider,
+                email=email,
+                profile_kind="sender",
+                count_message=count_message,
+            )
+            if sender_row is None:
+                self.session.add(
+                    SenderProfileORM(
+                        provider=provider,
+                        sender_address=address,
+                        payload=sender_payload,
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                )
+            else:
+                sender_row.payload = sender_payload
+                sender_row.updated_at = datetime.now(timezone.utc)
+
+        if domain:
+            domain_row = (
+                self.session.query(DomainProfileORM)
+                .filter(
+                    DomainProfileORM.provider == provider,
+                    DomainProfileORM.domain == domain,
+                )
+                .first()
+            )
+            domain_payload = observe_profile_email(
+                self._domain_profile_payload(domain_row) if domain_row else None,
+                provider=provider,
+                email=email,
+                profile_kind="domain",
+                count_message=count_message,
+            )
+            if domain_row is None:
+                self.session.add(
+                    DomainProfileORM(
+                        provider=provider,
+                        domain=domain,
+                        payload=domain_payload,
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                )
+            else:
+                domain_row.payload = domain_payload
+                domain_row.updated_at = datetime.now(timezone.utc)
 
     def upsert_mailbox_email(self, provider: str, email) -> None:
         row = (
@@ -276,6 +457,7 @@ class InboxRepository:
         }
 
         if row is None:
+            self._observe_sender_intelligence(provider, email, count_message=True)
             self.session.add(
                 MailboxEmailORM(
                     provider=provider,
@@ -296,6 +478,393 @@ class InboxRepository:
         row.has_attachments = payload["has_attachments"]
         row.unread = payload["unread"]
         row.last_synced_at = payload["last_synced_at"]
+        self._observe_sender_intelligence(provider, email, count_message=False)
+
+    def upsert_mailbox_classification(
+        self,
+        provider: str,
+        email_id: str,
+        classification: EmailClassification,
+        *,
+        source: str = "heuristic",
+        run_id: Optional[str] = None,
+    ) -> dict:
+        row = (
+            self.session.query(MailboxClassificationORM)
+            .filter(
+                MailboxClassificationORM.provider == provider,
+                MailboxClassificationORM.email_id == email_id,
+            )
+            .first()
+        )
+        payload = {
+            "category": getattr(classification.category, "value", classification.category),
+            "priority": getattr(classification.priority, "value", classification.priority),
+            "confidence": float(classification.confidence),
+            "reason": classification.reason,
+            "source": source,
+            "run_id": run_id,
+            "updated_at": datetime.now(timezone.utc),
+        }
+        if row is None:
+            row = MailboxClassificationORM(
+                provider=provider,
+                email_id=email_id,
+                **payload,
+            )
+            self.session.add(row)
+        else:
+            row.category = payload["category"]
+            row.priority = payload["priority"]
+            row.confidence = payload["confidence"]
+            row.reason = payload["reason"]
+            row.source = payload["source"]
+            row.run_id = payload["run_id"]
+            row.updated_at = payload["updated_at"]
+        self.session.flush()
+        return self._mailbox_classification_payload(row)
+
+    def replace_mailbox_action_items(
+        self,
+        provider: str,
+        email_id: str,
+        items: list[EmailActionItem],
+        *,
+        source: str = "heuristic",
+        run_id: Optional[str] = None,
+    ) -> list[dict]:
+        (
+            self.session.query(MailboxActionItemORM)
+            .filter(
+                MailboxActionItemORM.provider == provider,
+                MailboxActionItemORM.email_id == email_id,
+            )
+            .delete(synchronize_session=False)
+        )
+        rows: list[MailboxActionItemORM] = []
+        timestamp = datetime.now(timezone.utc)
+        for item in items:
+            row = MailboxActionItemORM(
+                provider=provider,
+                email_id=email_id,
+                action_type=item.action_type,
+                description=item.description,
+                due_hint=item.due_hint,
+                requires_reply=item.requires_reply,
+                source=source,
+                run_id=run_id,
+                updated_at=timestamp,
+            )
+            self.session.add(row)
+            rows.append(row)
+        self.session.flush()
+        return [self._mailbox_action_item_payload(row) for row in rows]
+
+    def upsert_mailbox_recommendation(
+        self,
+        provider: str,
+        email_id: str,
+        recommendation: EmailRecommendation,
+        *,
+        source: str = "heuristic",
+        run_id: Optional[str] = None,
+    ) -> dict:
+        row = (
+            self.session.query(MailboxRecommendationORM)
+            .filter(
+                MailboxRecommendationORM.provider == provider,
+                MailboxRecommendationORM.email_id == email_id,
+            )
+            .first()
+        )
+        payload = {
+            "recommended_action": recommendation.recommended_action,
+            "reason": recommendation.reason,
+            "confidence": float(recommendation.confidence),
+            "status": getattr(recommendation.status, "value", recommendation.status),
+            "requires_approval": recommendation.requires_approval,
+            "blocked_reason": recommendation.blocked_reason,
+            "proposed_labels": list(recommendation.proposed_labels),
+            "source": source,
+            "run_id": run_id,
+            "updated_at": datetime.now(timezone.utc),
+        }
+        if row is None:
+            row = MailboxRecommendationORM(
+                provider=provider,
+                email_id=email_id,
+                **payload,
+            )
+            self.session.add(row)
+        else:
+            row.recommended_action = payload["recommended_action"]
+            row.reason = payload["reason"]
+            row.confidence = payload["confidence"]
+            row.status = payload["status"]
+            row.requires_approval = payload["requires_approval"]
+            row.blocked_reason = payload["blocked_reason"]
+            row.proposed_labels = payload["proposed_labels"]
+            row.source = payload["source"]
+            row.run_id = payload["run_id"]
+            row.updated_at = payload["updated_at"]
+        self.session.flush()
+        return self._mailbox_recommendation_payload(row)
+
+    def get_mailbox_classification_map(
+        self,
+        provider: str,
+        email_ids: list[str],
+    ) -> dict[str, dict]:
+        if not email_ids:
+            return {}
+        rows = (
+            self.session.query(MailboxClassificationORM)
+            .filter(
+                MailboxClassificationORM.provider == provider,
+                MailboxClassificationORM.email_id.in_(email_ids),
+            )
+            .all()
+        )
+        return {
+            row.email_id: self._mailbox_classification_payload(row)
+            for row in rows
+        }
+
+    def get_mailbox_action_items(
+        self,
+        provider: str,
+        email_id: str,
+    ) -> list[dict]:
+        rows = (
+            self.session.query(MailboxActionItemORM)
+            .filter(
+                MailboxActionItemORM.provider == provider,
+                MailboxActionItemORM.email_id == email_id,
+            )
+            .order_by(MailboxActionItemORM.id.asc())
+            .all()
+        )
+        return [self._mailbox_action_item_payload(row) for row in rows]
+
+    def count_mailbox_action_items(
+        self,
+        provider: str,
+        *,
+        unread_only: Optional[bool] = None,
+        time_range: Optional[str] = None,
+    ) -> int:
+        query = (
+            self.session.query(MailboxActionItemORM)
+            .join(
+                MailboxEmailORM,
+                and_(
+                    MailboxEmailORM.provider == MailboxActionItemORM.provider,
+                    MailboxEmailORM.email_id == MailboxActionItemORM.email_id,
+                ),
+            )
+            .filter(MailboxActionItemORM.provider == provider)
+        )
+        if unread_only is True:
+            query = query.filter(MailboxEmailORM.unread.is_(True))
+        elif unread_only is False:
+            query = query.filter(MailboxEmailORM.unread.is_(False))
+        if time_range:
+            window = resolve_time_window(time_range)
+            if window.start_at is not None:
+                query = query.filter(MailboxEmailORM.received_at >= window.start_at)
+            if window.end_at is not None:
+                query = query.filter(MailboxEmailORM.received_at < window.end_at)
+        return query.count()
+
+    def get_mailbox_recommendation_map(
+        self,
+        provider: str,
+        email_ids: list[str],
+    ) -> dict[str, dict]:
+        if not email_ids:
+            return {}
+        rows = (
+            self.session.query(MailboxRecommendationORM)
+            .filter(
+                MailboxRecommendationORM.provider == provider,
+                MailboxRecommendationORM.email_id.in_(email_ids),
+            )
+            .all()
+        )
+        return {
+            row.email_id: self._mailbox_recommendation_payload(row)
+            for row in rows
+        }
+
+    def get_mailbox_recommendation_detail(
+        self,
+        provider: str,
+        email_id: str,
+    ) -> Optional[dict]:
+        row = (
+            self.session.query(MailboxRecommendationORM)
+            .filter(
+                MailboxRecommendationORM.provider == provider,
+                MailboxRecommendationORM.email_id == email_id,
+            )
+            .first()
+        )
+        return self._mailbox_recommendation_payload(row) if row else None
+
+    def get_mailbox_classification_detail(
+        self,
+        provider: str,
+        email_id: str,
+    ) -> Optional[dict]:
+        row = (
+            self.session.query(MailboxClassificationORM)
+            .filter(
+                MailboxClassificationORM.provider == provider,
+                MailboxClassificationORM.email_id == email_id,
+            )
+            .first()
+        )
+        return self._mailbox_classification_payload(row) if row else None
+
+    def list_mailbox_classifications(
+        self,
+        provider: str,
+        *,
+        unread_only: Optional[bool] = None,
+        q: Optional[str] = None,
+        time_range: Optional[str] = None,
+    ) -> dict[str, dict]:
+        query = (
+            self.session.query(MailboxClassificationORM, MailboxEmailORM)
+            .join(
+                MailboxEmailORM,
+                and_(
+                    MailboxEmailORM.provider == MailboxClassificationORM.provider,
+                    MailboxEmailORM.email_id == MailboxClassificationORM.email_id,
+                ),
+            )
+            .filter(MailboxClassificationORM.provider == provider)
+        )
+        if unread_only is True:
+            query = query.filter(MailboxEmailORM.unread.is_(True))
+        elif unread_only is False:
+            query = query.filter(MailboxEmailORM.unread.is_(False))
+        if time_range:
+            window = resolve_time_window(time_range)
+            if window.start_at is not None:
+                query = query.filter(MailboxEmailORM.received_at >= window.start_at)
+            if window.end_at is not None:
+                query = query.filter(MailboxEmailORM.received_at < window.end_at)
+        if q:
+            pattern = f"%{q.strip()}%"
+            query = query.filter(
+                or_(
+                    MailboxEmailORM.subject.ilike(pattern),
+                    MailboxEmailORM.sender.ilike(pattern),
+                    MailboxEmailORM.snippet.ilike(pattern),
+                    MailboxEmailORM.body_preview.ilike(pattern),
+                )
+            )
+        rows = query.order_by(MailboxEmailORM.received_at.desc()).all()
+        payload: dict[str, dict] = {}
+        for classification, _mailbox_email in rows:
+            payload[classification.email_id] = self._mailbox_classification_payload(classification)
+        return payload
+
+    def get_mailbox_classification_stats(
+        self,
+        provider: str,
+        *,
+        unread_only: Optional[bool] = None,
+        time_range: Optional[str] = None,
+        high_priority_limit: int = 250,
+    ) -> dict:
+        query = (
+            self.session.query(MailboxClassificationORM, MailboxEmailORM)
+            .join(
+                MailboxEmailORM,
+                and_(
+                    MailboxEmailORM.provider == MailboxClassificationORM.provider,
+                    MailboxEmailORM.email_id == MailboxClassificationORM.email_id,
+                ),
+            )
+            .filter(MailboxClassificationORM.provider == provider)
+        )
+        if unread_only is True:
+            query = query.filter(MailboxEmailORM.unread.is_(True))
+        elif unread_only is False:
+            query = query.filter(MailboxEmailORM.unread.is_(False))
+        if time_range:
+            window = resolve_time_window(time_range)
+            if window.start_at is not None:
+                query = query.filter(MailboxEmailORM.received_at >= window.start_at)
+            if window.end_at is not None:
+                query = query.filter(MailboxEmailORM.received_at < window.end_at)
+        rows = query.all()
+        category_counts: dict[str, int] = {}
+        high_priority_ids: list[tuple[datetime, str]] = []
+        for classification, mailbox_email in rows:
+            category_counts[classification.category] = (
+                category_counts.get(classification.category, 0) + 1
+            )
+            if classification.priority in {"critical", "high"}:
+                high_priority_ids.append((mailbox_email.received_at, mailbox_email.email_id))
+        high_priority_ids.sort(reverse=True)
+        return {
+            "category_counts": category_counts,
+            "high_priority_ids": [
+                email_id for _received_at, email_id in high_priority_ids[:high_priority_limit]
+            ],
+        }
+
+    def get_mailbox_recommendation_stats(
+        self,
+        provider: str,
+        *,
+        unread_only: Optional[bool] = None,
+        time_range: Optional[str] = None,
+    ) -> dict:
+        query = (
+            self.session.query(MailboxRecommendationORM, MailboxEmailORM)
+            .join(
+                MailboxEmailORM,
+                and_(
+                    MailboxEmailORM.provider == MailboxRecommendationORM.provider,
+                    MailboxEmailORM.email_id == MailboxRecommendationORM.email_id,
+                ),
+            )
+            .filter(MailboxRecommendationORM.provider == provider)
+        )
+        if unread_only is True:
+            query = query.filter(MailboxEmailORM.unread.is_(True))
+        elif unread_only is False:
+            query = query.filter(MailboxEmailORM.unread.is_(False))
+        if time_range:
+            window = resolve_time_window(time_range)
+            if window.start_at is not None:
+                query = query.filter(MailboxEmailORM.received_at >= window.start_at)
+            if window.end_at is not None:
+                query = query.filter(MailboxEmailORM.received_at < window.end_at)
+        rows = query.all()
+        safe_count = 0
+        review_count = 0
+        blocked_count = 0
+        auto_label_candidates = 0
+        for recommendation, _mailbox_email in rows:
+            if recommendation.status == "safe":
+                safe_count += 1
+            elif recommendation.status == "requires_approval":
+                review_count += 1
+            elif recommendation.status == "blocked":
+                blocked_count += 1
+            if recommendation.proposed_labels:
+                auto_label_candidates += 1
+        return {
+            "safe_count": safe_count,
+            "review_count": review_count,
+            "blocked_count": blocked_count,
+            "auto_label_candidates": auto_label_candidates,
+        }
 
     def save_mailbox_email_body(
         self,
@@ -324,6 +893,64 @@ class InboxRepository:
         row.last_synced_at = datetime.now(timezone.utc)
         self.session.flush()
         return self._mailbox_email_payload(row)
+
+    def update_mailbox_email_state(
+        self,
+        provider: str,
+        email_id: str,
+        *,
+        unread: Optional[bool] = None,
+        labels_to_add: Optional[list[str]] = None,
+        labels_to_remove: Optional[list[str]] = None,
+    ) -> Optional[dict]:
+        row = (
+            self.session.query(MailboxEmailORM)
+            .filter(
+                MailboxEmailORM.provider == provider,
+                MailboxEmailORM.email_id == email_id,
+            )
+            .first()
+        )
+        if row is None:
+            return None
+        if unread is not None:
+            row.unread = unread
+        labels = [str(label) for label in row.labels]
+        if labels_to_add:
+            labels.extend(str(label) for label in labels_to_add if label)
+        if labels_to_remove:
+            remove_set = {str(label) for label in labels_to_remove}
+            labels = [label for label in labels if label not in remove_set]
+        row.labels = list(dict.fromkeys(labels))
+        row.last_synced_at = datetime.now(timezone.utc)
+        self.session.flush()
+        return self._mailbox_email_payload(row)
+
+    def reconcile_unread_working_set(
+        self,
+        provider: str,
+        *,
+        unread_email_ids: list[str],
+        time_range: Optional[str] = None,
+    ) -> int:
+        query = self.session.query(MailboxEmailORM).filter(MailboxEmailORM.provider == provider)
+        if time_range:
+            window = resolve_time_window(time_range)
+            if window.start_at is not None:
+                query = query.filter(MailboxEmailORM.received_at >= window.start_at)
+            if window.end_at is not None:
+                query = query.filter(MailboxEmailORM.received_at < window.end_at)
+        rows = query.filter(MailboxEmailORM.unread.is_(True)).all()
+        unread_set = {str(email_id) for email_id in unread_email_ids}
+        updated = 0
+        for row in rows:
+            if row.email_id in unread_set:
+                continue
+            row.unread = False
+            row.last_synced_at = datetime.now(timezone.utc)
+            updated += 1
+        self.session.flush()
+        return updated
 
     def remove_labels_from_run_emails(
         self,
@@ -405,19 +1032,49 @@ class InboxRepository:
         *,
         unread_only: Optional[bool] = None,
         hydrated_only: bool = False,
+        has_attachments: Optional[bool] = None,
+        q: Optional[str] = None,
         time_range: Optional[str] = None,
+        priority: Optional[str] = None,
+        category: Optional[str] = None,
     ) -> int:
         query = self.session.query(MailboxEmailORM).filter(MailboxEmailORM.provider == provider)
+        if priority or category:
+            query = query.join(
+                MailboxClassificationORM,
+                and_(
+                    MailboxClassificationORM.provider == MailboxEmailORM.provider,
+                    MailboxClassificationORM.email_id == MailboxEmailORM.email_id,
+                ),
+            )
+            if priority:
+                query = query.filter(MailboxClassificationORM.priority == priority)
+            if category:
+                query = query.filter(MailboxClassificationORM.category == category)
         if unread_only is True:
             query = query.filter(MailboxEmailORM.unread.is_(True))
         elif unread_only is False:
             query = query.filter(MailboxEmailORM.unread.is_(False))
+        if has_attachments is True:
+            query = query.filter(MailboxEmailORM.has_attachments.is_(True))
+        elif has_attachments is False:
+            query = query.filter(MailboxEmailORM.has_attachments.is_(False))
         if time_range:
             window = resolve_time_window(time_range)
             if window.start_at is not None:
                 query = query.filter(MailboxEmailORM.received_at >= window.start_at)
             if window.end_at is not None:
                 query = query.filter(MailboxEmailORM.received_at < window.end_at)
+        if q:
+            pattern = f"%{q.strip()}%"
+            query = query.filter(
+                or_(
+                    MailboxEmailORM.subject.ilike(pattern),
+                    MailboxEmailORM.sender.ilike(pattern),
+                    MailboxEmailORM.snippet.ilike(pattern),
+                    MailboxEmailORM.body_preview.ilike(pattern),
+                )
+            )
         if hydrated_only:
             query = query.filter(func.length(func.trim(MailboxEmailORM.body_full)) > 0)
         return query.count()
@@ -431,8 +1088,22 @@ class InboxRepository:
         unread_only: Optional[bool] = None,
         q: Optional[str] = None,
         time_range: Optional[str] = None,
+        priority: Optional[str] = None,
+        category: Optional[str] = None,
     ) -> list[dict]:
         query = self.session.query(MailboxEmailORM).filter(MailboxEmailORM.provider == provider)
+        if priority or category:
+            query = query.join(
+                MailboxClassificationORM,
+                and_(
+                    MailboxClassificationORM.provider == MailboxEmailORM.provider,
+                    MailboxClassificationORM.email_id == MailboxEmailORM.email_id,
+                ),
+            )
+            if priority:
+                query = query.filter(MailboxClassificationORM.priority == priority)
+            if category:
+                query = query.filter(MailboxClassificationORM.category == category)
         if unread_only is True:
             query = query.filter(MailboxEmailORM.unread.is_(True))
         elif unread_only is False:
@@ -460,6 +1131,54 @@ class InboxRepository:
             .all()
         )
         return [self._mailbox_email_payload(row) for row in rows]
+
+    def get_latest_classification_map(
+        self,
+        provider: str,
+        email_ids: list[str],
+    ) -> dict[str, dict]:
+        if not email_ids:
+            return {}
+        rows = (
+            self.session.query(ClassificationORM, EmailRecordORM, TriageRunORM)
+            .join(
+                EmailRecordORM,
+                and_(
+                    EmailRecordORM.run_id == ClassificationORM.run_id,
+                    EmailRecordORM.email_id == ClassificationORM.email_id,
+                ),
+            )
+            .join(TriageRunORM, TriageRunORM.run_id == ClassificationORM.run_id)
+            .filter(
+                TriageRunORM.provider == provider,
+                EmailRecordORM.email_id.in_(email_ids),
+            )
+            .order_by(EmailRecordORM.email_id.asc(), TriageRunORM.started_at.desc())
+            .all()
+        )
+        payload: dict[str, dict] = {}
+        for classification, email, run in rows:
+            if email.email_id in payload:
+                continue
+            payload[email.email_id] = {
+                "email_id": email.email_id,
+                "classification": {
+                    "category": classification.category,
+                    "priority": classification.priority,
+                    "confidence": classification.confidence,
+                    "reason": classification.reason,
+                },
+                "run_id": run.run_id,
+            }
+        return payload
+
+    def get_latest_classification_detail(
+        self,
+        provider: str,
+        email_id: str,
+    ) -> Optional[dict]:
+        details = self.get_latest_classification_map(provider, [email_id])
+        return details.get(email_id)
 
     def get_mailbox_cache_stats(self, provider: str, *, time_range: Optional[str] = None) -> dict:
         query = self.session.query(MailboxEmailORM).filter(MailboxEmailORM.provider == provider)
@@ -591,7 +1310,7 @@ class InboxRepository:
         )
         if row is None:
             return None
-        payload = dict(row.payload or {})
+        payload = self._normalize_provider_sync_payload(dict(row.payload or {}))
         payload.setdefault("provider", provider_name)
         payload.setdefault("sync_kind", sync_kind)
         payload["updated_at"] = row.updated_at.isoformat()
@@ -611,7 +1330,7 @@ class InboxRepository:
             )
             .first()
         )
-        normalized = dict(payload)
+        normalized = self._normalize_provider_sync_payload(dict(payload))
         normalized.setdefault("provider", provider_name)
         normalized.setdefault("sync_kind", sync_kind)
         if row is None:
@@ -628,6 +1347,22 @@ class InboxRepository:
         stored = dict(normalized)
         stored["updated_at"] = row.updated_at.isoformat()
         return stored
+
+    @staticmethod
+    def _normalize_provider_sync_payload(payload: dict) -> dict:
+        normalized = dict(payload)
+        processed_count = int(normalized.get("processed_count") or 0)
+        next_offset = int(normalized.get("next_offset") or processed_count)
+        if next_offset < processed_count:
+            next_offset = processed_count
+        target_count = int(normalized.get("target_count") or 0)
+        if target_count and processed_count > target_count:
+            target_count = processed_count
+        normalized["processed_count"] = processed_count
+        normalized["next_offset"] = next_offset
+        if target_count:
+            normalized["target_count"] = target_count
+        return normalized
 
     def clear_provider_sync_state(self, provider_name: str, sync_kind: str) -> None:
         row = (

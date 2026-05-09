@@ -44,9 +44,12 @@ class ActionExtractorAgent:
         email: EmailMessage,
         *,
         classification: Optional[EmailClassification] = None,
+        allow_llm: bool = True,
     ) -> list[EmailActionItem]:
         preview = email.content_for_processing().strip()
         heuristic_items = self._heuristic_extract(email)
+        if not allow_llm:
+            return heuristic_items
         if not self._should_use_llm(
             email,
             heuristic_items,

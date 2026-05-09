@@ -6,6 +6,7 @@ from inboxanchor.agents.classifier import ClassifierAgent
 from inboxanchor.bootstrap import build_demo_emails
 from inboxanchor.infra.llm_client import LLMResult
 from inboxanchor.models import EmailMessage
+from inboxanchor.sender_intelligence import SenderIntelligenceContext, analyze_message_signals
 
 
 class StubLLMClient:
@@ -136,3 +137,72 @@ def test_classifier_treats_linkedin_profile_updates_as_low_priority():
 
     assert result.category == "low_priority"
     assert result.priority == "low"
+
+
+def test_classifier_uses_sender_profile_to_classify_plain_company_updates_as_work():
+    email = EmailMessage(
+        id="work-profile-1",
+        thread_id="work-profile-1",
+        sender="hello@acme.dev",
+        subject="Quick update",
+        snippet="Wanted to share a quick update before tomorrow.",
+        body_preview="Sharing a quick update before tomorrow's review call.",
+        received_at=datetime.now(timezone.utc),
+        labels=["INBOX"],
+        has_attachments=False,
+        unread=True,
+    )
+    agent = ClassifierAgent(
+        llm_client=StubLLMClient(
+            LLMResult(content="{}", provider="mock", model="mock", latency_ms=1)
+        )
+    )
+    intelligence = SenderIntelligenceContext(
+        sender_profile={
+            "sender_address": "hello@acme.dev",
+            "scores": {
+                "work": 0.92,
+                "human": 0.82,
+                "importance": 0.74,
+            },
+        },
+        domain_profile={
+            "domain": "acme.dev",
+            "scores": {
+                "work": 0.88,
+                "human": 0.65,
+                "importance": 0.7,
+            },
+        },
+        message_signals=analyze_message_signals(email),
+    )
+
+    result = agent.classify(email, intelligence=intelligence)
+
+    assert result.category == "work"
+    assert result.priority in {"medium", "high"}
+
+
+def test_classifier_treats_social_security_alerts_as_urgent():
+    email = EmailMessage(
+        id="social-sec-1",
+        thread_id="social-sec-1",
+        sender="security@mail.instagram.com",
+        subject="Security alert: new login from a new device",
+        snippet="We noticed a suspicious login to your Instagram account.",
+        body_preview="Security alert. Suspicious login detected from a new device. Review now.",
+        received_at=datetime.now(timezone.utc),
+        labels=["INBOX"],
+        has_attachments=False,
+        unread=True,
+    )
+    agent = ClassifierAgent(
+        llm_client=StubLLMClient(
+            LLMResult(content="{}", provider="mock", model="mock", latency_ms=1)
+        )
+    )
+
+    result = agent.classify(email)
+
+    assert result.category == "urgent"
+    assert result.priority in {"high", "critical"}

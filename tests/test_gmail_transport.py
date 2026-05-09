@@ -248,6 +248,42 @@ def test_google_api_transport_applies_time_range_query_to_unread_listing():
     assert "after:" in query
 
 
+def test_google_api_transport_unread_page_can_fetch_metadata_only():
+    session = StubSession(
+        [
+            StubResponse({"messages": [{"id": "msg-1", "threadId": "thread-1"}]}),
+            StubResponse(
+                {
+                    "id": "msg-1",
+                    "threadId": "thread-1",
+                    "snippet": "Metadata only snippet",
+                    "labelIds": ["UNREAD", "INBOX"],
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "ops@example.com"},
+                            {"name": "Subject", "value": "Metadata only"},
+                            {"name": "Date", "value": "Fri, 08 May 2026 12:00:00 +0000"},
+                        ],
+                    },
+                }
+            ),
+        ]
+    )
+
+    transport = GoogleAPITransport(
+        credentials_path="~/credentials.json",
+        token_path="~/token.json",
+        session=session,
+    )
+
+    page = transport.list_unread_page(limit=1, offset=0, include_body=False, time_range="all_time")
+
+    assert len(page) == 1
+    assert page[0].body_full == ""
+    assert page[0].body_preview == "Metadata only snippet"
+    assert session.calls[1][2]["format"] == "metadata"
+
+
 def test_google_api_transport_applies_time_range_query_to_mailbox_backfill():
     session = StubSession(
         [
@@ -395,6 +431,32 @@ def test_google_api_transport_can_delete_labels_from_gmail():
     assert session.calls[1][1].endswith("/users/me/labels/Label_1")
     assert session.calls[2][0] == "DELETE"
     assert session.calls[2][1].endswith("/users/me/labels/Label_2")
+
+
+def test_google_api_transport_can_list_labels_from_gmail():
+    session = StubSession(
+        [
+            StubResponse(
+                {
+                    "labels": [
+                        {"id": "Label_1", "name": "priority/high"},
+                        {"id": "Label_2", "name": "jobs/alert"},
+                    ]
+                }
+            ),
+        ]
+    )
+    transport = GoogleAPITransport(
+        credentials_path="~/credentials.json",
+        token_path="~/token.json",
+        session=session,
+    )
+
+    labels = transport.list_labels()
+
+    assert labels == ["jobs/alert", "priority/high"]
+    assert session.calls[0][0] == "GET"
+    assert session.calls[0][1].endswith("/users/me/labels")
 
 
 def test_google_api_transport_skips_missing_labels_during_delete():

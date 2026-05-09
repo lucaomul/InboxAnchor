@@ -66,8 +66,8 @@ export function useRunOpsScan() {
     mutationFn: (timeRange: MailboxTimeRange) => runOpsScan(timeRange),
     onSuccess: (result) => {
       invalidate();
-      toast.success("Unread scan refreshed", {
-        description: `${result.unreadCount} unread emails mapped for the current provider.`,
+      toast.success("Unread scan started", {
+        description: `${result.unreadCount} unread emails are queued for mailbox refresh on the current provider.`,
       });
     },
     onError: (err) => toast.error(`Failed to refresh scan: ${err.message}`),

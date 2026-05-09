@@ -103,6 +103,86 @@ class MailboxEmailORM(Base):
     last_synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class MailboxClassificationORM(Base):
+    __tablename__ = "mailbox_classifications"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "email_id",
+            name="uq_mailbox_classification",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(String(32), index=True)
+    email_id: Mapped[str] = mapped_column(String(128), index=True)
+    category: Mapped[str] = mapped_column(String(32), index=True)
+    priority: Mapped[str] = mapped_column(String(16), index=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(String(32), default="heuristic")
+    run_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class MailboxActionItemORM(Base):
+    __tablename__ = "mailbox_action_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(String(32), index=True)
+    email_id: Mapped[str] = mapped_column(String(128), index=True)
+    action_type: Mapped[str] = mapped_column(String(64))
+    description: Mapped[str] = mapped_column(Text)
+    due_hint: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    requires_reply: Mapped[bool] = mapped_column(Boolean, default=False)
+    source: Mapped[str] = mapped_column(String(32), default="heuristic")
+    run_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class MailboxRecommendationORM(Base):
+    __tablename__ = "mailbox_recommendations"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "email_id",
+            name="uq_mailbox_recommendation",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(String(32), index=True)
+    email_id: Mapped[str] = mapped_column(String(128), index=True)
+    recommended_action: Mapped[str] = mapped_column(String(64))
+    reason: Mapped[str] = mapped_column(Text)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    requires_approval: Mapped[bool] = mapped_column(Boolean, default=True)
+    blocked_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    proposed_labels: Mapped[list[str]] = mapped_column(JSON, default=list)
+    source: Mapped[str] = mapped_column(String(32), default="heuristic")
+    run_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class SenderProfileORM(Base):
+    __tablename__ = "sender_profiles"
+
+    provider: Mapped[str] = mapped_column(String(32), primary_key=True)
+    sender_address: Mapped[str] = mapped_column(String(255), primary_key=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class DomainProfileORM(Base):
+    __tablename__ = "domain_profiles"
+
+    provider: Mapped[str] = mapped_column(String(32), primary_key=True)
+    domain: Mapped[str] = mapped_column(String(255), primary_key=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class ClassificationORM(Base):
     __tablename__ = "classifications"
 

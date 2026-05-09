@@ -5,21 +5,14 @@ from typing import Optional
 from inboxanchor.agents._llm_utils import parse_json_content
 from inboxanchor.infra.llm_client import LLMClient
 from inboxanchor.infra.llm_providers import build_llm_client
-from inboxanchor.mail_intelligence import (
-    has_deadline_pressure,
-    is_finance_invoice,
-    is_finance_receipt,
-    is_high_value_newsletter,
-    is_job_alert,
-    is_newsletter,
-    is_promo,
-    is_recruiter_or_interview,
-    is_spam_like,
-    is_work_dev_or_ai,
-    looks_automated_email,
-)
+from inboxanchor.mail_intelligence import signal_text
 from inboxanchor.models import EmailClassification, EmailMessage
 from inboxanchor.models.email import EmailCategory, PriorityLevel
+from inboxanchor.sender_intelligence import (
+    SenderIntelligenceContext,
+    analyze_message_signals,
+    profile_scores,
+)
 
 CLASSIFIER_SYSTEM_PROMPT = """
 You are an expert email classifier for a safety-first inbox system.
@@ -64,9 +57,15 @@ class ClassifierAgent:
     def __init__(self, llm_client: Optional[LLMClient] = None):
         self.llm_client = llm_client or build_llm_client()
 
-    def classify(self, email: EmailMessage) -> EmailClassification:
-        heuristic = self._heuristic_classify(email)
-        if not self._should_use_llm(email, heuristic):
+    def classify(
+        self,
+        email: EmailMessage,
+        *,
+        intelligence: Optional[SenderIntelligenceContext] = None,
+        allow_llm: bool = True,
+    ) -> EmailClassification:
+        heuristic = self._heuristic_classify(email, intelligence=intelligence)
+        if not allow_llm or not self._should_use_llm(email, heuristic, intelligence=intelligence):
             return heuristic
 
         llm_result = self.llm_client.complete(
@@ -89,7 +88,10 @@ class ClassifierAgent:
         self,
         email: EmailMessage,
         heuristic: EmailClassification,
+        *,
+        intelligence: Optional[SenderIntelligenceContext] = None,
     ) -> bool:
+        signals = intelligence.message_signals if intelligence else analyze_message_signals(email)
         if heuristic.confidence >= 0.9:
             return False
         if heuristic.category in {
@@ -100,8 +102,12 @@ class ClassifierAgent:
             EmailCategory.low_priority,
         }:
             return False
-        if self._looks_automated(email):
+        if signals.automated:
             return False
+        if heuristic.category == EmailCategory.urgent and signals.deadline:
+            return False
+        if signals.security or signals.recruiter:
+            return heuristic.confidence < 0.78
         return heuristic.category in {
             EmailCategory.work,
             EmailCategory.opportunity,
@@ -122,203 +128,251 @@ class ClassifierAgent:
             f"Has attachments: {email.has_attachments}\n"
         )
 
-    def _heuristic_classify(self, email: EmailMessage) -> EmailClassification:
-        text = f"{email.subject}\n{email.snippet}\n{email.content_for_processing()}".lower()
-        automated = self._looks_automated(email)
-        deadline = has_deadline_pressure(
+    def _heuristic_classify(
+        self,
+        email: EmailMessage,
+        *,
+        intelligence: Optional[SenderIntelligenceContext] = None,
+    ) -> EmailClassification:
+        context = intelligence or SenderIntelligenceContext(
+            sender_profile=None,
+            domain_profile=None,
+            message_signals=analyze_message_signals(email),
+        )
+        signals = context.message_signals
+        sender_scores = profile_scores(context.sender_profile)
+        domain_scores = profile_scores(context.domain_profile)
+        text = signal_text(
             sender=email.sender,
             subject=email.subject,
             snippet=email.snippet,
             body=email.content_for_processing(),
         )
+        scores = {category.value: 0.0 for category in EmailCategory}
+        evidence: list[str] = []
 
-        if is_spam_like(
-            sender=email.sender,
-            subject=email.subject,
-            snippet=email.snippet,
-            body=email.content_for_processing(),
-        ):
-            return EmailClassification(
-                category=EmailCategory.spam_like,
-                priority=PriorityLevel.low,
-                confidence=0.97,
-                reason="Spam-like scam or claim-now language detected.",
-            )
+        def add(category: EmailCategory, weight: float, reason: str) -> None:
+            scores[category.value] += weight
+            if reason and reason not in evidence:
+                evidence.append(reason)
 
-        if is_finance_invoice(
-            sender=email.sender,
-            subject=email.subject,
-            snippet=email.snippet,
-            body=email.content_for_processing(),
-        ):
-            return EmailClassification(
-                category=EmailCategory.finance,
-                priority=(
-                    PriorityLevel.high
-                    if deadline or email.has_attachments
-                    else PriorityLevel.medium
-                ),
-                confidence=0.96,
-                reason="Invoice or payment-due language detected.",
+        if signals.spam_like:
+            add(EmailCategory.spam_like, 7.0, "spam or scam markers detected")
+        if signals.finance_invoice:
+            add(EmailCategory.finance, 5.5, "invoice or payment-due context detected")
+        if signals.finance_receipt:
+            add(EmailCategory.finance, 4.2, "receipt or payment confirmation detected")
+        if signals.recruiter:
+            add(EmailCategory.opportunity, 5.0, "direct recruiter or interview context detected")
+        if signals.job_alert:
+            add(EmailCategory.low_priority, 4.8, "automated job-platform alert detected")
+        if signals.work_dev:
+            add(EmailCategory.work, 5.0, "developer tooling, GitHub, or AI workflow detected")
+        if signals.promo:
+            add(EmailCategory.promo, 4.6, "promotional or discount language detected")
+        if signals.newsletter:
+            add(
+                EmailCategory.newsletter,
+                4.4 if signals.high_value_newsletter else 4.0,
+                "newsletter or digest pattern detected",
             )
-        if is_finance_receipt(
-            sender=email.sender,
-            subject=email.subject,
-            snippet=email.snippet,
-            body=email.content_for_processing(),
-        ):
-            return EmailClassification(
-                category=EmailCategory.finance,
-                priority=PriorityLevel.medium,
-                confidence=0.92,
-                reason="Receipt or payment-confirmation language detected.",
-            )
+        if signals.security:
+            add(EmailCategory.urgent, 3.8, "account or security-sensitive notice detected")
+        if signals.deadline and not signals.automated:
+            add(EmailCategory.urgent, 3.2, "explicit deadline or same-day urgency detected")
+            add(EmailCategory.work, 0.7, "deadline pressure often implies work follow-up")
+            add(EmailCategory.opportunity, 0.7, "deadline pressure often implies active follow-up")
+            add(EmailCategory.finance, 0.5, "deadline pressure can matter for finance mail")
+        if signals.opportunity and not signals.job_alert:
+            add(EmailCategory.opportunity, 2.2, "opportunity or partnership language detected")
+        if signals.personal:
+            add(EmailCategory.personal, 2.4, "personal-life context detected")
+        if signals.social and not signals.security:
+            add(EmailCategory.low_priority, 2.4, "social media update pattern detected")
+            add(EmailCategory.personal, 0.6, "social updates are usually personal context")
+        if signals.automated:
+            add(EmailCategory.low_priority, 1.0, "automated delivery pattern detected")
 
-        if is_recruiter_or_interview(
-            sender=email.sender,
-            subject=email.subject,
-            snippet=email.snippet,
-            body=email.content_for_processing(),
-        ) and not automated:
-            return EmailClassification(
-                category=EmailCategory.opportunity,
-                priority=PriorityLevel.high if deadline else PriorityLevel.medium,
-                confidence=0.91,
-                reason="Recruiter, interview, or active application context detected.",
-            )
+        work_prior = max(sender_scores["work"], domain_scores["work"])
+        opportunity_prior = max(sender_scores["opportunity"], domain_scores["opportunity"])
+        jobs_prior = max(sender_scores["jobs"], domain_scores["jobs"])
+        recruiter_prior = max(sender_scores["recruiter"], domain_scores["recruiter"])
+        finance_prior = max(sender_scores["finance"], domain_scores["finance"])
+        promo_prior = max(sender_scores["promo"], domain_scores["promo"])
+        newsletter_prior = max(sender_scores["newsletter"], domain_scores["newsletter"])
+        social_prior = max(sender_scores["social"], domain_scores["social"])
+        security_prior = max(sender_scores["security"], domain_scores["security"])
+        spam_prior = max(sender_scores["spam"], domain_scores["spam"])
+        personal_prior = max(sender_scores["personal"], domain_scores["personal"])
+        automation_prior = max(sender_scores["automated"], domain_scores["automated"])
+        human_prior = max(sender_scores["human"], domain_scores["human"])
 
-        if is_work_dev_or_ai(
-            sender=email.sender,
-            subject=email.subject,
-            snippet=email.snippet,
-            body=email.content_for_processing(),
-        ):
-            return EmailClassification(
-                category=EmailCategory.work,
-                priority=PriorityLevel.high if deadline else PriorityLevel.medium,
-                confidence=0.9,
-                reason="Developer workflow, GitHub, or AI tooling context detected.",
+        if work_prior > 0.1:
+            add(EmailCategory.work, 2.6 * work_prior, "sender history leans strongly toward work")
+        if opportunity_prior > 0.1:
+            add(
+                EmailCategory.opportunity,
+                2.0 * opportunity_prior,
+                "sender history leans toward opportunities or active threads",
             )
-
-        if is_job_alert(
-            sender=email.sender,
-            subject=email.subject,
-            snippet=email.snippet,
-            body=email.content_for_processing(),
-        ):
-            return EmailClassification(
-                category=EmailCategory.low_priority,
-                priority=PriorityLevel.low,
-                confidence=0.96,
-                reason="Automated job-site alert detected.",
+        if jobs_prior > 0.1:
+            if signals.automated or automation_prior >= 0.5:
+                add(
+                    EmailCategory.low_priority,
+                    2.2 * jobs_prior,
+                    "sender history points to automated job-platform mail",
+                )
+            else:
+                add(
+                    EmailCategory.opportunity,
+                    1.8 * jobs_prior,
+                    "sender history points to job-related correspondence",
+                )
+        if recruiter_prior > 0.1:
+            add(
+                EmailCategory.opportunity,
+                2.5 * recruiter_prior,
+                "sender history looks like direct recruiting outreach",
             )
-
-        if is_promo(
-            sender=email.sender,
-            subject=email.subject,
-            snippet=email.snippet,
-            body=email.content_for_processing(),
-        ):
-            return EmailClassification(
-                category=EmailCategory.promo,
-                priority=PriorityLevel.low,
-                confidence=0.95,
-                reason="Promotional or discount language detected.",
+        if finance_prior > 0.1:
+            add(EmailCategory.finance, 2.3 * finance_prior, "sender history is finance-heavy")
+        if promo_prior > 0.1:
+            add(EmailCategory.promo, 2.2 * promo_prior, "sender history is mostly promotional")
+        if newsletter_prior > 0.1:
+            add(
+                EmailCategory.newsletter,
+                2.0 * newsletter_prior,
+                "sender history is mostly newsletter traffic",
             )
-
-        if is_newsletter(
-            sender=email.sender,
-            subject=email.subject,
-            snippet=email.snippet,
-            body=email.content_for_processing(),
-        ):
-            return EmailClassification(
-                category=EmailCategory.newsletter,
-                priority=PriorityLevel.medium if is_high_value_newsletter(
-                    sender=email.sender,
-                    subject=email.subject,
-                    snippet=email.snippet,
-                    body=email.content_for_processing(),
-                ) else PriorityLevel.low,
-                confidence=0.95,
-                reason="Newsletter or digest markers detected.",
+        if social_prior > 0.1:
+            add(
+                EmailCategory.low_priority,
+                1.6 * social_prior,
+                "sender history looks like social-media updates",
             )
-
-        if deadline and not automated:
-            return EmailClassification(
-                category=EmailCategory.urgent,
-                priority=PriorityLevel.critical,
-                confidence=0.9,
-                reason="Clear deadline or same-day urgency detected.",
+        if security_prior > 0.1:
+            add(
+                EmailCategory.urgent,
+                2.0 * security_prior,
+                "sender history includes security-sensitive notices",
+            )
+        if spam_prior > 0.1:
+            add(EmailCategory.spam_like, 2.2 * spam_prior, "sender history trends spam-like")
+        if personal_prior > 0.1 and human_prior >= 0.3:
+            add(
+                EmailCategory.personal,
+                1.6 * personal_prior,
+                "sender history looks like personal correspondence",
             )
 
-        if any(
-            token in text
-            for token in ["partnership", "proposal", "term sheet", "investor", "opportunity"]
-        ):
+        if not any(score > 0 for score in scores.values()):
+            if human_prior >= 0.55:
+                add(EmailCategory.personal, 1.2, "human sender pattern detected")
+            elif automation_prior >= 0.55:
+                add(EmailCategory.low_priority, 1.1, "automated sender pattern detected")
+
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        top_category, top_score = ranked[0]
+        second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+        if top_score < 1.0:
             return EmailClassification(
-                category=EmailCategory.opportunity,
-                priority=PriorityLevel.high if not automated else PriorityLevel.medium,
-                confidence=0.88,
-                reason="Opportunity-related terms detected.",
+                category=EmailCategory.unknown,
+                priority=PriorityLevel.medium if email.has_attachments else PriorityLevel.low,
+                confidence=0.55,
+                reason="Signals were too weak or contradictory; keep for review.",
             )
-        if any(token in text for token in ["family", "birthday", "trip", "weekend"]):
-            return EmailClassification(
-                category=EmailCategory.personal,
-                priority=PriorityLevel.medium,
-                confidence=0.8,
-                reason="Personal context markers detected.",
-            )
-        if any(
-            token in text
-            for token in [
-                "project",
-                "client",
-                "review",
-                "contract",
-                "meeting",
-                "github",
-                "pull request",
-                "issue",
-            ]
-        ):
-            return EmailClassification(
-                category=EmailCategory.work,
-                priority=(
-                    PriorityLevel.high
-                    if email.has_attachments and not automated
-                    else PriorityLevel.medium
-                ),
-                confidence=0.86,
-                reason="Work-oriented keywords detected.",
-            )
-        if automated or any(
-            token in text
-            for token in [
-                "fyi",
-                "no action required",
-                "for your records",
-                "profile viewed",
-                "system update",
-            ]
-        ):
-            return EmailClassification(
-                category=EmailCategory.low_priority,
-                priority=PriorityLevel.low,
-                confidence=0.84,
-                reason="Automated or low-action informational language detected.",
-            )
+
+        priority = self._priority_for_category(
+            category=top_category,
+            email=email,
+            signals=signals,
+            human_prior=human_prior,
+            importance_prior=max(sender_scores["importance"], domain_scores["importance"]),
+            text=text,
+        )
+        confidence = self._confidence_from_scores(top_score, second_score, evidence)
+        reason = self._reason_from_evidence(evidence, default=top_category)
         return EmailClassification(
-            category=EmailCategory.unknown,
-            priority=PriorityLevel.medium if email.has_attachments else PriorityLevel.low,
-            confidence=0.55,
-            reason="No strong heuristic matched; keep for review.",
+            category=EmailCategory(top_category),
+            priority=priority,
+            confidence=confidence,
+            reason=reason,
         )
 
-    def _looks_automated(self, email: EmailMessage) -> bool:
-        return looks_automated_email(
-            sender=email.sender,
-            subject=email.subject,
-            snippet=email.snippet,
-            body=email.content_for_processing(),
-        )
+    def _priority_for_category(
+        self,
+        *,
+        category: str,
+        email: EmailMessage,
+        signals,
+        human_prior: float,
+        importance_prior: float,
+        text: str,
+    ) -> PriorityLevel:
+        if category in {
+            EmailCategory.spam_like.value,
+            EmailCategory.promo.value,
+            EmailCategory.low_priority.value,
+        }:
+            return PriorityLevel.low
+        if category == EmailCategory.newsletter.value:
+            return (
+                PriorityLevel.medium
+                if signals.high_value_newsletter or importance_prior >= 0.55
+                else PriorityLevel.low
+            )
+        if category == EmailCategory.finance.value:
+            if signals.finance_invoice and (signals.deadline or email.has_attachments):
+                return PriorityLevel.high
+            return PriorityLevel.medium
+        if category == EmailCategory.opportunity.value:
+            if (
+                signals.recruiter
+                or signals.deadline
+                or importance_prior >= 0.65
+                or (signals.opportunity and not signals.automated)
+            ):
+                return PriorityLevel.high
+            return PriorityLevel.medium
+        if category == EmailCategory.work.value:
+            if signals.deadline:
+                return PriorityLevel.high
+            if email.has_attachments and not signals.automated:
+                return PriorityLevel.high
+            if human_prior >= 0.7 and importance_prior >= 0.6:
+                return PriorityLevel.high
+            return PriorityLevel.medium
+        if category == EmailCategory.urgent.value:
+            if signals.deadline and not signals.automated:
+                return PriorityLevel.critical
+            if signals.security and ("immediately" in text or "urgent" in text):
+                return PriorityLevel.critical
+            return PriorityLevel.high
+        if category == EmailCategory.personal.value:
+            if signals.reply_needed or human_prior >= 0.65:
+                return PriorityLevel.medium
+            return PriorityLevel.low
+        return PriorityLevel.medium if email.has_attachments else PriorityLevel.low
+
+    def _confidence_from_scores(
+        self,
+        top_score: float,
+        second_score: float,
+        evidence: list[str],
+    ) -> float:
+        gap = max(top_score - second_score, 0.0)
+        confidence = 0.58
+        confidence += min(0.14, top_score / 8.0 * 0.14)
+        confidence += min(0.18, gap / 3.5 * 0.18)
+        if top_score >= 4.0:
+            confidence += 0.08
+        if len(evidence) >= 2:
+            confidence += 0.04
+        return min(confidence, 0.98)
+
+    def _reason_from_evidence(self, evidence: list[str], *, default: str) -> str:
+        if not evidence:
+            return f"Classified as {default} from weak fallback signals."
+        if len(evidence) == 1:
+            return evidence[0].capitalize() + "."
+        return f"{evidence[0].capitalize()}; {evidence[1]}."

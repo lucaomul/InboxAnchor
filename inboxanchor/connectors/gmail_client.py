@@ -12,6 +12,7 @@ class GmailTransport(Protocol):
         self,
         limit: int,
         *,
+        include_body: bool = True,
         time_range: Optional[str] = None,
     ) -> list[EmailMessage]: ...
     def list_unread_page(
@@ -19,6 +20,7 @@ class GmailTransport(Protocol):
         limit: int,
         offset: int,
         *,
+        include_body: bool = True,
         time_range: Optional[str] = None,
     ) -> list[EmailMessage]: ...
     def get_message(self, email_id: str, include_body: bool = True) -> EmailMessage: ...
@@ -39,6 +41,7 @@ class GmailTransport(Protocol):
     def apply_labels(self, email_ids: list[str], labels: list[str]) -> None: ...
     def remove_labels(self, email_ids: list[str], labels: list[str]) -> None: ...
     def delete_labels(self, labels: list[str]) -> None: ...
+    def list_labels(self) -> list[str]: ...
     def ensure_alias_routing(self, alias_address: str, *, label_name: str) -> None: ...
     def remove_alias_routing(self, alias_address: str) -> None: ...
     def send_reply(
@@ -80,8 +83,12 @@ class GmailClient(EmailProvider):
         transport = self._require_transport()
         normalized_time_range = normalize_time_range(time_range)
         if normalized_time_range != ALL_TIME_RANGE:
-            return transport.list_unread(limit, time_range=normalized_time_range)
-        return transport.list_unread(limit)
+            return transport.list_unread(
+                limit,
+                include_body=include_body,
+                time_range=normalized_time_range,
+            )
+        return transport.list_unread(limit, include_body=include_body)
 
     def iter_unread_batches(
         self,
@@ -97,11 +104,12 @@ class GmailClient(EmailProvider):
             if normalized_time_range == ALL_TIME_RANGE:
                 fetched = 0
                 offset = 0
-                page_fetch_size = min(batch_size, 25 if include_body else batch_size)
+                page_fetch_size = min(batch_size, 25 if include_body else 100)
                 while fetched < limit:
                     page = transport.list_unread_page(
                         min(page_fetch_size, limit - fetched),
                         offset,
+                        include_body=include_body,
                         time_range=normalized_time_range,
                     )
                     if not page:
@@ -112,9 +120,13 @@ class GmailClient(EmailProvider):
                 return
 
         emails = (
-            transport.list_unread(limit, time_range=normalized_time_range)
+            transport.list_unread(
+                limit,
+                include_body=include_body,
+                time_range=normalized_time_range,
+            )
             if normalized_time_range != ALL_TIME_RANGE
-            else transport.list_unread(limit)
+            else transport.list_unread(limit, include_body=include_body)
         )
         for start in range(0, len(emails), batch_size):
             yield emails[start : start + batch_size]
@@ -318,6 +330,13 @@ class GmailClient(EmailProvider):
             executed=not dry_run,
             details=f"Gmail label deletion prepared: {', '.join(labels)}",
         )
+
+    def list_labels(self) -> list[str]:
+        transport = self._require_transport()
+        list_labels = getattr(transport, "list_labels", None)
+        if callable(list_labels):
+            return list_labels()
+        return []
 
     def ensure_alias_routing(
         self,

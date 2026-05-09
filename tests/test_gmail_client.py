@@ -11,6 +11,7 @@ class StubGmailTransport:
         self.trashed: list[str] = []
         self.labels_applied: list[tuple[list[str], list[str]]] = []
         self.labels_deleted: list[list[str]] = []
+        self.available_labels: list[str] = ["priority/high", "jobs/alert", "InboxAnchor/Aliases"]
         self.alias_routes_created: list[tuple[str, str]] = []
         self.alias_routes_removed: list[str] = []
         self.replies_sent: list[tuple[str, str, str | None]] = []
@@ -27,14 +28,17 @@ class StubGmailTransport:
             unread=True,
         )
 
-    def list_unread(self, limit: int, *, time_range=None):
+    def list_unread(self, limit: int, *, include_body=True, time_range=None):
+        del include_body
         del time_range
         return [self.message]
 
-    def get_message(self, email_id: str):
+    def get_message(self, email_id: str, include_body: bool = True):
+        del email_id, include_body
         return self.message
 
     def get_body(self, email_id: str):
+        del email_id
         return self.message.body_preview
 
     def mark_read(self, email_ids: list[str]):
@@ -51,6 +55,9 @@ class StubGmailTransport:
 
     def delete_labels(self, labels: list[str]):
         self.labels_deleted.append(labels)
+
+    def list_labels(self):
+        return list(self.available_labels)
 
     def ensure_alias_routing(self, alias_address: str, *, label_name: str):
         self.alias_routes_created.append((alias_address, label_name))
@@ -89,6 +96,15 @@ def test_gmail_connector_can_delete_label_definitions_through_transport():
 
     assert result.executed is True
     assert transport.labels_deleted == [["priority/high", "jobs/alert"]]
+
+
+def test_gmail_connector_can_list_provider_labels_through_transport():
+    transport = StubGmailTransport()
+    client = GmailClient(transport=transport)
+
+    labels = client.list_labels()
+
+    assert labels == ["priority/high", "jobs/alert", "InboxAnchor/Aliases"]
 
 
 def test_gmail_connector_can_send_reply_through_transport():
@@ -134,11 +150,12 @@ def test_gmail_iter_unread_batches_uses_paged_path_for_all_time():
     calls: list[tuple[int, int, str | None]] = []
 
     class PagedTransport(StubGmailTransport):
-        def list_unread(self, limit: int, *, time_range=None):
+        def list_unread(self, limit: int, *, include_body=True, time_range=None):
+            del limit, include_body, time_range
             raise AssertionError("all_time should use list_unread_page, not list_unread")
 
-        def list_unread_page(self, limit: int, offset: int, *, time_range=None):
-            calls.append((limit, offset, time_range))
+        def list_unread_page(self, limit: int, offset: int, *, include_body=True, time_range=None):
+            calls.append((limit, offset, include_body, time_range))
             if offset >= 4:
                 return []
             return [
@@ -152,18 +169,19 @@ def test_gmail_iter_unread_batches_uses_paged_path_for_all_time():
 
     assert len(batches) == 1
     assert len(batches[0]) == 4
-    assert calls == [(4, 0, "all_time")]
+    assert calls == [(4, 0, True, "all_time")]
 
 
 def test_gmail_iter_unread_batches_caps_initial_page_size_when_fetching_bodies():
     calls: list[tuple[int, int, str | None]] = []
 
     class PagedTransport(StubGmailTransport):
-        def list_unread(self, limit: int, *, time_range=None):
+        def list_unread(self, limit: int, *, include_body=True, time_range=None):
+            del limit, include_body, time_range
             raise AssertionError("all_time should use list_unread_page, not list_unread")
 
-        def list_unread_page(self, limit: int, offset: int, *, time_range=None):
-            calls.append((limit, offset, time_range))
+        def list_unread_page(self, limit: int, offset: int, *, include_body=True, time_range=None):
+            calls.append((limit, offset, include_body, time_range))
             remaining = max(0, 60 - offset)
             count = min(limit, remaining)
             return [
@@ -184,7 +202,52 @@ def test_gmail_iter_unread_batches_caps_initial_page_size_when_fetching_bodies()
 
     assert [len(batch) for batch in batches] == [25, 25, 10]
     assert calls == [
-        (25, 0, "all_time"),
-        (25, 25, "all_time"),
-        (10, 50, "all_time"),
+        (25, 0, True, "all_time"),
+        (25, 25, True, "all_time"),
+        (10, 50, True, "all_time"),
+    ]
+
+
+def test_gmail_iter_unread_batches_uses_metadata_pages_for_large_lightweight_scan():
+    calls: list[tuple[int, int, bool, str | None]] = []
+
+    class PagedTransport(StubGmailTransport):
+        def list_unread(self, limit: int, *, include_body=True, time_range=None):
+            del limit, include_body, time_range
+            raise AssertionError("all_time should use list_unread_page, not list_unread")
+
+        def list_unread_page(self, limit: int, offset: int, *, include_body=True, time_range=None):
+            calls.append((limit, offset, include_body, time_range))
+            remaining = max(0, 600 - offset)
+            count = min(limit, remaining)
+            return [
+                self.message.model_copy(
+                    update={
+                        "id": f"gmail-{offset + index}",
+                        "body_full": "" if not include_body else "Full body",
+                    }
+                )
+                for index in range(count)
+            ]
+
+    client = GmailClient(transport=PagedTransport())
+
+    batches = list(
+        client.iter_unread_batches(
+            limit=600,
+            batch_size=250,
+            include_body=False,
+            time_range="all_time",
+        )
+    )
+
+    assert [len(batch) for batch in batches] == [100, 100, 100, 100, 100, 100]
+    assert all(email.body_full == "" for batch in batches for email in batch)
+    assert calls == [
+        (100, 0, False, "all_time"),
+        (100, 100, False, "all_time"),
+        (100, 200, False, "all_time"),
+        (100, 300, False, "all_time"),
+        (100, 400, False, "all_time"),
+        (100, 500, False, "all_time"),
     ]

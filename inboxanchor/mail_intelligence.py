@@ -164,6 +164,25 @@ WAITING_MARKERS = {
     "just bumping this",
 }
 
+REPLY_SIGNAL_MARKERS = {
+    "please reply",
+    "please respond",
+    "reply by",
+    "let me know",
+    "can you",
+    "could you",
+    "would you",
+    "please review",
+    "please confirm",
+    "please send",
+    "send over",
+    "need your input",
+    "need your feedback",
+    "what do you think",
+    "share your thoughts",
+    "awaiting your response",
+}
+
 DEADLINE_MARKERS = {
     "urgent",
     "asap",
@@ -193,6 +212,8 @@ INBOXANCHOR_LABEL_PREFIXES = (
     "priority/",
     "attachments/",
 )
+
+INBOXANCHOR_ALIAS_LABEL_PREFIX = "inboxanchor/aliases"
 
 LEGACY_INBOXANCHOR_LABELS = {
     "work",
@@ -395,6 +416,19 @@ def has_deadline_pressure(*, sender: str, subject: str, snippet: str = "", body:
     )
 
 
+def has_reply_needed_signal(
+    *,
+    sender: str,
+    subject: str,
+    snippet: str = "",
+    body: str = "",
+) -> bool:
+    return _contains_any(
+        signal_text(sender=sender, subject=subject, snippet=snippet, body=body),
+        REPLY_SIGNAL_MARKERS,
+    )
+
+
 def extract_project_slug(
     *,
     sender: str,
@@ -409,17 +443,6 @@ def extract_project_slug(
     project_match = re.search(r"(?i)\bproject[:\s-]+([A-Za-z0-9][A-Za-z0-9 _.-]{2,30})", text)
     if project_match:
         return _slug(project_match.group(1))
-    subject_words = re.findall(r"[A-Za-z][A-Za-z0-9_-]{3,}", subject)
-    for word in subject_words:
-        lowered = word.lower()
-        if lowered in {"urgent", "invoice", "meeting", "follow", "update", "application"}:
-            continue
-        if lowered.startswith("re"):
-            continue
-        if lowered in {"github", "linkedin", "invoice", "contract"}:
-            continue
-        if lowered and lowered not in {"your", "this", "from"}:
-            return _slug(word)
     return None
 
 
@@ -457,6 +480,7 @@ def recommend_mailbox_labels(
     priority: str = "low",
 ) -> list[str]:
     labels: list[str] = []
+    text = signal_text(sender=sender, subject=subject, snippet=snippet, body=body)
     automated = looks_automated_email(sender=sender, subject=subject, snippet=snippet, body=body)
     finance_invoice = is_finance_invoice(
         sender=sender,
@@ -480,9 +504,10 @@ def recommend_mailbox_labels(
     )
     work_dev = is_work_dev_or_ai(sender=sender, subject=subject, snippet=snippet, body=body)
     ai_topic = _contains_any(
-        signal_text(sender=sender, subject=subject, snippet=snippet, body=body),
+        text,
         AI_TOPIC_MARKERS,
     )
+    github_thread = _contains_any(text, {"github", "gitlab", "bitbucket"})
     legal_contract = is_legal_contract(
         sender=sender,
         subject=subject,
@@ -502,6 +527,12 @@ def recommend_mailbox_labels(
         body=body,
     )
     deadline = has_deadline_pressure(sender=sender, subject=subject, snippet=snippet, body=body)
+    reply_needed = has_reply_needed_signal(
+        sender=sender,
+        subject=subject,
+        snippet=snippet,
+        body=body,
+    )
     high_value_newsletter = is_high_value_newsletter(
         sender=sender,
         subject=subject,
@@ -522,16 +553,21 @@ def recommend_mailbox_labels(
         labels.append("meetings/follow-up")
 
     if job_related:
-        if recruiter:
+        if recruiter and not automated:
             labels.append("jobs/recruiter")
-        elif job_alert:
+        elif job_alert or automated:
             labels.append("jobs/alert")
         else:
             labels.append("jobs/application")
 
     if work_dev:
-        labels.append("work/github")
-    elif category == "work":
+        if github_thread:
+            labels.append("work/github")
+        elif ai_topic:
+            labels.append("work/ai")
+        else:
+            labels.append("work/dev")
+    elif category == "work" and not automated:
         labels.append("work/general")
 
     if ai_topic:
@@ -541,29 +577,39 @@ def recommend_mailbox_labels(
         labels.append(
             "newsletters/high-value" if high_value_newsletter else "newsletters/routine"
         )
-        if not high_value_newsletter:
+        if automated and not high_value_newsletter:
             labels.append("cleanup/low-priority")
 
     if category == "promo" or is_promo(sender=sender, subject=subject, snippet=snippet, body=body):
         labels.append("promo/discount")
-        labels.append("cleanup/low-priority")
+        if automated:
+            labels.append("cleanup/low-priority")
 
     if category == "low_priority":
         labels.append("cleanup/low-priority")
 
-    if automated and category not in {"work", "finance"}:
+    if automated and category in {"low_priority", "newsletter", "promo"}:
         labels.append("automation/notification")
 
-    if waiting:
+    if waiting and not automated:
         labels.append("waiting-for-response")
 
-    if category in {"urgent", "work", "finance", "opportunity"} and not automated:
+    if (
+        category in {"urgent", "work", "finance", "opportunity"}
+        and not automated
+        and (reply_needed or recruiter or legal_contract or meeting_followup)
+    ):
         if priority == "critical" or deadline:
             labels.append("needs-reply/urgent")
         elif priority in {"high", "medium"}:
             labels.append("needs-reply/this-week")
 
-    if priority in {"critical", "high"}:
+    if priority in {"critical", "high"} and category in {
+        "work",
+        "finance",
+        "opportunity",
+        "urgent",
+    }:
         labels.append(f"priority/{priority}")
 
     if has_attachments and category in {"work", "finance", "opportunity", "urgent"}:
@@ -579,7 +625,7 @@ def recommend_mailbox_labels(
         labels.append(f"projects/{project_slug}")
 
     client_slug = extract_client_slug(sender=sender, category=category)
-    if client_slug:
+    if client_slug and not automated and not job_related:
         labels.append(f"clients/{client_slug}")
 
     if not labels:
@@ -607,6 +653,14 @@ def select_inboxanchor_labels(
         if normalized:
             selected.add(normalized)
     return sorted(selected)
+
+
+def select_provider_cleanup_labels(existing_labels: list[str]) -> list[str]:
+    return sorted(
+        _normalize_label(label)
+        for label in existing_labels
+        if _is_inboxanchor_label(label) and not _is_alias_routing_label(label)
+    )
 
 
 def dedupe_labels(labels: list[str]) -> list[str]:
@@ -639,3 +693,7 @@ def _is_inboxanchor_label(label: str) -> bool:
     if normalized in LEGACY_INBOXANCHOR_LABELS:
         return True
     return normalized.startswith(INBOXANCHOR_LABEL_PREFIXES)
+
+
+def _is_alias_routing_label(label: str) -> bool:
+    return _normalize_label(label).startswith(INBOXANCHOR_ALIAS_LABEL_PREFIX)

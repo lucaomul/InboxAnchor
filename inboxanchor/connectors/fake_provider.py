@@ -5,6 +5,7 @@ from typing import Optional
 
 from inboxanchor.connectors.base import EmailProvider, ProviderActionResult
 from inboxanchor.core.time_windows import in_time_window
+from inboxanchor.mail_intelligence import dedupe_labels
 from inboxanchor.models import EmailMessage
 
 
@@ -209,6 +210,12 @@ class FakeEmailProvider(EmailProvider):
             executed=not dry_run,
             details=f"Deleted label definitions: {', '.join(labels)}",
         )
+
+    def list_labels(self) -> list[str]:
+        labels: list[str] = []
+        for email in self._emails.values():
+            labels.extend(email.labels)
+        return dedupe_labels(labels)
 
     def supports_outbound_email(self) -> bool:
         return True

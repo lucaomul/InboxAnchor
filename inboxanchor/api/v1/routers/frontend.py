@@ -12,8 +12,15 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from inboxanchor.agents import (
+    ActionExtractorAgent,
+    ClassifierAgent,
+    PriorityAgent,
+    SafetyVerifierAgent,
+)
 from inboxanchor.bootstrap import InboxAnchorService
 from inboxanchor.config.settings import SETTINGS
+from inboxanchor.core.rules import RulesEngine
 from inboxanchor.core.time_windows import (
     ALL_TIME_RANGE,
     available_time_ranges,
@@ -29,8 +36,19 @@ from inboxanchor.mail_intelligence import (
     dedupe_labels,
     recommend_mailbox_labels,
     select_inboxanchor_labels,
+    select_provider_cleanup_labels,
 )
-from inboxanchor.models import AutomationDecision, EmailAlias, SafetyStatus, WorkspaceSettings
+from inboxanchor.models import (
+    AutomationDecision,
+    EmailActionItem,
+    EmailAlias,
+    EmailClassification,
+    EmailMessage,
+    EmailRecommendation,
+    SafetyStatus,
+    WorkspaceSettings,
+)
+from inboxanchor.sender_intelligence import SenderIntelligenceResolver
 
 router = APIRouter(tags=["frontend-compat"])
 
@@ -43,6 +61,11 @@ FRONTEND_PROGRESS: dict[str, dict] = {}
 FRONTEND_ACTIVE_RUNS: dict[str, "FrontendRunJob"] = {}
 FRONTEND_ACTIVE_RUNS_LOCK = threading.Lock()
 MAILBOX_BACKFILL_SYNC_KIND = "mailbox_backfill"
+MAILBOX_CLASSIFIER = ClassifierAgent()
+MAILBOX_PRIORITY_AGENT = PriorityAgent()
+MAILBOX_ACTION_EXTRACTOR = ActionExtractorAgent()
+MAILBOX_RULES_ENGINE = RulesEngine()
+MAILBOX_SAFETY_VERIFIER = SafetyVerifierAgent()
 
 
 @dataclass
@@ -228,6 +251,7 @@ def _provider_runtime_error_message(provider_name: str, exc: Exception) -> str:
         "max retries exceeded",
         "failed to establish a new connection",
         "name or service not known",
+        "unable to find the server",
         "temporary failure in name resolution",
         "newconnectionerror",
         "nameresolutionerror",
@@ -484,6 +508,11 @@ def _ensure_frontend_run(
         120,
     )
     initial_load = not force and latest_run_id is None
+    scan_limit = bootstrap_limit if initial_load else settings.default_scan_limit
+    scan_batch_size = bootstrap_batch_size if initial_load else settings.default_batch_size
+    lightweight_scan = scan_limit > 250
+    if lightweight_scan:
+        scan_batch_size = min(scan_batch_size, 250)
 
     wait_job: Optional[FrontendRunJob] = None
     with FRONTEND_ACTIVE_RUNS_LOCK:
@@ -503,7 +532,7 @@ def _ensure_frontend_run(
             "mode": "scan",
             "status": "running",
             "stage": "bootstrapping" if initial_load else "refreshing",
-            "limit": bootstrap_limit if initial_load else settings.default_scan_limit,
+            "limit": scan_limit,
             "processed_emails": 0,
             "read_count": 0,
             "action_item_count": 0,
@@ -523,8 +552,11 @@ def _ensure_frontend_run(
     try:
         result = service.engine.run(
             dry_run=True,
-            limit=bootstrap_limit if initial_load else settings.default_scan_limit,
-            batch_size=bootstrap_batch_size if initial_load else settings.default_batch_size,
+            limit=scan_limit,
+            batch_size=scan_batch_size,
+            include_body=not lightweight_scan,
+            extract_actions=not lightweight_scan,
+            draft_replies=not lightweight_scan,
             confidence_threshold=settings.default_confidence_threshold,
             email_preview_limit=(
                 bootstrap_email_preview_limit
@@ -897,6 +929,535 @@ def _load_mailbox_cache_stats(provider_name: str, *, time_range: Optional[str] =
         )
 
 
+def _load_latest_classification_map(provider_name: str, email_ids: list[str]) -> dict[str, dict]:
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        return repository.get_latest_classification_map(provider_name, email_ids)
+
+
+def _load_mailbox_classification_map(provider_name: str, email_ids: list[str]) -> dict[str, dict]:
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        return repository.get_mailbox_classification_map(provider_name, email_ids)
+
+
+def _load_mailbox_classification_detail(provider_name: str, email_id: str) -> Optional[dict]:
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        return repository.get_mailbox_classification_detail(provider_name, email_id)
+
+
+def _load_mailbox_classifications(
+    provider_name: str,
+    *,
+    unread_only: Optional[bool] = None,
+    q: Optional[str] = None,
+    time_range: Optional[str] = None,
+) -> dict[str, dict]:
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        return repository.list_mailbox_classifications(
+            provider_name,
+            unread_only=unread_only,
+            q=q,
+            time_range=normalize_time_range(time_range),
+        )
+
+
+def _load_mailbox_classification_stats(
+    provider_name: str,
+    *,
+    unread_only: Optional[bool] = None,
+    time_range: Optional[str] = None,
+) -> dict:
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        return repository.get_mailbox_classification_stats(
+            provider_name,
+            unread_only=unread_only,
+            time_range=normalize_time_range(time_range),
+        )
+
+
+def _load_mailbox_workflow_counts(
+    provider_name: str,
+    *,
+    unread_only: Optional[bool] = None,
+    time_range: Optional[str] = None,
+) -> dict:
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        recommendation_stats = repository.get_mailbox_recommendation_stats(
+            provider_name,
+            unread_only=unread_only,
+            time_range=normalize_time_range(time_range),
+        )
+        action_item_count = repository.count_mailbox_action_items(
+            provider_name,
+            unread_only=unread_only,
+            time_range=normalize_time_range(time_range),
+        )
+    recommendation_count = (
+        int(recommendation_stats["safe_count"])
+        + int(recommendation_stats["review_count"])
+        + int(recommendation_stats["blocked_count"])
+    )
+    return {
+        "action_item_count": int(action_item_count),
+        "recommendation_count": recommendation_count,
+    }
+
+
+def _mailbox_email_to_model(mailbox_email: dict) -> EmailMessage:
+    received_at = datetime.fromisoformat(str(mailbox_email["received_at"]))
+    if received_at.tzinfo is None:
+        received_at = received_at.replace(tzinfo=timezone.utc)
+    return EmailMessage(
+        id=str(mailbox_email["email_id"]),
+        thread_id=str(mailbox_email.get("thread_id", "")),
+        sender=str(mailbox_email.get("sender", "")),
+        subject=str(mailbox_email.get("subject", "")),
+        snippet=str(mailbox_email.get("snippet", "")),
+        body_preview=str(mailbox_email.get("body_preview", "")),
+        body_full=str(mailbox_email.get("body_full", "")),
+        received_at=received_at,
+        labels=[str(label) for label in mailbox_email.get("labels", [])],
+        has_attachments=bool(mailbox_email.get("has_attachments")),
+        unread=bool(mailbox_email.get("unread", True)),
+    )
+
+
+def _mailbox_classification_payload(
+    provider_name: str,
+    mailbox_email: dict,
+    *,
+    mailbox_classification: Optional[dict] = None,
+    latest_classification: Optional[dict] = None,
+) -> dict:
+    if mailbox_classification and mailbox_classification.get("classification"):
+        return mailbox_classification["classification"]
+    if latest_classification and latest_classification.get("classification"):
+        return latest_classification["classification"]
+
+    email = _mailbox_email_to_model(mailbox_email)
+    resolver = SenderIntelligenceResolver(provider_name)
+    intelligence = resolver.resolve(email)
+    classification = MAILBOX_PRIORITY_AGENT.prioritize(
+        email,
+        MAILBOX_CLASSIFIER.classify(
+            email,
+            intelligence=intelligence,
+            allow_llm=False,
+        ),
+    )
+    return classification.model_dump(mode="json")
+
+
+def _mailbox_email_detail_payload(
+    provider_name: str,
+    mailbox_email: dict,
+    *,
+    mailbox_classification: Optional[dict] = None,
+    latest_classification: Optional[dict] = None,
+) -> dict:
+    return {
+        "email_id": mailbox_email["email_id"],
+        "thread_id": mailbox_email.get("thread_id", ""),
+        "sender": mailbox_email.get("sender", ""),
+        "subject": mailbox_email.get("subject", ""),
+        "snippet": mailbox_email.get("snippet", ""),
+        "body_preview": mailbox_email.get("body_preview", ""),
+        "received_at": mailbox_email.get("received_at"),
+        "labels": mailbox_email.get("labels", []),
+        "has_attachments": mailbox_email.get("has_attachments", False),
+        "unread": mailbox_email.get("unread", True),
+        "classification": _mailbox_classification_payload(
+            provider_name,
+            mailbox_email,
+            mailbox_classification=mailbox_classification,
+            latest_classification=latest_classification,
+        ),
+    }
+
+
+def _maybe_seed_mailbox_cache(
+    provider_name: str,
+    *,
+    time_range: Optional[str] = None,
+) -> None:
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        overall_count = repository.count_mailbox_emails(provider_name)
+    if overall_count == 0:
+        settings = _get_workspace_settings()
+        _sync_unread_working_set(
+            provider_name,
+            force_refresh=False,
+            time_range=time_range or None,
+            limit_override=min(settings.default_scan_limit, 50),
+            batch_size_override=min(settings.default_batch_size, 50),
+        )
+
+
+def _sync_unread_working_set(
+    provider_name: str,
+    *,
+    force_refresh: bool = True,
+    time_range: Optional[str] = None,
+    limit_override: Optional[int] = None,
+    batch_size_override: Optional[int] = None,
+) -> dict:
+    del force_refresh
+    normalized_time_range = normalize_time_range(time_range)
+    scope_key = _scope_key(provider_name, normalized_time_range)
+    service = _service_for_provider(provider_name)
+    provider = getattr(service, "provider", None)
+    settings = _get_workspace_settings()
+    scan_limit = limit_override or settings.default_scan_limit
+    scan_batch_size = min(batch_size_override or settings.default_batch_size, 250)
+    wait_job: Optional[FrontendRunJob] = None
+
+    with FRONTEND_ACTIVE_RUNS_LOCK:
+        active_job = FRONTEND_ACTIVE_RUNS.get(scope_key)
+        if active_job is not None:
+            wait_job = active_job
+        else:
+            FRONTEND_ACTIVE_RUNS[scope_key] = FrontendRunJob(provider_name=provider_name)
+
+    if wait_job is not None:
+        run_id, _ = _wait_for_frontend_job(
+            wait_job,
+            provider_name,
+            time_range=normalized_time_range,
+        )
+        return {
+            "provider": provider_name,
+            "run_id": run_id,
+            "count": 0,
+            "processed_total": 0,
+            "cached_count": _load_mailbox_cache_stats(
+                provider_name,
+                time_range=normalized_time_range,
+            )["cached_count"],
+        }
+
+    seen_email_ids: list[str] = []
+    processed_total = 0
+    batch_count = 0
+    latest_subject: Optional[str] = None
+    cached_count = 0
+    cache_stats = _load_mailbox_cache_stats(provider_name, time_range=normalized_time_range)
+    workflow_counts = _load_mailbox_workflow_counts(
+        provider_name,
+        unread_only=True,
+        time_range=normalized_time_range,
+    )
+    job = FRONTEND_ACTIVE_RUNS[scope_key]
+
+    _update_frontend_progress(
+        provider_name,
+        {
+            "mode": "scan",
+            "status": "running",
+            "stage": "syncing_unread",
+            "limit": scan_limit,
+            "processed_emails": 0,
+            "read_count": 0,
+            "action_item_count": workflow_counts["action_item_count"],
+            "recommendation_count": workflow_counts["recommendation_count"],
+            "batch_count": 0,
+            "cached_count": cache_stats["cached_count"],
+            "hydrated_count": cache_stats["hydrated_count"],
+            "labeled_count": 0,
+            "archived_count": 0,
+            "marked_read_count": 0,
+            "trashed_count": 0,
+            "reply_sent_count": 0,
+            "run_id": _get_cached_or_latest_run_id(provider_name, time_range=normalized_time_range),
+            "error": None,
+        },
+        time_range=normalized_time_range,
+    )
+
+    try:
+        if provider is None:
+            result = service.engine.run(
+                dry_run=True,
+                limit=scan_limit,
+                batch_size=scan_batch_size,
+                include_body=False,
+                extract_actions=False,
+                draft_replies=False,
+                confidence_threshold=settings.default_confidence_threshold,
+                email_preview_limit=min(scan_limit, 120),
+                recommendation_preview_limit=min(scan_limit, 120),
+                workspace_policy=settings.policy,
+                time_range=normalized_time_range,
+            )
+            processed_total = getattr(
+                result,
+                "scanned_emails",
+                getattr(result, "total_emails", 0),
+            )
+            batch_count = getattr(result, "batch_count", 0)
+            latest_subject = result.emails[0].subject if getattr(result, "emails", None) else None
+            workflow_counts = {
+                "action_item_count": sum(
+                    len(items) for items in getattr(result, "action_items", {}).values()
+                ),
+                "recommendation_count": len(getattr(result, "recommendations", [])),
+            }
+            FRONTEND_RUN_CACHE[scope_key] = result.run_id
+            cache_stats = _load_mailbox_cache_stats(provider_name, time_range=normalized_time_range)
+        else:
+            resolver = SenderIntelligenceResolver(provider_name)
+            for batch in provider.iter_unread_batches(
+                limit=scan_limit,
+                batch_size=scan_batch_size,
+                include_body=False,
+                time_range=normalized_time_range,
+            ):
+                batch_count += 1
+                with session_scope() as session:
+                    repository = InboxRepository(session)
+                    for email in batch:
+                        intelligence = resolver.resolve(email)
+                        classification = MAILBOX_PRIORITY_AGENT.prioritize(
+                            email,
+                            MAILBOX_CLASSIFIER.classify(
+                                email,
+                                intelligence=intelligence,
+                                allow_llm=False,
+                            ),
+                        )
+                        action_items = [
+                            EmailActionItem.model_validate(item)
+                            for item in _mailbox_action_items_for_email(email, classification)
+                        ]
+                        recommendation = _mailbox_recommendation_for_email(
+                            email,
+                            classification,
+                            policy=settings.policy,
+                        )
+                        repository.upsert_mailbox_email(provider_name, email)
+                        repository.upsert_mailbox_classification(
+                            provider_name,
+                            email.id,
+                            classification,
+                            source="heuristic",
+                        )
+                        repository.replace_mailbox_action_items(
+                            provider_name,
+                            email.id,
+                            action_items,
+                            source="heuristic",
+                        )
+                        repository.upsert_mailbox_recommendation(
+                            provider_name,
+                            email.id,
+                            recommendation,
+                            source="heuristic",
+                        )
+                        resolver.observe(email, context=intelligence)
+                        seen_email_ids.append(email.id)
+                        processed_total += 1
+                    cache_stats = repository.get_mailbox_cache_stats(
+                        provider_name,
+                        time_range=normalized_time_range,
+                    )
+                    recommendation_stats = repository.get_mailbox_recommendation_stats(
+                        provider_name,
+                        unread_only=True,
+                        time_range=normalized_time_range,
+                    )
+                    workflow_counts = {
+                        "action_item_count": repository.count_mailbox_action_items(
+                            provider_name,
+                            unread_only=True,
+                            time_range=normalized_time_range,
+                        ),
+                        "recommendation_count": (
+                            int(recommendation_stats["safe_count"])
+                            + int(recommendation_stats["review_count"])
+                            + int(recommendation_stats["blocked_count"])
+                        ),
+                    }
+                cached_count = cache_stats["cached_count"]
+                latest_subject = batch[0].subject if batch else latest_subject
+                _update_frontend_progress(
+                    provider_name,
+                    {
+                        "mode": "scan",
+                        "status": "running",
+                        "stage": "syncing_unread",
+                        "limit": scan_limit,
+                        "processed_emails": processed_total,
+                        "read_count": processed_total,
+                        "action_item_count": workflow_counts["action_item_count"],
+                        "recommendation_count": workflow_counts["recommendation_count"],
+                        "batch_count": batch_count,
+                        "cached_count": cached_count,
+                        "hydrated_count": cache_stats["hydrated_count"],
+                        "oldest_cached_at": cache_stats["oldest_cached_at"],
+                        "newest_cached_at": cache_stats["newest_cached_at"],
+                        "latest_subject": latest_subject,
+                        "error": None,
+                    },
+                    time_range=normalized_time_range,
+                )
+    except HTTPException:
+        job.error = "InboxAnchor could not refresh the unread working set."
+        job.event.set()
+        with FRONTEND_ACTIVE_RUNS_LOCK:
+            FRONTEND_ACTIVE_RUNS.pop(scope_key, None)
+        raise
+    except Exception as exc:
+        message = _provider_runtime_error_message(provider_name, exc)
+        job.error = message
+        _update_frontend_progress(
+            provider_name,
+            {
+                "mode": "scan",
+                "status": "error",
+                "stage": "failed",
+                "error": message,
+            },
+            time_range=normalized_time_range,
+        )
+        job.event.set()
+        with FRONTEND_ACTIVE_RUNS_LOCK:
+            FRONTEND_ACTIVE_RUNS.pop(scope_key, None)
+        raise HTTPException(status_code=502, detail=message) from exc
+
+    fully_reconciled = provider is not None and processed_total < scan_limit
+    if fully_reconciled:
+        with session_scope() as session:
+            repository = InboxRepository(session)
+            repository.reconcile_unread_working_set(
+                provider_name,
+                unread_email_ids=seen_email_ids,
+                time_range=normalized_time_range,
+            )
+            cache_stats = repository.get_mailbox_cache_stats(
+                provider_name,
+                time_range=normalized_time_range,
+            )
+    else:
+        cache_stats = _load_mailbox_cache_stats(provider_name, time_range=normalized_time_range)
+    workflow_counts = _load_mailbox_workflow_counts(
+        provider_name,
+        unread_only=True,
+        time_range=normalized_time_range,
+    )
+
+    latest_run_id = _get_cached_or_latest_run_id(provider_name, time_range=normalized_time_range)
+    _update_frontend_progress(
+        provider_name,
+        {
+            "mode": "scan",
+            "status": "complete",
+            "stage": "cache_ready",
+            "limit": scan_limit,
+            "processed_emails": processed_total,
+            "read_count": processed_total,
+            "action_item_count": workflow_counts["action_item_count"],
+            "recommendation_count": workflow_counts["recommendation_count"],
+            "batch_count": batch_count,
+            "cached_count": cache_stats["cached_count"],
+            "hydrated_count": cache_stats["hydrated_count"],
+            "oldest_cached_at": cache_stats["oldest_cached_at"],
+            "newest_cached_at": cache_stats["newest_cached_at"],
+            "latest_subject": latest_subject,
+            "run_id": latest_run_id,
+            "error": None,
+        },
+        time_range=normalized_time_range,
+    )
+    job.run_id = latest_run_id
+    job.event.set()
+    with FRONTEND_ACTIVE_RUNS_LOCK:
+        FRONTEND_ACTIVE_RUNS.pop(scope_key, None)
+    STREAM_HUB.emit(
+        {
+            "type": "scan_completed",
+            "provider": provider_name,
+            "run_id": latest_run_id,
+            "processed_count": processed_total,
+            "cached_count": cache_stats["cached_count"],
+        }
+    )
+    return {
+        "provider": provider_name,
+        "run_id": latest_run_id,
+        "count": processed_total,
+        "processed_total": processed_total,
+        "cached_count": cache_stats["cached_count"],
+    }
+
+
+def _start_unread_sync_job(
+    provider_name: str,
+    *,
+    force_refresh: bool = True,
+    time_range: Optional[str] = None,
+) -> bool:
+    normalized_time_range = normalize_time_range(time_range)
+    scope_key = _scope_key(provider_name, normalized_time_range)
+    if _has_active_frontend_job(scope_key):
+        return False
+
+    settings = _get_workspace_settings()
+    _update_frontend_progress(
+        provider_name,
+        {
+            "mode": "scan",
+            "status": "running",
+            "stage": "queued",
+            "limit": settings.default_scan_limit,
+            "processed_emails": 0,
+            "read_count": 0,
+            "action_item_count": 0,
+            "recommendation_count": 0,
+            "batch_count": 0,
+            "run_id": _get_cached_or_latest_run_id(
+                provider_name,
+                time_range=normalized_time_range,
+            ),
+            "error": None,
+        },
+        time_range=normalized_time_range,
+    )
+
+    def _runner() -> None:
+        try:
+            _sync_unread_working_set(
+                provider_name,
+                force_refresh=force_refresh,
+                time_range=normalized_time_range,
+            )
+        except HTTPException:
+            return
+        except Exception as exc:
+            message = _provider_runtime_error_message(provider_name, exc)
+            _update_frontend_progress(
+                provider_name,
+                {
+                    "mode": "scan",
+                    "status": "error",
+                    "stage": "failed",
+                    "error": message,
+                },
+                time_range=normalized_time_range,
+            )
+
+    threading.Thread(
+        target=_runner,
+        name=f"inboxanchor-scan-{provider_name}-{normalized_time_range}",
+        daemon=True,
+    ).start()
+    return True
+
+
 def _load_mailbox_sync_state(
     provider_name: str,
     *,
@@ -908,6 +1469,78 @@ def _load_mailbox_sync_state(
             provider_name,
             _scope_sync_kind(time_range),
         )
+
+
+def _load_unread_mailbox_preview(
+    provider_name: str,
+    *,
+    time_range: Optional[str] = None,
+    limit: int = 120,
+) -> list[dict]:
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        return repository.list_mailbox_emails(
+            provider_name,
+            limit=limit,
+            offset=0,
+            unread_only=True,
+            time_range=normalize_time_range(time_range),
+        )
+
+
+def _build_cache_digest(
+    provider_name: str,
+    *,
+    time_range: Optional[str] = None,
+    run_id: Optional[str] = None,
+) -> dict:
+    cache_stats = _load_mailbox_cache_stats(provider_name, time_range=time_range)
+    preview = _load_unread_mailbox_preview(provider_name, time_range=time_range, limit=120)
+    classification_stats = _load_mailbox_classification_stats(
+        provider_name,
+        unread_only=True,
+        time_range=time_range,
+    )
+    summary = ""
+    category_counts: dict[str, int] = dict(classification_stats.get("category_counts", {}))
+    high_priority_ids: list[str] = list(classification_stats.get("high_priority_ids", []))
+    if run_id:
+        try:
+            digest = _load_digest(run_id)
+        except HTTPException:
+            digest = None
+        if digest:
+            summary = digest["summary"]
+            if not category_counts:
+                category_counts = dict(digest.get("category_counts", {}))
+            if not high_priority_ids:
+                high_priority_ids = list(digest.get("high_priority_ids", []))
+
+    if not summary:
+        top_senders = []
+        for item in preview:
+            sender = str(item.get("sender", "")).strip()
+            if sender and sender not in top_senders:
+                top_senders.append(sender)
+            if len(top_senders) >= 3:
+                break
+        if top_senders:
+            summary = (
+                f"{cache_stats['cached_unread_count']} unread emails are cached locally. "
+                f"Recent senders: {', '.join(top_senders)}."
+            )
+        else:
+            summary = (
+                f"{cache_stats['cached_unread_count']} unread emails are cached locally "
+                "and ready for review."
+            )
+
+    return {
+        "total_unread": cache_stats["cached_unread_count"],
+        "category_counts": category_counts,
+        "high_priority_ids": high_priority_ids,
+        "summary": summary,
+    }
 
 
 def _has_active_frontend_job(scope_key: str) -> bool:
@@ -981,10 +1614,10 @@ def _synthesized_complete_progress(
     previous: Optional[dict] = None,
 ) -> dict:
     overview = _build_ops_overview(provider_name, run_id, time_range=time_range)
-    recommendation_count = (
-        int(overview["safeCleanupCount"])
-        + int(overview["needsApprovalCount"])
-        + int(overview["blockedCount"])
+    workflow_counts = _load_mailbox_workflow_counts(
+        provider_name,
+        unread_only=True,
+        time_range=overview["timeRange"],
     )
     previous = previous or {}
     return {
@@ -997,8 +1630,8 @@ def _synthesized_complete_progress(
         "target_count": int(overview["unreadCount"]),
         "processed_count": int(overview["unreadCount"]),
         "read_count": int(overview["unreadCount"]),
-        "action_item_count": int(previous.get("action_item_count", 0)),
-        "recommendation_count": recommendation_count,
+        "action_item_count": int(workflow_counts["action_item_count"]),
+        "recommendation_count": int(workflow_counts["recommendation_count"]),
         "batch_count": int(previous.get("batch_count", 0)),
         "cached_count": int(overview["cachedEmailsCount"]),
         "hydrated_count": int(overview["hydratedEmailsCount"]),
@@ -1040,6 +1673,271 @@ def _load_action_items(run_id: str, email_id: str) -> list[dict]:
         return InboxRepository(session).list_action_items_for_email(run_id, email_id)
 
 
+def _mailbox_recommendation_sort_key(detail: dict) -> tuple[int, int, float, str]:
+    status_order = {
+        "blocked": 0,
+        "requires_approval": 1,
+        "safe": 2,
+    }
+    priority_order = {
+        "critical": 0,
+        "high": 1,
+        "medium": 2,
+        "low": 3,
+    }
+    classification = detail["classification"]
+    return (
+        status_order.get(str(detail.get("status", "")), 3),
+        priority_order.get(str(classification.get("priority", "")), 4),
+        -float(detail.get("confidence", 0.0)),
+        str(detail.get("received_at", "")),
+    )
+
+
+def _mailbox_action_items_for_email(
+    email: EmailMessage,
+    classification: EmailClassification,
+) -> list[dict]:
+    items = MAILBOX_ACTION_EXTRACTOR.extract(
+        email,
+        classification=classification,
+        allow_llm=False,
+    )
+    return [item.model_dump(mode="json") for item in items]
+
+
+def _mailbox_recommendation_for_email(
+    email: EmailMessage,
+    classification: EmailClassification,
+    *,
+    policy: Optional[object] = None,
+) -> EmailRecommendation:
+    workspace_policy = policy or _get_workspace_settings().policy
+    return MAILBOX_SAFETY_VERIFIER.verify(
+        email,
+        classification,
+        MAILBOX_RULES_ENGINE.recommend(
+            email,
+            classification,
+            now=datetime.now(timezone.utc),
+            policy=workspace_policy,
+        ),
+        policy=workspace_policy,
+    )
+
+
+def _mailbox_recommendation_detail(
+    provider_name: str,
+    mailbox_email: dict,
+    *,
+    mailbox_classification: Optional[dict] = None,
+    latest_classification: Optional[dict] = None,
+    policy: Optional[object] = None,
+) -> dict:
+    detail = _mailbox_email_detail_payload(
+        provider_name,
+        mailbox_email,
+        mailbox_classification=mailbox_classification,
+        latest_classification=latest_classification,
+    )
+    email = _mailbox_email_to_model(mailbox_email)
+    classification = EmailClassification.model_validate(detail["classification"])
+    recommendation = _mailbox_recommendation_for_email(
+        email,
+        classification,
+        policy=policy,
+    )
+    detail.update(recommendation.model_dump(mode="json"))
+    return detail
+
+
+def _persist_mailbox_workflow_enrichment(
+    repository: InboxRepository,
+    provider_name: str,
+    mailbox_email: dict,
+    *,
+    mailbox_classification: Optional[dict] = None,
+    latest_classification: Optional[dict] = None,
+    policy: Optional[object] = None,
+) -> tuple[dict, list[dict]]:
+    detail = _mailbox_recommendation_detail(
+        provider_name,
+        mailbox_email,
+        mailbox_classification=mailbox_classification,
+        latest_classification=latest_classification,
+        policy=policy,
+    )
+    classification = EmailClassification.model_validate(detail["classification"])
+    email = _mailbox_email_to_model(mailbox_email)
+    items = [
+        EmailActionItem.model_validate(item)
+        for item in _mailbox_action_items_for_email(email, classification)
+    ]
+    repository.replace_mailbox_action_items(
+        provider_name,
+        email.id,
+        items,
+        source="heuristic",
+    )
+    repository.upsert_mailbox_recommendation(
+        provider_name,
+        email.id,
+        EmailRecommendation.model_validate(
+            {
+                "email_id": email.id,
+                "recommended_action": detail["recommended_action"],
+                "reason": detail["reason"],
+                "confidence": detail["confidence"],
+                "status": detail["status"],
+                "requires_approval": detail["requires_approval"],
+                "blocked_reason": detail.get("blocked_reason"),
+                "proposed_labels": detail.get("proposed_labels", []),
+            }
+        ),
+        source="heuristic",
+    )
+    return detail, [item.model_dump(mode="json") for item in items]
+
+
+def _load_mailbox_recommendation_details(
+    provider_name: str,
+    *,
+    time_range: Optional[str] = None,
+    email_id: str = "",
+    unread_only: Optional[bool] = None,
+    limit: Optional[int] = None,
+) -> list[dict]:
+    normalized_time_range = normalize_time_range(time_range)
+    policy = _get_workspace_settings().policy
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        if email_id:
+            mailbox_email = repository.get_mailbox_email(provider_name, email_id)
+            if mailbox_email is None:
+                return []
+            recommendation = repository.get_mailbox_recommendation_detail(provider_name, email_id)
+            mailbox_classification = repository.get_mailbox_classification_detail(
+                provider_name,
+                email_id,
+            )
+            latest_classification = repository.get_latest_classification_detail(
+                provider_name,
+                email_id,
+            )
+            if recommendation is None:
+                detail, _ = _persist_mailbox_workflow_enrichment(
+                    repository,
+                    provider_name,
+                    mailbox_email,
+                    mailbox_classification=mailbox_classification,
+                    latest_classification=latest_classification,
+                    policy=policy,
+                )
+                return [detail]
+            detail = _mailbox_email_detail_payload(
+                provider_name,
+                mailbox_email,
+                mailbox_classification=mailbox_classification,
+                latest_classification=latest_classification,
+            )
+            detail.update(recommendation)
+            return [detail]
+
+        total = repository.count_mailbox_emails(
+            provider_name,
+            unread_only=unread_only,
+            time_range=normalized_time_range,
+        )
+        page = repository.list_mailbox_emails(
+            provider_name,
+            limit=max(limit or total, 1),
+            offset=0,
+            unread_only=unread_only,
+            time_range=normalized_time_range,
+        )
+        email_ids = [item["email_id"] for item in page]
+        mailbox_classifications = repository.get_mailbox_classification_map(
+            provider_name,
+            email_ids,
+        )
+        mailbox_recommendations = repository.get_mailbox_recommendation_map(
+            provider_name,
+            email_ids,
+        )
+        latest_classifications = repository.get_latest_classification_map(
+            provider_name,
+            [email_id for email_id in email_ids if email_id not in mailbox_classifications],
+        )
+        details: list[dict] = []
+        for item in page:
+            mailbox_classification = mailbox_classifications.get(item["email_id"])
+            latest_classification = latest_classifications.get(item["email_id"])
+            recommendation = mailbox_recommendations.get(item["email_id"])
+            if recommendation is None:
+                detail, _ = _persist_mailbox_workflow_enrichment(
+                    repository,
+                    provider_name,
+                    item,
+                    mailbox_classification=mailbox_classification,
+                    latest_classification=latest_classification,
+                    policy=policy,
+                )
+            else:
+                detail = _mailbox_email_detail_payload(
+                    provider_name,
+                    item,
+                    mailbox_classification=mailbox_classification,
+                    latest_classification=latest_classification,
+                )
+                detail.update(recommendation)
+            details.append(detail)
+    details.sort(key=_mailbox_recommendation_sort_key)
+    return details[:limit] if limit else details
+
+
+def _load_mailbox_action_items(provider_name: str, email_id: str) -> list[dict]:
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        mailbox_email = repository.get_mailbox_email(provider_name, email_id)
+        mailbox_classification = repository.get_mailbox_classification_detail(
+            provider_name,
+            email_id,
+        )
+        latest_classification = repository.get_latest_classification_detail(provider_name, email_id)
+        items = repository.get_mailbox_action_items(provider_name, email_id)
+    if mailbox_email is None:
+        return []
+    if items:
+        return items
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        _detail, persisted_items = _persist_mailbox_workflow_enrichment(
+            repository,
+            provider_name,
+            mailbox_email,
+            mailbox_classification=mailbox_classification,
+            latest_classification=latest_classification,
+            policy=_get_workspace_settings().policy,
+        )
+    return persisted_items
+
+
+def _find_mailbox_recommendation_detail(
+    provider_name: str,
+    email_id: str,
+    *,
+    time_range: Optional[str] = None,
+) -> dict:
+    details = _load_mailbox_recommendation_details(
+        provider_name,
+        time_range=time_range,
+        email_id=email_id,
+    )
+    if not details:
+        raise HTTPException(status_code=404, detail="Recommendation not found")
+    return details[0]
+
+
 def _find_recommendation_detail(run_id: str, email_id: str) -> dict:
     with session_scope() as session:
         detail = InboxRepository(session).get_run_recommendation_detail(run_id, email_id)
@@ -1052,6 +1950,16 @@ def _labels_to_remove_for_email(detail: dict) -> list[str]:
     suggested = _recommended_labels_for_email(detail)
     existing = [str(label) for label in detail.get("labels", [])]
     return select_inboxanchor_labels(existing, suggested)
+
+
+def _list_provider_cleanup_labels(provider_name: str) -> list[str]:
+    service = _service_for_provider(provider_name)
+    provider = service.provider
+    try:
+        labels = provider.list_labels()
+    except Exception:
+        return []
+    return select_provider_cleanup_labels([str(label) for label in labels])
 
 
 def _apply_provider_action(
@@ -1103,7 +2011,14 @@ def _apply_provider_action(
     audit_logger = AuditLogger()
     audit_entry = audit_logger.create_entry(decision)
     with session_scope() as session:
-        InboxRepository(session).add_audit_entry(audit_entry)
+        repository = InboxRepository(session)
+        repository.add_audit_entry(audit_entry)
+        repository.update_mailbox_email_state(
+            provider_name,
+            email_id,
+            unread=False if action in {"mark_read", "archive", "trash"} else None,
+            labels_to_add=labels or None,
+        )
     return {
         "emailId": email_id,
         "action": action,
@@ -1210,13 +2125,13 @@ def _record_label_removal_decision(
 
 def _build_ops_overview(
     provider_name: str,
-    run_id: str,
+    run_id: Optional[str],
     *,
     time_range: Optional[str] = None,
 ) -> dict:
     normalized_time_range = normalize_time_range(time_range)
     settings = _get_workspace_settings()
-    digest = _load_digest(run_id)
+    digest = _build_cache_digest(provider_name, time_range=normalized_time_range, run_id=run_id)
     blocked = FRONTEND_BLOCK_REGISTRY.setdefault(provider_name, set())
     connection = InboxAnchorService().load_provider_connection(provider_name)
     cache_stats = _load_mailbox_cache_stats(provider_name, time_range=normalized_time_range)
@@ -1232,7 +2147,12 @@ def _build_ops_overview(
         int(sync_state.get("processed_count") or 0) if sync_state else 0,
     )
     resume_offset = min(
-        int(sync_state.get("next_offset") or processed_total) if sync_state else processed_total,
+        max(
+            int(sync_state.get("next_offset") or 0),
+            processed_total,
+        )
+        if sync_state
+        else processed_total,
         mailbox_target,
     )
     mailbox_memory = {
@@ -1247,20 +2167,35 @@ def _build_ops_overview(
     }
     with session_scope() as session:
         repository = InboxRepository(session)
-        safe_count = repository.count_run_recommendations_by_status(run_id, "safe")
-        review_count = repository.count_run_recommendations_by_status(run_id, "requires_approval")
-        blocked_count = repository.count_run_recommendations_by_status(run_id, "blocked")
-        auto_label_candidates = repository.count_run_auto_label_candidates(run_id)
-        high_priority_count = repository.count_run_high_priority_emails(run_id)
-        attachment_count = repository.count_run_attachment_emails(run_id)
+        recommendation_stats = repository.get_mailbox_recommendation_stats(
+            provider_name,
+            unread_only=True,
+            time_range=normalized_time_range,
+        )
+        classification_stats = repository.get_mailbox_classification_stats(
+            provider_name,
+            unread_only=True,
+            time_range=normalized_time_range,
+        )
+        safe_count = recommendation_stats["safe_count"]
+        review_count = recommendation_stats["review_count"]
+        blocked_count = recommendation_stats["blocked_count"]
+        auto_label_candidates = recommendation_stats["auto_label_candidates"]
+        high_priority_count = len(classification_stats["high_priority_ids"])
+        attachment_count = repository.count_mailbox_emails(
+            provider_name,
+            unread_only=True,
+            time_range=normalized_time_range,
+            has_attachments=True,
+        )
 
     return {
         "provider": provider_name,
         "timeRange": normalized_time_range,
         "timeRangeLabel": time_range_label(normalized_time_range),
         "timeRangeOptions": available_time_ranges(),
-        "runId": run_id,
-        "unreadCount": digest["total_unread"],
+        "runId": run_id or f"sync::{provider_name}::{normalized_time_range}",
+        "unreadCount": cache_stats["cached_unread_count"],
         "highPriorityCount": high_priority_count,
         "safeCleanupCount": safe_count,
         "needsApprovalCount": review_count,
@@ -1349,35 +2284,47 @@ def frontend_emails(
     category: str = "",
     priority: str = "",
     time_range: str = "",
-    unread_only: bool = Query(default=False),
+    unread_only: Optional[bool] = Query(default=None),
     limit: int = Query(default=25, ge=1, le=250),
     offset: int = Query(default=0, ge=0),
 ):
-    run_id, provider_name = _ensure_frontend_run(time_range=time_range or None)
+    provider_name = _get_provider_name()
+    _maybe_seed_mailbox_cache(provider_name, time_range=time_range or None)
+    mailbox_unread_only = True if unread_only is not False else False
     with session_scope() as session:
         repository = InboxRepository(session)
-        total = repository.count_run_email_details(
-            run_id,
+        total = repository.count_mailbox_emails(
+            provider_name,
+            unread_only=mailbox_unread_only,
+            q=q or None,
+            time_range=time_range or None,
             priority=priority or None,
             category=category or None,
-            q=q or None,
-            unread_only=unread_only,
-            time_range=time_range or None,
         )
-        page = repository.list_run_email_details(
-            run_id,
+        page = repository.list_mailbox_emails(
+            provider_name,
             limit=limit,
             offset=offset,
+            unread_only=mailbox_unread_only,
+            q=q or None,
+            time_range=time_range or None,
             priority=priority or None,
             category=category or None,
-            q=q or None,
-            unread_only=unread_only,
-            time_range=time_range or None,
         )
-    mailbox_map = _load_mailbox_email_map(provider_name, [item["email_id"] for item in page])
+    mailbox_classifications = _load_mailbox_classification_map(
+        provider_name,
+        [item["email_id"] for item in page],
+    )
     return {
         "emails": [
-            _frontend_email_payload(item, mailbox_map.get(item["email_id"]))
+            _frontend_email_payload(
+                _mailbox_email_detail_payload(
+                    provider_name,
+                    item,
+                    mailbox_classification=mailbox_classifications.get(item["email_id"]),
+                ),
+                item,
+            )
             for item in page
         ],
         "total": total,
@@ -1386,23 +2333,44 @@ def frontend_emails(
 
 @router.get("/emails/{email_id}")
 def frontend_email(email_id: str, time_range: str = ""):
-    run_id, provider_name = _ensure_frontend_run(time_range=time_range or None)
+    provider_name = _get_provider_name()
+    _maybe_seed_mailbox_cache(provider_name, time_range=time_range or None)
     service = _service_for_provider(provider_name)
     with session_scope() as session:
-        detail = InboxRepository(session).get_run_email_detail(run_id, email_id)
-    if detail is None:
-        raise HTTPException(status_code=404, detail="Email not found")
-    mailbox_map = _load_mailbox_email_map(provider_name, [email_id])
+        repository = InboxRepository(session)
+        mailbox_email = repository.get_mailbox_email(provider_name, email_id)
+        mailbox_classification = repository.get_mailbox_classification_detail(
+            provider_name,
+            email_id,
+        )
+        latest_classification = repository.get_latest_classification_detail(provider_name, email_id)
+        latest_run_id = repository.get_latest_run_id(provider_name)
+    if mailbox_email is None:
+        run_id, provider_name = _ensure_frontend_run(time_range=time_range or None)
+        with session_scope() as session:
+            detail = InboxRepository(session).get_run_email_detail(run_id, email_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="Email not found")
+        mailbox_map = _load_mailbox_email_map(provider_name, [email_id])
+        mailbox_email = mailbox_map.get(email_id)
+        latest_run_id = run_id
+    else:
+        detail = _mailbox_email_detail_payload(
+            provider_name,
+            mailbox_email,
+            mailbox_classification=mailbox_classification,
+            latest_classification=latest_classification,
+        )
     mailbox_email = _hydrate_mailbox_email_if_needed(
         provider_name,
         email_id,
         detail,
-        mailbox_map.get(email_id),
+        mailbox_email,
     )
     return _frontend_email_payload(
         detail,
         mailbox_email,
-        reply_draft=_reply_draft_for_email(run_id, email_id),
+        reply_draft=_reply_draft_for_email(latest_run_id, email_id) if latest_run_id else None,
         can_reply=_provider_supports_reply(service),
         reply_to_address=_reply_target_for_detail(detail),
     )
@@ -1410,24 +2378,36 @@ def frontend_email(email_id: str, time_range: str = ""):
 
 @router.get("/classifications")
 def frontend_classifications(time_range: str = ""):
-    run_id, _ = _ensure_frontend_run(time_range=time_range or None)
-    details = _load_email_details(run_id)
-    return {
-        item["email_id"]: _frontend_classification_payload(item)
-        for item in details
-    }
+    provider_name = _get_provider_name()
+    _maybe_seed_mailbox_cache(provider_name, time_range=time_range or None)
+    classifications = _load_mailbox_classifications(
+        provider_name,
+        unread_only=True,
+        time_range=time_range or None,
+    )
+    return {email_id: payload["classification"] for email_id, payload in classifications.items()}
 
 
 @router.get("/recommendations")
 def frontend_recommendations(email_id: str = "", time_range: str = ""):
-    run_id, provider_name = _ensure_frontend_run(time_range=time_range or None)
+    provider_name = _get_provider_name()
+    _maybe_seed_mailbox_cache(provider_name, time_range=time_range or None)
     blocked = FRONTEND_BLOCK_REGISTRY.setdefault(provider_name, set())
+    preview_limit = _get_workspace_settings().default_recommendation_preview_limit
     if email_id:
-        with session_scope() as session:
-            detail = InboxRepository(session).get_run_recommendation_detail(run_id, email_id)
-        details = [detail] if detail else []
+        details = _load_mailbox_recommendation_details(
+            provider_name,
+            time_range=time_range or None,
+            email_id=email_id,
+            unread_only=None,
+        )
     else:
-        details = _load_recommendation_details(run_id)
+        details = _load_mailbox_recommendation_details(
+            provider_name,
+            time_range=time_range or None,
+            unread_only=True,
+            limit=preview_limit,
+        )
     return [
         _frontend_recommendation_payload(item, blocked=item["email_id"] in blocked)
         for item in details
@@ -1436,8 +2416,15 @@ def frontend_recommendations(email_id: str = "", time_range: str = ""):
 
 @router.get("/emails/{email_id}/actions")
 def frontend_action_items(email_id: str, time_range: str = ""):
-    run_id, _ = _ensure_frontend_run(time_range=time_range or None)
-    items = _load_action_items(run_id, email_id)
+    provider_name = _get_provider_name()
+    _maybe_seed_mailbox_cache(provider_name, time_range=time_range or None)
+    with session_scope() as session:
+        mailbox_email = InboxRepository(session).get_mailbox_email(provider_name, email_id)
+    if mailbox_email is not None:
+        items = _load_mailbox_action_items(provider_name, email_id)
+    else:
+        run_id, _ = _ensure_frontend_run(time_range=time_range or None)
+        items = _load_action_items(run_id, email_id)
     return [
         {
             "emailId": item["email_id"],
@@ -1695,8 +2682,10 @@ def frontend_resolve_alias(
 
 @router.get("/digest")
 def frontend_digest(time_range: str = ""):
-    run_id, _ = _ensure_frontend_run(time_range=time_range or None)
-    digest = _load_digest(run_id)
+    provider_name = _get_provider_name()
+    _maybe_seed_mailbox_cache(provider_name, time_range=time_range or None)
+    run_id = _get_cached_or_latest_run_id(provider_name, time_range=time_range or None)
+    digest = _build_cache_digest(provider_name, time_range=time_range or None, run_id=run_id)
     return {
         "totalUnread": digest["total_unread"],
         "categoryCounts": digest["category_counts"],
@@ -1707,10 +2696,9 @@ def frontend_digest(time_range: str = ""):
 
 @router.get("/ops/overview")
 def frontend_ops_overview(provider: str = "", time_range: str = ""):
-    run_id, provider_name = _ensure_frontend_run(
-        provider=provider or None,
-        time_range=time_range or None,
-    )
+    provider_name = _get_provider_name(provider or None)
+    _maybe_seed_mailbox_cache(provider_name, time_range=time_range or None)
+    run_id = _get_cached_or_latest_run_id(provider_name, time_range=time_range or None)
     return _build_ops_overview(provider_name, run_id, time_range=time_range or None)
 
 
@@ -1744,9 +2732,21 @@ def frontend_ops_progress(provider: str = "", time_range: str = ""):
     cache_stats = _load_mailbox_cache_stats(provider_name, time_range=normalized_time_range)
     sync_state = _load_mailbox_sync_state(provider_name, time_range=normalized_time_range)
     if sync_state:
+        sync_unread_only = sync_state.get("unread_only")
+        workflow_counts = _load_mailbox_workflow_counts(
+            provider_name,
+            unread_only=sync_unread_only if sync_unread_only is not None else None,
+            time_range=normalized_time_range,
+        )
         target_count = int(sync_state.get("target_count") or 0)
-        processed_count = int(sync_state.get("processed_count") or 0)
-        resume_offset = int(sync_state.get("next_offset") or processed_count)
+        processed_count = max(
+            int(sync_state.get("processed_count") or 0),
+            cache_stats["cached_count"],
+        )
+        resume_offset = max(
+            int(sync_state.get("next_offset") or 0),
+            processed_count,
+        )
         completed = bool(sync_state.get("completed"))
         return {
             "provider": provider_name,
@@ -1758,8 +2758,8 @@ def frontend_ops_progress(provider: str = "", time_range: str = ""):
             "target_count": target_count,
             "processed_count": processed_count,
             "read_count": processed_count,
-            "action_item_count": 0,
-            "recommendation_count": 0,
+            "action_item_count": workflow_counts["action_item_count"],
+            "recommendation_count": workflow_counts["recommendation_count"],
             "batch_count": int(sync_state.get("batch_count") or 0),
             "cached_count": cache_stats["cached_count"],
             "hydrated_count": cache_stats["hydrated_count"],
@@ -1816,20 +2816,14 @@ def frontend_ops_progress(provider: str = "", time_range: str = ""):
 
 @router.post("/ops/scan")
 def frontend_ops_scan(payload: FrontendProviderWorkflowRequest):
-    run_id, provider_name = _ensure_frontend_run(
-        provider=payload.provider,
-        force=payload.force_refresh,
+    provider_name = _get_provider_name(payload.provider)
+    _start_unread_sync_job(
+        provider_name,
+        force_refresh=payload.force_refresh,
         time_range=payload.time_range,
     )
-    overview = _build_ops_overview(provider_name, run_id, time_range=payload.time_range)
-    STREAM_HUB.emit(
-        {
-            "type": "scan_completed",
-            "provider": provider_name,
-            "run_id": run_id,
-        }
-    )
-    return overview
+    run_id = _get_cached_or_latest_run_id(provider_name, time_range=payload.time_range)
+    return _build_ops_overview(provider_name, run_id, time_range=payload.time_range)
 
 
 @router.post("/ops/backfill")
@@ -1838,6 +2832,7 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
     normalized_time_range = normalize_time_range(payload.time_range)
     sync_kind = _scope_sync_kind(normalized_time_range)
     service = _service_for_provider(provider_name)
+    settings = _get_workspace_settings()
     start_offset = 0
     processed_total = 0
     processed_this_run = 0
@@ -1854,6 +2849,11 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
             provider_name,
             time_range=normalized_time_range,
         )
+    workflow_counts = _load_mailbox_workflow_counts(
+        provider_name,
+        unread_only=payload.unread_only,
+        time_range=normalized_time_range,
+    )
 
     if (
         sync_state
@@ -1863,10 +2863,18 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
         and normalize_time_range(sync_state.get("time_range")) == normalized_time_range
     ):
         start_offset = min(
-            int(sync_state.get("next_offset") or sync_state.get("processed_count") or 0),
+            max(
+                int(sync_state.get("next_offset") or 0),
+                int(sync_state.get("processed_count") or 0),
+                cache_stats["cached_count"],
+            ),
             payload.limit,
         )
-        processed_total = int(sync_state.get("processed_count") or start_offset)
+        processed_total = max(
+            int(sync_state.get("processed_count") or 0),
+            cache_stats["cached_count"],
+            start_offset,
+        )
         hydrated_total = max(
             int(sync_state.get("hydrated_count") or 0),
             cache_stats["hydrated_count"],
@@ -1878,11 +2886,6 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
                 provider_name,
                 time_range=normalized_time_range,
             )
-            if run_id is None:
-                run_id, _ = _ensure_frontend_run(
-                    provider=provider_name,
-                    time_range=normalized_time_range,
-                )
             overview = _build_ops_overview(
                 provider_name,
                 run_id,
@@ -1897,6 +2900,8 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
                     "limit": payload.limit,
                     "processed_emails": processed_total,
                     "read_count": processed_total,
+                    "action_item_count": workflow_counts["action_item_count"],
+                    "recommendation_count": workflow_counts["recommendation_count"],
                     "batch_count": batch_count,
                     "cached_count": cache_stats["cached_count"],
                     "hydrated_count": cache_stats["hydrated_count"],
@@ -1930,8 +2935,8 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
             "limit": payload.limit,
             "processed_emails": processed_total,
             "read_count": processed_total,
-            "action_item_count": 0,
-            "recommendation_count": 0,
+            "action_item_count": workflow_counts["action_item_count"],
+            "recommendation_count": workflow_counts["recommendation_count"],
             "batch_count": batch_count,
             "cached_count": cache_stats["cached_count"],
             "hydrated_count": cache_stats["hydrated_count"],
@@ -1947,6 +2952,7 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
     )
 
     try:
+        resolver = SenderIntelligenceResolver(provider_name)
         for batch in service.provider.iter_mailbox_batches(
             limit=max(payload.limit - start_offset, 0),
             batch_size=payload.batch_size,
@@ -1959,7 +2965,44 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
             with session_scope() as session:
                 repository = InboxRepository(session)
                 for email in batch:
+                    intelligence = resolver.resolve(email)
+                    classification = MAILBOX_PRIORITY_AGENT.prioritize(
+                        email,
+                        MAILBOX_CLASSIFIER.classify(
+                            email,
+                            intelligence=intelligence,
+                            allow_llm=False,
+                        ),
+                    )
+                    action_items = [
+                        EmailActionItem.model_validate(item)
+                        for item in _mailbox_action_items_for_email(email, classification)
+                    ]
+                    recommendation = _mailbox_recommendation_for_email(
+                        email,
+                        classification,
+                        policy=settings.policy,
+                    )
                     repository.upsert_mailbox_email(provider_name, email)
+                    repository.upsert_mailbox_classification(
+                        provider_name,
+                        email.id,
+                        classification,
+                        source="heuristic",
+                    )
+                    repository.replace_mailbox_action_items(
+                        provider_name,
+                        email.id,
+                        action_items,
+                        source="heuristic",
+                    )
+                    repository.upsert_mailbox_recommendation(
+                        provider_name,
+                        email.id,
+                        recommendation,
+                        source="heuristic",
+                    )
+                    resolver.observe(email, context=intelligence)
                     processed_this_run += 1
                     processed_total += 1
                     if (email.body_full or "").strip():
@@ -1968,6 +3011,23 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
                     provider_name,
                     time_range=normalized_time_range,
                 )
+                recommendation_stats = repository.get_mailbox_recommendation_stats(
+                    provider_name,
+                    unread_only=payload.unread_only,
+                    time_range=normalized_time_range,
+                )
+                workflow_counts = {
+                    "action_item_count": repository.count_mailbox_action_items(
+                        provider_name,
+                        unread_only=payload.unread_only,
+                        time_range=normalized_time_range,
+                    ),
+                    "recommendation_count": (
+                        int(recommendation_stats["safe_count"])
+                        + int(recommendation_stats["review_count"])
+                        + int(recommendation_stats["blocked_count"])
+                    ),
+                }
                 repository.save_provider_sync_state(
                     provider_name,
                     sync_kind,
@@ -1983,6 +3043,8 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
                         "time_range": normalized_time_range,
                         "completed": False,
                         "latest_subject": batch[0].subject if batch else latest_subject,
+                        "action_item_count": workflow_counts["action_item_count"],
+                        "recommendation_count": workflow_counts["recommendation_count"],
                     },
                 )
             latest_subject = batch[0].subject if batch else latest_subject
@@ -1995,6 +3057,8 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
                     "limit": payload.limit,
                     "processed_emails": processed_total,
                     "read_count": processed_total,
+                    "action_item_count": workflow_counts["action_item_count"],
+                    "recommendation_count": workflow_counts["recommendation_count"],
                     "batch_count": batch_count,
                     "cached_count": cache_stats["cached_count"],
                     "hydrated_count": max(hydrated_total, cache_stats["hydrated_count"]),
@@ -2038,6 +3102,23 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
     completed = processed_total >= payload.limit or processed_this_run == 0
     with session_scope() as session:
         repository = InboxRepository(session)
+        recommendation_stats = repository.get_mailbox_recommendation_stats(
+            provider_name,
+            unread_only=payload.unread_only,
+            time_range=normalized_time_range,
+        )
+        workflow_counts = {
+            "action_item_count": repository.count_mailbox_action_items(
+                provider_name,
+                unread_only=payload.unread_only,
+                time_range=normalized_time_range,
+            ),
+            "recommendation_count": (
+                int(recommendation_stats["safe_count"])
+                + int(recommendation_stats["review_count"])
+                + int(recommendation_stats["blocked_count"])
+            ),
+        }
         repository.save_provider_sync_state(
             provider_name,
             sync_kind,
@@ -2053,6 +3134,8 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
                 "time_range": normalized_time_range,
                 "completed": completed,
                 "latest_subject": latest_subject,
+                "action_item_count": workflow_counts["action_item_count"],
+                "recommendation_count": workflow_counts["recommendation_count"],
             },
         )
     _update_frontend_progress(
@@ -2064,6 +3147,8 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
             "limit": payload.limit,
             "processed_emails": processed_total,
             "read_count": processed_total,
+            "action_item_count": workflow_counts["action_item_count"],
+            "recommendation_count": workflow_counts["recommendation_count"],
             "batch_count": batch_count,
             "cached_count": cache_stats["cached_count"],
             "hydrated_count": cache_stats["hydrated_count"],
@@ -2079,18 +3164,6 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
     )
 
     run_id = _get_cached_or_latest_run_id(provider_name, time_range=normalized_time_range)
-    if run_id is None:
-        run_id, _ = _ensure_frontend_run(
-            provider=provider_name,
-            time_range=normalized_time_range,
-        )
-    elif payload.force_refresh:
-        run_id, _ = _ensure_frontend_run(
-            provider=provider_name,
-            force=True,
-            time_range=normalized_time_range,
-        )
-
     overview = _build_ops_overview(provider_name, run_id, time_range=normalized_time_range)
     STREAM_HUB.emit(
         {
@@ -2114,11 +3187,13 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
 
 @router.post("/ops/auto-label")
 def frontend_ops_auto_label(payload: FrontendProviderWorkflowRequest):
-    run_id, provider_name = _ensure_frontend_run(
-        provider=payload.provider,
+    provider_name = payload.provider or _get_provider_name()
+    _maybe_seed_mailbox_cache(provider_name, time_range=payload.time_range)
+    details = _load_mailbox_recommendation_details(
+        provider_name,
         time_range=payload.time_range,
+        unread_only=True,
     )
-    details = _load_email_details(run_id)
     targets = [
         (detail, _recommended_labels_for_email(detail))
         for detail in details
@@ -2174,9 +3249,8 @@ def frontend_ops_auto_label(payload: FrontendProviderWorkflowRequest):
             time_range=payload.time_range,
         )
 
-    refreshed_run_id, _ = _ensure_frontend_run(
-        provider=provider_name,
-        force=payload.force_refresh,
+    refreshed_run_id = _get_cached_or_latest_run_id(
+        provider_name,
         time_range=payload.time_range,
     )
     overview = _build_ops_overview(
@@ -2212,11 +3286,13 @@ def frontend_ops_auto_label(payload: FrontendProviderWorkflowRequest):
 
 @router.post("/ops/clean-labels")
 def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
-    run_id, provider_name = _ensure_frontend_run(
-        provider=payload.provider,
+    provider_name = payload.provider or _get_provider_name()
+    _maybe_seed_mailbox_cache(provider_name, time_range=payload.time_range)
+    details = _load_mailbox_recommendation_details(
+        provider_name,
         time_range=payload.time_range,
+        unread_only=True,
     )
-    details = _load_email_details(run_id)
     targets = [
         (detail, _labels_to_remove_for_email(detail))
         for detail in details
@@ -2226,13 +3302,17 @@ def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
     removed_label_names = dedupe_labels(
         [label for _, labels in targets for label in labels]
     )
+    provider_cleanup_labels = (
+        _list_provider_cleanup_labels(provider_name) if provider_name == "gmail" else []
+    )
+    cleanup_label_names = dedupe_labels(removed_label_names + provider_cleanup_labels)
     _update_frontend_progress(
         provider_name,
         {
             "mode": "workflow",
             "status": "running",
             "stage": "cleaning_labels",
-            "limit": len(removed_label_names) if provider_name == "gmail" else len(targets),
+            "limit": len(cleanup_label_names) if provider_name == "gmail" else len(targets),
             "processed_emails": 0,
             "read_count": len(details),
             "labeled_count": 0,
@@ -2249,7 +3329,7 @@ def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
     use_global_label_delete = provider_name == "gmail"
     if use_global_label_delete:
         deleted_label_names: list[str] = []
-        for index, label_name in enumerate(removed_label_names, start=1):
+        for index, label_name in enumerate(cleanup_label_names, start=1):
             deleted = _delete_provider_labels(provider_name, [label_name])
             deleted_label_names.extend(deleted["deletedLabels"])
             _update_frontend_progress(
@@ -2258,7 +3338,7 @@ def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
                     "mode": "workflow",
                     "status": "running",
                     "stage": "deleting_label_definitions",
-                    "limit": len(removed_label_names),
+                    "limit": len(cleanup_label_names),
                     "processed_emails": index,
                     "read_count": len(details),
                     "labels_removed_count": 0,
@@ -2285,7 +3365,7 @@ def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
                 "mode": "workflow",
                 "status": "running",
                 "stage": "syncing_local_cache",
-                "limit": len(removed_label_names),
+                "limit": len(cleanup_label_names),
                 "processed_emails": deleted_labels["deletedCount"],
                 "read_count": len(details),
                 "labels_removed_count": len(targets),
@@ -2318,10 +3398,12 @@ def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
             )
         with session_scope() as session:
             repository = InboxRepository(session)
-            repository.remove_labels_from_run_emails(
-                run_id,
-                deleted_labels["deletedLabels"],
-            )
+            run_id = repository.get_latest_run_id(provider_name)
+            if run_id:
+                repository.remove_labels_from_run_emails(
+                    run_id,
+                    deleted_labels["deletedLabels"],
+                )
             repository.remove_labels_from_mailbox(
                 provider_name,
                 deleted_labels["deletedLabels"],
@@ -2362,18 +3444,23 @@ def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
         target_email_ids = [detail["email_id"] for detail, _ in targets]
         with session_scope() as session:
             repository = InboxRepository(session)
-            repository.remove_labels_from_run_emails(
-                run_id,
-                removed_label_names,
-                email_ids=target_email_ids,
-            )
+            run_id = repository.get_latest_run_id(provider_name)
+            if run_id:
+                repository.remove_labels_from_run_emails(
+                    run_id,
+                    removed_label_names,
+                    email_ids=target_email_ids,
+                )
             repository.remove_labels_from_mailbox(
                 provider_name,
                 removed_label_names,
                 email_ids=target_email_ids,
             )
 
-    refreshed_run_id = run_id
+    refreshed_run_id = _get_cached_or_latest_run_id(
+        provider_name,
+        time_range=payload.time_range,
+    )
     overview = _build_ops_overview(
         provider_name,
         refreshed_run_id,
@@ -2419,16 +3506,18 @@ def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
 
 @router.post("/ops/safe-cleanup")
 def frontend_ops_safe_cleanup(payload: FrontendProviderWorkflowRequest):
-    run_id, provider_name = _ensure_frontend_run(
-        provider=payload.provider,
-        time_range=payload.time_range,
-    )
+    provider_name = payload.provider or _get_provider_name()
+    _maybe_seed_mailbox_cache(provider_name, time_range=payload.time_range)
     existing_progress = FRONTEND_PROGRESS.get(
         _scope_key(provider_name, payload.time_range),
         {},
     )
     blocked = FRONTEND_BLOCK_REGISTRY.setdefault(provider_name, set())
-    details = _load_recommendation_details(run_id)
+    details = _load_mailbox_recommendation_details(
+        provider_name,
+        time_range=payload.time_range,
+        unread_only=True,
+    )
     detail_map = {detail["email_id"]: detail for detail in details}
     safe_targets = [
         _frontend_recommendation_payload(detail, blocked=detail["email_id"] in blocked)
@@ -2504,9 +3593,8 @@ def frontend_ops_safe_cleanup(payload: FrontendProviderWorkflowRequest):
             time_range=payload.time_range,
         )
 
-    refreshed_run_id, _ = _ensure_frontend_run(
-        provider=provider_name,
-        force=payload.force_refresh,
+    refreshed_run_id = _get_cached_or_latest_run_id(
+        provider_name,
         time_range=payload.time_range,
     )
     overview = _build_ops_overview(
@@ -2571,9 +3659,14 @@ def frontend_apply_all_safe(
     authorization: Optional[str] = Header(default=None),
     time_range: str = "",
 ):
-    run_id, provider_name = _ensure_frontend_run(time_range=time_range or None)
+    provider_name = _get_provider_name()
+    _maybe_seed_mailbox_cache(provider_name, time_range=time_range or None)
     blocked = FRONTEND_BLOCK_REGISTRY.setdefault(provider_name, set())
-    details = _load_recommendation_details(run_id)
+    details = _load_mailbox_recommendation_details(
+        provider_name,
+        time_range=time_range or None,
+        unread_only=True,
+    )
     applied: list[dict] = []
     for detail in details:
         payload = _frontend_recommendation_payload(detail, blocked=detail["email_id"] in blocked)
@@ -2593,9 +3686,8 @@ def frontend_apply_all_safe(
         )
         blocked.discard(detail["email_id"])
 
-    refreshed_run_id, _ = _ensure_frontend_run(
-        provider=provider_name,
-        force=True,
+    refreshed_run_id = _get_cached_or_latest_run_id(
+        provider_name,
         time_range=time_range or None,
     )
     STREAM_HUB.emit(
@@ -2616,8 +3708,13 @@ def frontend_apply_recommendation(
     authorization: Optional[str] = Header(default=None),
     time_range: str = "",
 ):
-    run_id, provider_name = _ensure_frontend_run(time_range=time_range or None)
-    detail = _find_recommendation_detail(run_id, email_id)
+    provider_name = _get_provider_name()
+    _maybe_seed_mailbox_cache(provider_name, time_range=time_range or None)
+    detail = _find_mailbox_recommendation_detail(
+        provider_name,
+        email_id,
+        time_range=time_range or None,
+    )
     recommendation = _frontend_recommendation_payload(detail)
     result = _apply_provider_action(
         provider_name,
@@ -2630,9 +3727,8 @@ def frontend_apply_recommendation(
         safety_status=SafetyStatus.allowed,
     )
     FRONTEND_BLOCK_REGISTRY.setdefault(provider_name, set()).discard(email_id)
-    refreshed_run_id, _ = _ensure_frontend_run(
-        provider=provider_name,
-        force=True,
+    refreshed_run_id = _get_cached_or_latest_run_id(
+        provider_name,
         time_range=time_range or None,
     )
     STREAM_HUB.emit(
@@ -2653,8 +3749,13 @@ def frontend_approve_recommendation(
     authorization: Optional[str] = Header(default=None),
     time_range: str = "",
 ):
-    run_id, provider_name = _ensure_frontend_run(time_range=time_range or None)
-    detail = _find_recommendation_detail(run_id, email_id)
+    provider_name = _get_provider_name()
+    _maybe_seed_mailbox_cache(provider_name, time_range=time_range or None)
+    detail = _find_mailbox_recommendation_detail(
+        provider_name,
+        email_id,
+        time_range=time_range or None,
+    )
     recommendation = _frontend_recommendation_payload(detail)
     result = _apply_provider_action(
         provider_name,
@@ -2676,11 +3777,6 @@ def frontend_approve_recommendation(
             "actor": actor_email,
         }
     )
-    _ensure_frontend_run(
-        provider=provider_name,
-        force=True,
-        time_range=time_range or None,
-    )
     return {"ok": True, **result}
 
 
@@ -2691,8 +3787,13 @@ def frontend_block_recommendation(
     authorization: Optional[str] = Header(default=None),
     time_range: str = "",
 ):
-    run_id, provider_name = _ensure_frontend_run(time_range=time_range or None)
-    detail = _find_recommendation_detail(run_id, email_id)
+    provider_name = _get_provider_name()
+    _maybe_seed_mailbox_cache(provider_name, time_range=time_range or None)
+    detail = _find_mailbox_recommendation_detail(
+        provider_name,
+        email_id,
+        time_range=time_range or None,
+    )
     recommendation = _frontend_recommendation_payload(detail, blocked=True)
     blocked = FRONTEND_BLOCK_REGISTRY.setdefault(provider_name, set())
     blocked.add(email_id)
@@ -2714,7 +3815,7 @@ def frontend_block_recommendation(
         {
             "type": "recommendation_blocked",
             "provider": provider_name,
-            "run_id": run_id,
+            "run_id": _get_cached_or_latest_run_id(provider_name, time_range=time_range or None),
             "email_id": email_id,
         }
     )

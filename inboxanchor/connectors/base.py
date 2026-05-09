@@ -167,6 +167,9 @@ class EmailProvider(ABC):
             ),
         )
 
+    def list_labels(self) -> list[str]:
+        return []
+
     def send_reply(
         self,
         email_id: str,

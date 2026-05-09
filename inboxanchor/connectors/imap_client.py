@@ -4,6 +4,7 @@ from typing import Optional
 
 from inboxanchor.connectors.base import EmailProvider, ProviderActionResult
 from inboxanchor.core.time_windows import in_time_window
+from inboxanchor.mail_intelligence import dedupe_labels
 from inboxanchor.models import EmailMessage
 
 
@@ -219,6 +220,12 @@ class IMAPEmailClient(EmailProvider):
             executed=not dry_run,
             details=f"IMAP label deletion prepared: {', '.join(labels)}",
         )
+
+    def list_labels(self) -> list[str]:
+        labels: list[str] = []
+        for message in self._messages.values():
+            labels.extend(message.labels)
+        return dedupe_labels(labels)
 
     def send_reply(
         self,

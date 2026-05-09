@@ -14,6 +14,9 @@ import inboxanchor.api.v1.routers.frontend as frontend_router
 import inboxanchor.api.v1.routers.oauth as oauth_router
 from inboxanchor.api.main import app
 from inboxanchor.bootstrap import build_demo_emails
+from inboxanchor.infra.database import session_scope
+from inboxanchor.infra.repository import InboxRepository
+from inboxanchor.models import EmailClassification, WorkspaceSettings
 
 client = TestClient(app)
 
@@ -552,6 +555,212 @@ def test_frontend_emails_include_classification_and_apply_server_side_filters():
     )
 
 
+def test_frontend_emails_can_render_from_mailbox_cache_without_frontend_run(monkeypatch):
+    email = build_demo_emails()[0].model_copy(
+        update={
+            "id": "cache-route-1",
+            "thread_id": "cache-route-1",
+            "subject": "Mailbox cache route smoke test",
+        }
+    )
+    with session_scope() as session:
+        InboxRepository(session).upsert_mailbox_email("fake", email)
+
+    monkeypatch.setattr(
+        frontend_router,
+        "_ensure_frontend_run",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("Mailbox-backed /emails should not force a triage run.")
+        ),
+    )
+
+    response = client.get("/emails", params={"limit": 10})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] >= 1
+    cached = next(item for item in payload["emails"] if item["id"] == "cache-route-1")
+    assert cached["classification"]["category"]
+    assert cached["classification"]["priority"]
+
+
+def test_frontend_email_detail_can_render_from_mailbox_cache_without_frontend_run(monkeypatch):
+    email = build_demo_emails()[0].model_copy(
+        update={
+            "id": "cache-detail-1",
+            "thread_id": "cache-detail-1",
+            "subject": "Mailbox detail route smoke test",
+        }
+    )
+    with session_scope() as session:
+        InboxRepository(session).upsert_mailbox_email("fake", email)
+
+    monkeypatch.setattr(
+        frontend_router,
+        "_ensure_frontend_run",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("Mailbox-backed /emails/{id} should not force a triage run.")
+        ),
+    )
+
+    response = client.get("/emails/cache-detail-1")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == "cache-detail-1"
+    assert payload["classification"]["category"]
+    assert "replyDraft" in payload
+
+
+def test_frontend_filtered_emails_can_render_from_mailbox_classifications_without_frontend_run(
+    monkeypatch,
+):
+    email = build_demo_emails()[0].model_copy(
+        update={
+            "id": "cache-filter-1",
+            "thread_id": "cache-filter-1",
+            "subject": "Mailbox classification filter smoke test",
+        }
+    )
+    classification = EmailClassification(
+        category="finance",
+        priority="high",
+        confidence=0.93,
+        reason="Finance-heavy sender history",
+    )
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        repository.upsert_mailbox_email("fake", email)
+        repository.upsert_mailbox_classification("fake", email.id, classification)
+
+    monkeypatch.setattr(
+        frontend_router,
+        "_ensure_frontend_run",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("Mailbox-backed category filters should not force a triage run.")
+        ),
+    )
+
+    response = client.get("/emails", params={"category": "finance", "limit": 10})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] >= 1
+    filtered = next(item for item in payload["emails"] if item["id"] == "cache-filter-1")
+    assert filtered["classification"]["category"] == "finance"
+    assert filtered["classification"]["priority"] == "high"
+
+
+def test_frontend_classifications_can_render_from_mailbox_cache_without_frontend_run(monkeypatch):
+    email = build_demo_emails()[0].model_copy(
+        update={
+            "id": "cache-classifications-1",
+            "thread_id": "cache-classifications-1",
+            "subject": "Mailbox classifications route smoke test",
+        }
+    )
+    classification = EmailClassification(
+        category="work",
+        priority="medium",
+        confidence=0.88,
+        reason="Sender history and message intent point to work",
+    )
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        repository.upsert_mailbox_email("fake", email)
+        repository.upsert_mailbox_classification("fake", email.id, classification)
+
+    monkeypatch.setattr(
+        frontend_router,
+        "_ensure_frontend_run",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("Mailbox-backed classifications should not force a triage run.")
+        ),
+    )
+
+    response = client.get("/classifications")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["cache-classifications-1"]["category"] == "work"
+    assert payload["cache-classifications-1"]["priority"] == "medium"
+
+
+def test_frontend_recommendations_can_render_from_mailbox_cache_without_frontend_run(
+    monkeypatch,
+):
+    email = build_demo_emails()[0].model_copy(
+        update={
+            "id": "cache-recommendations-1",
+            "thread_id": "cache-recommendations-1",
+            "subject": "Mailbox recommendations route smoke test",
+        }
+    )
+    classification = EmailClassification(
+        category="work",
+        priority="high",
+        confidence=0.91,
+        reason="High-signal work thread",
+    )
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        repository.upsert_mailbox_email("fake", email)
+        repository.upsert_mailbox_classification("fake", email.id, classification)
+
+    monkeypatch.setattr(
+        frontend_router,
+        "_ensure_frontend_run",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("Mailbox-backed recommendations should not force a triage run.")
+        ),
+    )
+
+    response = client.get("/recommendations")
+
+    assert response.status_code == 200
+    payload = response.json()
+    target = next(item for item in payload if item["emailId"] == "cache-recommendations-1")
+    assert target["recommendedAction"]
+    assert target["status"] in {"safe", "requires_approval", "blocked"}
+
+
+def test_frontend_action_items_can_render_from_mailbox_cache_without_frontend_run(monkeypatch):
+    email = build_demo_emails()[0].model_copy(
+        update={
+            "id": "cache-actions-1",
+            "thread_id": "cache-actions-1",
+            "subject": "Please review this today",
+            "snippet": "Please review the attached outline and reply with any changes.",
+        }
+    )
+    classification = EmailClassification(
+        category="work",
+        priority="medium",
+        confidence=0.89,
+        reason="Work request with review signal",
+    )
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        repository.upsert_mailbox_email("fake", email)
+        repository.upsert_mailbox_classification("fake", email.id, classification)
+
+    monkeypatch.setattr(
+        frontend_router,
+        "_ensure_frontend_run",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("Mailbox-backed action items should not force a triage run.")
+        ),
+    )
+
+    response = client.get("/emails/cache-actions-1/actions")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert isinstance(payload, list)
+    assert payload
+    assert payload[0]["actionType"]
+
+
 def test_frontend_recommendations_can_scope_to_one_email():
     recommendations = client.get("/recommendations").json()
     target_email_id = recommendations[0]["emailId"]
@@ -562,6 +771,150 @@ def test_frontend_recommendations_can_scope_to_one_email():
     scoped_payload = scoped_response.json()
     assert len(scoped_payload) == 1
     assert scoped_payload[0]["emailId"] == target_email_id
+
+
+def test_frontend_digest_can_render_from_mailbox_cache_without_frontend_run(monkeypatch):
+    email = build_demo_emails()[0].model_copy(
+        update={
+            "id": "cache-digest-1",
+            "thread_id": "cache-digest-1",
+            "subject": "Digest cache smoke test",
+        }
+    )
+    with session_scope() as session:
+        InboxRepository(session).upsert_mailbox_email("fake", email)
+
+    monkeypatch.setattr(
+        frontend_router,
+        "_ensure_frontend_run",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("Digest fallback should not force a triage run.")
+        ),
+    )
+
+    response = client.get("/digest")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["totalUnread"] >= 1
+    assert payload["summary"]
+
+
+def test_frontend_digest_uses_mailbox_classification_stats_without_frontend_run(monkeypatch):
+    email = build_demo_emails()[0].model_copy(
+        update={
+            "id": "cache-digest-classifications-1",
+            "thread_id": "cache-digest-classifications-1",
+            "subject": "Digest category count smoke test",
+        }
+    )
+    classification = EmailClassification(
+        category="finance",
+        priority="critical",
+        confidence=0.95,
+        reason="Invoice with deadline",
+    )
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        repository.upsert_mailbox_email("fake", email)
+        repository.upsert_mailbox_classification("fake", email.id, classification)
+
+    monkeypatch.setattr(
+        frontend_router,
+        "_ensure_frontend_run",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("Digest classification stats should not force a triage run.")
+        ),
+    )
+
+    response = client.get("/digest")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["categoryCounts"].get("finance", 0) >= 1
+    assert "cache-digest-classifications-1" in payload["highPriorityIds"]
+
+
+def test_frontend_ops_scan_syncs_mailbox_cache_without_frontend_run(monkeypatch):
+    launched: list[tuple[str, bool, str | None]] = []
+
+    monkeypatch.setattr(
+        frontend_router,
+        "_ensure_frontend_run",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("Unread sync should not force a triage run.")
+        ),
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_start_unread_sync_job",
+        lambda provider_name, *, force_refresh=True, time_range=None: launched.append(
+            (provider_name, force_refresh, time_range)
+        )
+        or True,
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_build_ops_overview",
+        lambda provider_name, run_id, time_range=None: {
+            "provider": provider_name,
+            "runId": run_id,
+            "timeRange": time_range or "all_time",
+            "timeRangeLabel": "All time",
+            "cachedEmailsCount": 1,
+            "unreadCount": 1,
+        },
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_get_cached_or_latest_run_id",
+        lambda provider_name, time_range=None: None,
+    )
+
+    response = client.post("/ops/scan", json={"force_refresh": True})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["provider"] == "fake"
+    assert payload["cachedEmailsCount"] == 1
+    assert payload["unreadCount"] == 1
+    assert launched == [("fake", True, None)]
+
+
+def test_frontend_ops_scan_starts_background_job(monkeypatch):
+    launched: list[tuple[str, bool, str | None]] = []
+
+    monkeypatch.setattr(
+        frontend_router,
+        "_start_unread_sync_job",
+        lambda provider_name, *, force_refresh=True, time_range=None: launched.append(
+            (provider_name, force_refresh, time_range)
+        )
+        or True,
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_build_ops_overview",
+        lambda provider_name, run_id, time_range=None: {
+            "provider": provider_name,
+            "runId": run_id,
+            "timeRange": time_range or "all_time",
+            "timeRangeLabel": "All time",
+            "cachedEmailsCount": 42,
+            "unreadCount": 21,
+        },
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_get_cached_or_latest_run_id",
+        lambda provider_name, time_range=None: "cached-run-123",
+    )
+
+    response = client.post("/ops/scan", json={"force_refresh": True, "time_range": "all_time"})
+
+    assert response.status_code == 200
+    assert launched == [("fake", True, "all_time")]
+    assert response.json()["runId"] == "cached-run-123"
 
 
 def test_frontend_ops_workflows_expose_mailbox_upgrade_features():
@@ -646,10 +999,11 @@ def test_frontend_clean_labels_uses_fast_gmail_delete_path_without_rescan(monkey
         return "gmail-run-1", "gmail"
 
     monkeypatch.setattr(frontend_router, "_ensure_frontend_run", fake_ensure_frontend_run)
+    monkeypatch.setattr(frontend_router, "_maybe_seed_mailbox_cache", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         frontend_router,
-        "_load_email_details",
-        lambda run_id: [
+        "_load_mailbox_recommendation_details",
+        lambda provider_name, **kwargs: [
             {
                 "email_id": "msg-1",
                 "subject": "LinkedIn Jobs",
@@ -667,6 +1021,11 @@ def test_frontend_clean_labels_uses_fast_gmail_delete_path_without_rescan(monkey
         frontend_router,
         "_record_label_removal_decision",
         lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_list_provider_cleanup_labels",
+        lambda provider_name: ["work", "jobs/alert"],
     )
     monkeypatch.setattr(
         frontend_router,
@@ -708,10 +1067,10 @@ def test_frontend_clean_labels_uses_fast_gmail_delete_path_without_rescan(monkey
     assert response.status_code == 200
     payload = response.json()
     assert payload["count"] == 1
-    assert payload["deletedLabelCount"] == 2
-    assert payload["deletedLabels"] == ["jobs/alert", "priority/high"]
-    assert ensure_calls == [("gmail", False, "all_time")]
-    assert delete_calls == [["jobs/alert"], ["priority/high"]]
+    assert payload["deletedLabelCount"] == 3
+    assert payload["deletedLabels"] == ["jobs/alert", "priority/high", "work"]
+    assert ensure_calls == []
+    assert delete_calls == [["jobs/alert"], ["priority/high"], ["work"]]
 
 
 def test_frontend_ops_backfill_builds_mailbox_memory_cache():
@@ -1071,6 +1430,55 @@ def test_frontend_ops_overview_returns_selected_time_range():
     assert payload["timeRangeLabel"] == "Last 6 months"
 
 
+def test_frontend_large_scan_switches_to_lightweight_batches(monkeypatch):
+    frontend_router.FRONTEND_RUN_CACHE.clear()
+    frontend_router.FRONTEND_SERVICE_CACHE.clear()
+    frontend_router.FRONTEND_BLOCK_REGISTRY.clear()
+    frontend_router.FRONTEND_FORCE_REFRESH_PROVIDERS.clear()
+    frontend_router.FRONTEND_PROVIDER_ERRORS.clear()
+    frontend_router.FRONTEND_PROGRESS.clear()
+
+    run_calls: list[dict] = []
+
+    def fake_run(**kwargs):
+        run_calls.append(kwargs)
+        return SimpleNamespace(
+            run_id="scan-run-1",
+            scanned_emails=kwargs["limit"],
+            total_emails=kwargs["limit"],
+            action_items={},
+            recommendations=[],
+            batch_count=kwargs["limit"] // kwargs["batch_size"],
+        )
+
+    monkeypatch.setattr(frontend_router, "_get_provider_name", lambda provider=None: "gmail")
+    monkeypatch.setattr(
+        frontend_router,
+        "_get_workspace_settings",
+        lambda: WorkspaceSettings(
+            preferred_provider="gmail",
+            default_scan_limit=10000,
+            default_batch_size=1000,
+        ),
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_service_for_provider",
+        lambda provider_name: SimpleNamespace(engine=SimpleNamespace(run=fake_run)),
+    )
+
+    run_id, provider_name = frontend_router._ensure_frontend_run(force=True, time_range="all_time")
+
+    assert run_id == "scan-run-1"
+    assert provider_name == "gmail"
+    assert run_calls
+    assert run_calls[0]["limit"] == 10000
+    assert run_calls[0]["batch_size"] == 250
+    assert run_calls[0]["include_body"] is False
+    assert run_calls[0]["extract_actions"] is False
+    assert run_calls[0]["draft_replies"] is False
+
+
 def test_frontend_ops_overview_surfaces_live_provider_fetch_failure(monkeypatch):
     frontend_router.FRONTEND_RUN_CACHE.clear()
     frontend_router.FRONTEND_SERVICE_CACHE.clear()
@@ -1222,6 +1630,14 @@ def test_frontend_ops_progress_reconciles_empty_stale_scan(monkeypatch):
             "newestCachedAt": "2026-05-09T10:00:00Z",
         },
     )
+    monkeypatch.setattr(
+        frontend_router,
+        "_load_mailbox_workflow_counts",
+        lambda provider_name, unread_only=None, time_range=None: {
+            "action_item_count": 13,
+            "recommendation_count": 28,
+        },
+    )
 
     response = client.get("/ops/progress", params={"provider": "gmail"})
 
@@ -1232,9 +1648,61 @@ def test_frontend_ops_progress_reconciles_empty_stale_scan(monkeypatch):
     assert payload["run_id"] == "live-run-123"
     assert payload["processed_count"] == 245
     assert payload["read_count"] == 245
+    assert payload["action_item_count"] == 13
     assert payload["recommendation_count"] == 28
     assert payload["cached_count"] == 612
     assert payload["hydrated_count"] == 401
+
+
+def test_frontend_ops_progress_sync_state_uses_mailbox_workflow_counts(monkeypatch):
+    frontend_router.FRONTEND_PROGRESS.clear()
+    frontend_router.FRONTEND_PROVIDER_ERRORS.clear()
+    frontend_router.FRONTEND_RUN_CACHE.clear()
+
+    monkeypatch.setattr(
+        frontend_router,
+        "_load_mailbox_cache_stats",
+        lambda provider_name, time_range=None: {
+            "cached_count": 4100,
+            "hydrated_count": 900,
+            "cached_unread_count": 275,
+            "oldest_cached_at": "2024-01-01T10:00:00Z",
+            "newest_cached_at": "2026-05-09T10:00:00Z",
+        },
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_load_mailbox_sync_state",
+        lambda provider_name, time_range=None: {
+            "target_count": 10000,
+            "processed_count": 4100,
+            "next_offset": 4100,
+            "batch_count": 41,
+            "unread_only": False,
+            "completed": False,
+            "latest_subject": "Older archive sync",
+            "updated_at": "2026-05-09T10:00:00Z",
+        },
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_load_mailbox_workflow_counts",
+        lambda provider_name, unread_only=None, time_range=None: {
+            "action_item_count": 86,
+            "recommendation_count": 275,
+        },
+    )
+
+    response = client.get("/ops/progress", params={"provider": "gmail", "time_range": "all_time"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["mode"] == "backfill"
+    assert payload["status"] == "paused"
+    assert payload["processed_count"] == 4100
+    assert payload["action_item_count"] == 86
+    assert payload["recommendation_count"] == 275
+    assert payload["latest_subject"] == "Older archive sync"
 
 
 def test_frontend_ensure_run_reuses_inflight_provider_job(monkeypatch):

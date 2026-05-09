@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from inboxanchor.core.rules import RulesEngine
+from inboxanchor.mail_intelligence import extract_project_slug, recommend_mailbox_labels
 from inboxanchor.models import EmailClassification, EmailMessage, WorkspacePolicy
 from inboxanchor.models.email import EmailCategory, PriorityLevel, RecommendationStatus
 
@@ -83,3 +84,48 @@ def test_high_value_newsletter_stays_in_review():
     assert recommendation.recommended_action == "review"
     assert recommendation.status == RecommendationStatus.requires_approval
     assert "newsletters/high-value" in recommendation.proposed_labels
+
+
+def test_recommend_mailbox_labels_keeps_job_alerts_low_signal():
+    labels = recommend_mailbox_labels(
+        sender="jobs-noreply@linkedin.com",
+        subject="Gabriel Luca, your application was sent to Adecco",
+        snippet="See similar jobs and recommended roles for your profile.",
+        body="LinkedIn found more jobs for you this week. Manage preferences or unsubscribe.",
+        category="low_priority",
+        priority="low",
+    )
+
+    assert "jobs/alert" in labels
+    assert "cleanup/low-priority" in labels
+    assert "automation/notification" in labels
+    assert not any(label.startswith("needs-reply/") for label in labels)
+    assert not any(label.startswith("projects/") for label in labels)
+    assert "priority/high" not in labels
+
+
+def test_recommend_mailbox_labels_keeps_github_threads_in_work_lane():
+    labels = recommend_mailbox_labels(
+        sender="notifications@github.com",
+        subject="[lucaomul/InboxAnchor] Run failed: CI - main",
+        snippet="The latest CI run failed on main after the last push.",
+        body="GitHub Actions reported a failed workflow run and linked the logs.",
+        category="work",
+        priority="high",
+    )
+
+    assert "work/github" in labels
+    assert "projects/inboxanchor" in labels
+    assert "jobs/alert" not in labels
+    assert not any(label.startswith("needs-reply/") for label in labels)
+
+
+def test_extract_project_slug_requires_explicit_project_signal():
+    slug = extract_project_slug(
+        sender="billing@service.com",
+        subject="Invoice update",
+        snippet="Your monthly invoice is ready.",
+        body="Download the invoice PDF from the dashboard.",
+    )
+
+    assert slug is None
