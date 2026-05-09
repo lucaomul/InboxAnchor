@@ -15,13 +15,14 @@ from urllib.parse import quote
 
 from inboxanchor.connectors.gmail_client import GmailTransport
 from inboxanchor.connectors.oauth_flow import get_credentials
-from inboxanchor.core.time_windows import gmail_query_with_time_range
+from inboxanchor.core.time_windows import gmail_query_with_time_range, in_time_window
 from inboxanchor.models import EmailMessage
 
 logger = logging.getLogger(__name__)
 
 GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+GMAIL_SETTINGS_BASIC_SCOPE = "https://www.googleapis.com/auth/gmail.settings.basic"
 GMAIL_API_BASE_URL = "https://gmail.googleapis.com/gmail/v1"
 
 
@@ -38,7 +39,9 @@ class GoogleAPITransport(GmailTransport):
     ):
         self.credentials_path = str(Path(credentials_path).expanduser())
         self.token_path = str(Path(token_path).expanduser())
-        self.scopes = list(scopes or [GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE])
+        self.scopes = list(
+            scopes or [GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE, GMAIL_SETTINGS_BASIC_SCOPE]
+        )
         self.user_id = user_id
         self._service = service
         self._session = session
@@ -537,6 +540,74 @@ class GoogleAPITransport(GmailTransport):
         label_ids = [self._label_name_to_id(label) for label in labels]
         self._batch_modify(email_ids, add_label_ids=label_ids)
 
+    def _list_filters(self) -> list[dict]:
+        if self._service is not None:
+            service = self._build_service()
+            return self._execute_legacy(
+                service.users().settings().filters().list(userId=self.user_id)
+            ).get("filter", [])
+        return self._request_json("GET", "settings/filters").get("filter", [])
+
+    def _delete_filter(self, filter_id: str) -> None:
+        if self._service is not None:
+            service = self._build_service()
+            self._execute_legacy(
+                service.users().settings().filters().delete(
+                    userId=self.user_id,
+                    id=filter_id,
+                )
+            )
+            return
+        self._request_json(
+            "DELETE",
+            f"settings/filters/{quote(filter_id, safe='')}",
+        )
+
+    def ensure_alias_routing(self, alias_address: str, *, label_name: str) -> None:
+        alias_address = alias_address.strip().lower()
+        if not alias_address:
+            raise ValueError("Alias address is required to configure Gmail routing.")
+
+        label_id = self._label_name_to_id(label_name)
+        existing = self._list_filters()
+        for item in existing:
+            criteria = item.get("criteria", {}) or {}
+            if (criteria.get("to") or "").strip().lower() == alias_address:
+                return
+
+        body = {
+            "criteria": {"to": alias_address},
+            "action": {
+                "addLabelIds": [label_id],
+                "removeLabelIds": ["INBOX"],
+            },
+        }
+        if self._service is not None:
+            service = self._build_service()
+            self._execute_legacy(
+                service.users().settings().filters().create(
+                    userId=self.user_id,
+                    body=body,
+                )
+            )
+            return
+        self._request_json(
+            "POST",
+            "settings/filters",
+            json_body=body,
+        )
+
+    def remove_alias_routing(self, alias_address: str) -> None:
+        alias_address = alias_address.strip().lower()
+        if not alias_address:
+            return
+        for item in self._list_filters():
+            criteria = item.get("criteria", {}) or {}
+            if (criteria.get("to") or "").strip().lower() == alias_address:
+                filter_id = str(item.get("id", "")).strip()
+                if filter_id:
+                    self._delete_filter(filter_id)
+
     def send_reply(
         self,
         email_id: str,
@@ -663,13 +734,15 @@ class GoogleAPITransport(GmailTransport):
         limit: int = 50,
         batch_size: int = 100,
         include_body: bool = True,
+        time_range: Optional[str] = None,
     ):
-        del include_body
         message_ids, _ = self.list_changed_message_ids(checkpoint, max_results=limit)
         batch: list[EmailMessage] = []
         for message_id in message_ids:
-            email = self.get_message(message_id)
+            email = self.get_message(message_id, include_body=include_body)
             if not email.unread:
+                continue
+            if time_range and not in_time_window(email.received_at, time_range):
                 continue
             batch.append(email)
             if len(batch) >= batch_size:

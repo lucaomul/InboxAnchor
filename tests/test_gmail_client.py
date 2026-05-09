@@ -10,6 +10,8 @@ class StubGmailTransport:
         self.archived: list[str] = []
         self.trashed: list[str] = []
         self.labels_applied: list[tuple[list[str], list[str]]] = []
+        self.alias_routes_created: list[tuple[str, str]] = []
+        self.alias_routes_removed: list[str] = []
         self.replies_sent: list[tuple[str, str, str | None]] = []
         self.message = EmailMessage(
             id="gmail-1",
@@ -45,6 +47,12 @@ class StubGmailTransport:
 
     def apply_labels(self, email_ids: list[str], labels: list[str]):
         self.labels_applied.append((email_ids, labels))
+
+    def ensure_alias_routing(self, alias_address: str, *, label_name: str):
+        self.alias_routes_created.append((alias_address, label_name))
+
+    def remove_alias_routing(self, alias_address: str):
+        self.alias_routes_removed.append(alias_address)
 
     def send_reply(self, email_id: str, body: str, *, from_address=None):
         self.replies_sent.append((email_id, body, from_address))
@@ -84,3 +92,25 @@ def test_gmail_connector_can_send_reply_through_transport():
     assert transport.replies_sent == [
         ("gmail-1", "Thanks, I will send an update today.", "alias@example.com")
     ]
+
+
+def test_gmail_connector_can_manage_alias_routing_through_transport():
+    transport = StubGmailTransport()
+    client = GmailClient(transport=transport)
+
+    create_result = client.ensure_alias_routing(
+        "owner+ia-travel1234567@gmail.com",
+        label_name="InboxAnchor/Aliases/Travel",
+        dry_run=False,
+    )
+    remove_result = client.remove_alias_routing(
+        "owner+ia-travel1234567@gmail.com",
+        dry_run=False,
+    )
+
+    assert create_result.executed is True
+    assert remove_result.executed is True
+    assert transport.alias_routes_created == [
+        ("owner+ia-travel1234567@gmail.com", "InboxAnchor/Aliases/Travel")
+    ]
+    assert transport.alias_routes_removed == ["owner+ia-travel1234567@gmail.com"]

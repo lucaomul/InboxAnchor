@@ -645,25 +645,117 @@ def test_frontend_reply_send_works_for_supported_provider():
 
 
 def test_frontend_gmail_aliases_can_be_generated_and_revoked():
+    from inboxanchor.api.v1.routers import frontend as frontend_router
+
+    frontend_router.SETTINGS.alias_allow_plus_fallback = True
+    configured: list[tuple[str, str, str]] = []
+    removed: list[str] = []
+
+    def fake_configure(alias_address: str, *, label: str = "", purpose: str = "") -> str:
+        configured.append((alias_address, label, purpose))
+        return "InboxAnchor/Aliases/Travel"
+
+    def fake_remove(alias_address: str) -> None:
+        removed.append(alias_address)
+
+    original_configure = frontend_router._configure_alias_inbox_routing
+    original_remove = frontend_router._remove_alias_inbox_routing
+    frontend_router._configure_alias_inbox_routing = fake_configure
+    frontend_router._remove_alias_inbox_routing = fake_remove
+    try:
+        signup = client.post(
+            "/auth/signup",
+            json={
+                "full_name": "Alias Operator",
+                "email": "alias-owner@example.com",
+                "password": "alias-secret-pass",
+            },
+        )
+        token = signup.json()["token"]
+        client.put(
+            "/providers/gmail/connection",
+            json={
+                "status": "connected",
+                "account_hint": "owner@gmail.com",
+                "sync_enabled": True,
+                "dry_run_only": False,
+                "notes": "Connected for alias generation tests.",
+            },
+        )
+
+        generated = client.post(
+            "/aliases/generate",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"label": "travel", "purpose": "airlines"},
+        )
+        assert generated.status_code == 200
+        generated_payload = generated.json()
+        assert "+ia-travel" in generated_payload["alias_address"]
+        assert generated_payload["status"] == "active"
+        assert "InboxAnchor/Aliases/Travel" in generated_payload["note"]
+        assert configured == [(generated_payload["alias_address"], "travel", "airlines")]
+
+        listed = client.get("/aliases", headers={"Authorization": f"Bearer {token}"})
+        assert listed.status_code == 200
+        assert listed.json()["count"] == 1
+        assert configured[-1] == (generated_payload["alias_address"], "travel", "airlines")
+        assert len(configured) == 2
+
+        revoked = client.post(
+            f"/aliases/{generated_payload['id']}/revoke",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert revoked.status_code == 200
+        assert revoked.json()["status"] == "revoked"
+        assert removed == [generated_payload["alias_address"]]
+    finally:
+        frontend_router._configure_alias_inbox_routing = original_configure
+        frontend_router._remove_alias_inbox_routing = original_remove
+        frontend_router.SETTINGS.alias_allow_plus_fallback = False
+
+
+def test_frontend_alias_generation_requires_managed_domain_when_fallback_disabled():
+    from inboxanchor.api.v1.routers import frontend as frontend_router
+
+    frontend_router.SETTINGS.alias_managed_enabled = False
+    frontend_router.SETTINGS.alias_domain = ""
+    frontend_router.SETTINGS.alias_allow_plus_fallback = False
+
     signup = client.post(
         "/auth/signup",
         json={
-            "full_name": "Alias Operator",
-            "email": "alias-owner@example.com",
-            "password": "alias-secret-pass",
+            "full_name": "Strict Alias Operator",
+            "email": "strict-owner@example.com",
+            "password": "strict-alias-pass",
         },
     )
     token = signup.json()["token"]
-    client.put(
-        "/providers/gmail/connection",
+
+    generated = client.post(
+        "/aliases/generate",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"label": "travel", "purpose": "airlines"},
+    )
+
+    assert generated.status_code == 400
+    assert "Managed aliases like" in generated.json()["detail"]
+
+
+def test_frontend_managed_aliases_use_clean_domain(monkeypatch):
+    from inboxanchor.api.v1.routers import frontend as frontend_router
+
+    monkeypatch.setattr(frontend_router.SETTINGS, "alias_managed_enabled", True)
+    monkeypatch.setattr(frontend_router.SETTINGS, "alias_domain", "inboxanchor.com")
+
+    signup = client.post(
+        "/auth/signup",
         json={
-            "status": "connected",
-            "account_hint": "owner@gmail.com",
-            "sync_enabled": True,
-            "dry_run_only": False,
-            "notes": "Connected for alias generation tests.",
+            "full_name": "Managed Alias Operator",
+            "email": "managed-owner@example.com",
+            "password": "managed-alias-pass",
         },
     )
+    token = signup.json()["token"]
 
     generated = client.post(
         "/aliases/generate",
@@ -672,19 +764,88 @@ def test_frontend_gmail_aliases_can_be_generated_and_revoked():
     )
     assert generated.status_code == 200
     generated_payload = generated.json()
-    assert "+ia-travel-" in generated_payload["alias_address"]
-    assert generated_payload["status"] == "active"
+    assert generated_payload["alias_type"] == "managed"
+    assert generated_payload["provider"] == "inboxanchor"
+    assert generated_payload["alias_address"].startswith("travel")
+    assert generated_payload["alias_address"].endswith("@inboxanchor.com")
+    assert "InboxAnchor-managed privacy alias" in generated_payload["note"]
 
     listed = client.get("/aliases", headers={"Authorization": f"Bearer {token}"})
     assert listed.status_code == 200
-    assert listed.json()["count"] == 1
+    listed_payload = listed.json()
+    assert listed_payload["mode"] == "managed"
+    assert listed_payload["managed_enabled"] is True
+    assert listed_payload["domain"] == "inboxanchor.com"
 
-    revoked = client.post(
-        f"/aliases/{generated_payload['id']}/revoke",
-        headers={"Authorization": f"Bearer {token}"},
+
+def test_frontend_alias_resolve_returns_forwarding_payload(monkeypatch):
+    from inboxanchor.api.v1.routers import frontend as frontend_router
+
+    monkeypatch.setattr(frontend_router.SETTINGS, "alias_managed_enabled", True)
+    monkeypatch.setattr(frontend_router.SETTINGS, "alias_domain", "inboxanchor.com")
+    monkeypatch.setattr(
+        frontend_router.SETTINGS,
+        "alias_resolver_secret",
+        "resolver-secret",
     )
-    assert revoked.status_code == 200
-    assert revoked.json()["status"] == "revoked"
+
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "full_name": "Resolver Operator",
+            "email": "resolver-owner@example.com",
+            "password": "resolver-pass",
+        },
+    )
+    token = signup.json()["token"]
+
+    generated = client.post(
+        "/aliases/generate",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"label": "travel", "purpose": "airlines"},
+    )
+    alias_address = generated.json()["alias_address"]
+
+    resolved = client.post(
+        "/aliases/resolve",
+        headers={"X-InboxAnchor-Alias-Secret": "resolver-secret"},
+        json={
+            "alias_address": alias_address,
+            "sender": "alerts@airline.example",
+            "subject": "Boarding pass",
+        },
+    )
+
+    assert resolved.status_code == 200
+    payload = resolved.json()
+    assert payload["active"] is True
+    assert payload["action"] == "forward"
+    assert payload["alias_address"] == alias_address
+    assert payload["forward_to"] == "resolver-owner@example.com"
+    assert payload["skip_inbox"] is True
+    assert payload["label_name"] == "InboxAnchor/Aliases/Travel"
+
+
+def test_frontend_alias_resolve_rejects_unknown_alias(monkeypatch):
+    from inboxanchor.api.v1.routers import frontend as frontend_router
+
+    monkeypatch.setattr(
+        frontend_router.SETTINGS,
+        "alias_resolver_secret",
+        "resolver-secret",
+    )
+
+    resolved = client.post(
+        "/aliases/resolve",
+        headers={"X-InboxAnchor-Alias-Secret": "resolver-secret"},
+        json={"alias_address": "missing@inboxanchor.com"},
+    )
+
+    assert resolved.status_code == 200
+    payload = resolved.json()
+    assert payload["active"] is False
+    assert payload["action"] == "reject"
+    assert payload["reason"] == "Alias not found."
 
 
 def test_frontend_ops_backfill_can_resume_from_saved_offset(monkeypatch):

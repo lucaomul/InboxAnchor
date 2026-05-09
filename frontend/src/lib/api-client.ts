@@ -637,6 +637,10 @@ export interface EmailAlias {
 export interface EmailAliasListResponse {
   items: EmailAlias[];
   count: number;
+  mode?: "plus" | "managed";
+  domain?: string | null;
+  managed_enabled?: boolean;
+  plus_fallback_enabled?: boolean;
 }
 
 export async function fetchEmailAliases(status?: "active" | "revoked"): Promise<EmailAliasListResponse> {

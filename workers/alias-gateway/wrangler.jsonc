@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "inboxanchor-alias-gateway",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-05-09",
+  "send_email": [
+    {
+      "name": "alias-gateway"
+    }
+  ],
+  "vars": {
+    "INBOXANCHOR_BASE_URL": "https://your-inboxanchor-api.example.com",
+    "INBOXANCHOR_ALIAS_RESOLVER_SECRET": "replace-me"
+  }
+}

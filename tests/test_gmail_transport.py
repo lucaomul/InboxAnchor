@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from inboxanchor.connectors.gmail_transport import GoogleAPITransport
+from inboxanchor.models import EmailMessage
 
 
 class StubResponse:
@@ -272,6 +275,58 @@ def test_google_api_transport_applies_time_range_query_to_mailbox_backfill():
     assert "before:" in query
 
 
+def test_google_api_transport_incremental_batches_accept_time_range_and_filter_results():
+    transport = GoogleAPITransport(
+        credentials_path="~/credentials.json",
+        token_path="~/token.json",
+        session=StubSession([]),
+    )
+    include_body_calls: list[bool] = []
+
+    transport.list_changed_message_ids = lambda checkpoint, max_results=500: (  # type: ignore[method-assign]
+        ["recent", "old"],
+        "next-history",
+    )
+
+    def fake_get_message(email_id: str, include_body: bool = True) -> EmailMessage:
+        include_body_calls.append(include_body)
+        now = datetime.now(timezone.utc)
+        received_at = (
+            now - timedelta(days=1)
+            if email_id == "recent"
+            else now - timedelta(days=3650)
+        )
+        return EmailMessage(
+            id=email_id,
+            thread_id=f"thread-{email_id}",
+            sender="sender@example.com",
+            subject=f"Subject {email_id}",
+            snippet="Snippet",
+            body_preview="Body preview",
+            body_full="" if not include_body else "Full body",
+            received_at=received_at,
+            labels=["UNREAD", "INBOX"],
+            has_attachments=False,
+            unread=True,
+        )
+
+    transport.get_message = fake_get_message  # type: ignore[method-assign]
+
+    batches = list(
+        transport.iter_unread_batches_since(
+            "history-1",
+            limit=10,
+            batch_size=10,
+            include_body=False,
+            time_range="last_7_days",
+        )
+    )
+
+    assert len(batches) == 1
+    assert [email.id for email in batches[0]] == ["recent"]
+    assert include_body_calls == [False, False]
+
+
 def test_google_api_transport_mark_read_uses_batch_modify_endpoint():
     session = StubSession([StubResponse({})])
     transport = GoogleAPITransport(
@@ -309,6 +364,63 @@ def test_google_api_transport_apply_labels_uses_batch_modify_endpoint():
     assert session.calls[1][1].endswith("/users/me/messages/batchModify")
     assert session.calls[1][3]["ids"] == ["msg-1", "msg-2"]
     assert session.calls[1][3]["addLabelIds"] == ["Label_1"]
+
+
+def test_google_api_transport_can_create_alias_routing_filter():
+    session = StubSession(
+        [
+            StubResponse({"labels": []}),
+            StubResponse({"id": "Label_123"}),
+            StubResponse({"filter": []}),
+            StubResponse({"id": "Filter_123"}),
+        ]
+    )
+    transport = GoogleAPITransport(
+        credentials_path="~/credentials.json",
+        token_path="~/token.json",
+        session=session,
+    )
+
+    transport.ensure_alias_routing(
+        "owner+ia-travel1234567@gmail.com",
+        label_name="InboxAnchor/Aliases/Travel",
+    )
+
+    assert session.calls[0][1].endswith("/users/me/labels")
+    assert session.calls[1][0] == "POST"
+    assert session.calls[2][1].endswith("/users/me/settings/filters")
+    assert session.calls[3][3]["criteria"]["to"] == "owner+ia-travel1234567@gmail.com"
+    assert session.calls[3][3]["action"]["removeLabelIds"] == ["INBOX"]
+    assert session.calls[3][3]["action"]["addLabelIds"] == ["Label_123"]
+
+
+def test_google_api_transport_can_remove_alias_routing_filter():
+    session = StubSession(
+        [
+            StubResponse(
+                {
+                    "filter": [
+                        {
+                            "id": "Filter_123",
+                            "criteria": {"to": "owner+ia-travel1234567@gmail.com"},
+                        }
+                    ]
+                }
+            ),
+            StubResponse({}),
+        ]
+    )
+    transport = GoogleAPITransport(
+        credentials_path="~/credentials.json",
+        token_path="~/token.json",
+        session=session,
+    )
+
+    transport.remove_alias_routing("owner+ia-travel1234567@gmail.com")
+
+    assert session.calls[0][1].endswith("/users/me/settings/filters")
+    assert session.calls[1][0] == "DELETE"
+    assert session.calls[1][1].endswith("/users/me/settings/filters/Filter_123")
 
 
 def test_google_api_transport_can_send_reply_via_authorized_session():

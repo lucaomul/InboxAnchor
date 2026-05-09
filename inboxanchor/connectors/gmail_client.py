@@ -30,6 +30,8 @@ class GmailTransport(Protocol):
     def archive(self, email_ids: list[str]) -> None: ...
     def trash(self, email_ids: list[str]) -> None: ...
     def apply_labels(self, email_ids: list[str], labels: list[str]) -> None: ...
+    def ensure_alias_routing(self, alias_address: str, *, label_name: str) -> None: ...
+    def remove_alias_routing(self, alias_address: str) -> None: ...
     def send_reply(
         self,
         email_id: str,
@@ -264,6 +266,52 @@ class GmailClient(EmailProvider):
             dry_run=dry_run,
             executed=not dry_run,
             details=f"Gmail labels prepared: {', '.join(labels)}",
+        )
+
+    def ensure_alias_routing(
+        self,
+        alias_address: str,
+        *,
+        label_name: str,
+        dry_run: bool = True,
+    ) -> ProviderActionResult:
+        if not dry_run:
+            self._require_transport().ensure_alias_routing(
+                alias_address,
+                label_name=label_name,
+            )
+        return ProviderActionResult(
+            provider=self.provider_name,
+            action="configure_alias_routing",
+            email_ids=[],
+            dry_run=dry_run,
+            executed=not dry_run,
+            details=(
+                f"Gmail alias routing prepared for {alias_address} -> {label_name}"
+                if dry_run
+                else f"Gmail alias routing installed for {alias_address} -> {label_name}"
+            ),
+        )
+
+    def remove_alias_routing(
+        self,
+        alias_address: str,
+        *,
+        dry_run: bool = True,
+    ) -> ProviderActionResult:
+        if not dry_run:
+            self._require_transport().remove_alias_routing(alias_address)
+        return ProviderActionResult(
+            provider=self.provider_name,
+            action="remove_alias_routing",
+            email_ids=[],
+            dry_run=dry_run,
+            executed=not dry_run,
+            details=(
+                f"Gmail alias routing removal prepared for {alias_address}"
+                if dry_run
+                else f"Gmail alias routing removed for {alias_address}"
+            ),
         )
 
     def send_reply(

@@ -46,6 +46,10 @@ function SettingsPage() {
   const [webhookDetails, setWebhookDetails] = useState<{ uptime: number; clients: number; lastEvent: string | null } | null>(null);
   const [aliasLabel, setAliasLabel] = useState("");
   const [aliasPurpose, setAliasPurpose] = useState("");
+  const [aliasMode, setAliasMode] = useState<"plus" | "managed">("plus");
+  const [aliasDomain, setAliasDomain] = useState("");
+  const [managedAliasEnabled, setManagedAliasEnabled] = useState(false);
+  const [plusFallbackEnabled, setPlusFallbackEnabled] = useState(false);
   const [aliasItems, setAliasItems] = useState<Array<{
     id: number;
     alias_address: string;
@@ -115,6 +119,10 @@ function SettingsPage() {
     try {
       const response = await fetchEmailAliases();
       setAliasItems(response.items);
+      setAliasMode(response.mode === "managed" ? "managed" : "plus");
+      setAliasDomain(response.domain || "");
+      setManagedAliasEnabled(Boolean(response.managed_enabled));
+      setPlusFallbackEnabled(Boolean(response.plus_fallback_enabled));
       setAliasError("");
     } catch (err) {
       setAliasError(err instanceof Error ? err.message : "Unable to load aliases");
@@ -213,6 +221,12 @@ function SettingsPage() {
         purpose: aliasPurpose,
       });
       setAliasItems((previous) => [created, ...previous]);
+      setAliasMode(created.alias_type === "managed" ? "managed" : "plus");
+      if (created.alias_type === "managed") {
+        const generatedDomain = created.alias_address.split("@")[1] || "";
+        setAliasDomain(generatedDomain);
+        setManagedAliasEnabled(true);
+      }
       setAliasLabel("");
       setAliasPurpose("");
       toast.success("Privacy alias created");
@@ -421,17 +435,67 @@ function SettingsPage() {
               <h2 className="text-sm font-semibold text-foreground">Privacy Aliases</h2>
             </div>
             <p className="text-xs text-muted-foreground">
-              Generate disposable Gmail-style aliases so you can share a safer address for signups,
-              newsletters, or vendors without handing out the core inbox address everywhere.
+              Generate privacy aliases for signups, newsletters, and vendors without giving your
+              core inbox address to every service you touch. When live Gmail routing is available,
+              InboxAnchor can also auto-label alias mail and keep it out of the primary inbox.
             </p>
             <div className="rounded-md border border-border bg-secondary/30 p-3 text-xs leading-5 text-muted-foreground">
-              Gmail plus aliases still land in your normal inbox automatically. Revoking one in
-              InboxAnchor stops future reuse here, but Gmail still controls delivery for addresses
-              that were already shared externally.
+              {managedAliasEnabled ? (
+                <>
+                  InboxAnchor is using its managed alias domain
+                  {" "}
+                  <span className="font-medium text-foreground">{aliasDomain}</span>
+                  {" "}
+                  for cleaner addresses like
+                  {" "}
+                  <span className="font-medium text-foreground">
+                    travel1234567@{aliasDomain}
+                  </span>.
+                </>
+              ) : (
+                <>
+                  InboxAnchor alias domain is not configured yet.
+                  {plusFallbackEnabled ? (
+                    <>
+                      {" "}
+                      This workspace still allows Gmail plus-addressing as an explicit fallback,
+                      but those aliases expose part of the underlying mailbox address because Gmail
+                      requires the original local-part before the
+                      {" "}
+                      <span className="font-medium text-foreground">+</span>
+                      {" "}
+                      tag.
+                    </>
+                  ) : (
+                    <>
+                      {" "}
+                      Gmail plus-addressing fallback is disabled so InboxAnchor does not expose
+                      your real mailbox address.
+                    </>
+                  )}
+                </>
+              )}
             </div>
+            {!managedAliasEnabled ? (
+              <div className="rounded-md border border-warning/30 bg-warning/5 p-3 text-[11px] leading-5 text-warning">
+                To get product-owned aliases like
+                {" "}
+                <span className="font-medium">travel1234567@inboxanchor.com</span>
+                {" "}
+                instead of exposing the Gmail local-part, configure
+                {" "}
+                <span className="font-medium">INBOXANCHOR_ALIAS_MANAGED_ENABLED=true</span>
+                {" "}
+                and
+                {" "}
+                <span className="font-medium">INBOXANCHOR_ALIAS_DOMAIN=your-domain.com</span>
+                {" "}
+                on the backend after inbound forwarding is ready.
+              </div>
+            ) : null}
             {!authEmail ? (
               <p className="text-xs text-warning">Log in to manage privacy aliases.</p>
-            ) : !gmailConnected ? (
+            ) : !gmailConnected && !managedAliasEnabled && plusFallbackEnabled ? (
               <p className="text-xs text-warning">Connect Gmail first to generate privacy aliases.</p>
             ) : (
               <>
@@ -447,8 +511,17 @@ function SettingsPage() {
                     placeholder="Purpose (example: airline promos)"
                   />
                 </div>
-                <Button onClick={handleGenerateAlias} disabled={aliasLoading}>
-                  {aliasLoading ? "Generating..." : "Generate privacy alias"}
+                <Button
+                  onClick={handleGenerateAlias}
+                  disabled={aliasLoading || (!managedAliasEnabled && !plusFallbackEnabled)}
+                >
+                  {aliasLoading
+                    ? "Generating..."
+                    : managedAliasEnabled
+                      ? "Generate InboxAnchor alias"
+                      : plusFallbackEnabled
+                        ? "Generate Gmail fallback alias"
+                        : "Managed alias domain required"}
                 </Button>
                 {aliasError ? (
                   <p className="text-xs text-destructive">{aliasError}</p>

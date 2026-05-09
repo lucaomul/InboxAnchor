@@ -53,6 +53,16 @@ class Settings:
     )
     gmail_pubsub_topic: str = os.getenv("GMAIL_PUBSUB_TOPIC", "")
     gmail_watch_label_ids: str = os.getenv("GMAIL_WATCH_LABEL_IDS", "INBOX")
+    alias_managed_enabled: bool = _as_bool(
+        os.getenv("INBOXANCHOR_ALIAS_MANAGED_ENABLED"),
+        False,
+    )
+    alias_domain: str = os.getenv("INBOXANCHOR_ALIAS_DOMAIN", "")
+    alias_allow_plus_fallback: bool = _as_bool(
+        os.getenv("INBOXANCHOR_ALIAS_ALLOW_PLUS_FALLBACK"),
+        False,
+    )
+    alias_resolver_secret: str = os.getenv("INBOXANCHOR_ALIAS_RESOLVER_SECRET", "")
     imap_host: str = os.getenv("IMAP_HOST", "")
     imap_port: int = int(os.getenv("IMAP_PORT", "993"))
     imap_username: str = os.getenv("IMAP_USERNAME", "")

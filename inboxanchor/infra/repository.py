@@ -625,6 +625,17 @@ class InboxRepository:
             return None
         return self._alias_model(row)
 
+    def get_email_alias_by_address(self, alias_address: str) -> Optional[EmailAlias]:
+        row = (
+            self.session.query(EmailAliasORM)
+            .filter(EmailAliasORM.alias_address == alias_address.strip().lower())
+            .order_by(EmailAliasORM.created_at.desc())
+            .first()
+        )
+        if row is None:
+            return None
+        return self._alias_model(row)
+
     def revoke_email_alias(self, alias_id: int) -> Optional[EmailAlias]:
         row = self.session.get(EmailAliasORM, alias_id)
         if row is None:

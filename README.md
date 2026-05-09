@@ -16,7 +16,7 @@ InboxAnchor is a safety-first inbox triage system for overloaded email accounts.
 - Builds a local mailbox-memory cache for older email history, resumes historical syncs, and hydrates full bodies lazily when needed
 - Scopes scans, labeling, cleanup, and mailbox-memory backfill to practical windows such as today, last month, last year, or 10+ years ago
 - Supports bulk lane actions, operator playbooks, focus views, follow-up radar, and reminder center workflows in the dashboard
-- Generates and manages privacy aliases for Gmail-style plus-addressing so users can shield their primary inbox address
+- Generates and manages product-owned privacy aliases, with a managed-domain path for clean addresses such as `travel1234567@inboxanchor.com`
 - Exposes a FastAPI backend and a Streamlit workspace on top of the same core engine
 - Includes a full React frontend in `frontend/` with a premium command center, welcome/auth flow, inbox workspace, and settings surface wired to the FastAPI backend
 
@@ -218,6 +218,26 @@ Important:
 ## Authentication
 
 The Streamlit workspace is account-aware and requires sign-in unless you intentionally use demo mode.
+
+## Managed Alias Gateway
+
+InboxAnchor now treats clean privacy aliases as a first-class product feature instead of relying on
+Gmail plus-addressing by default.
+
+- Managed aliases require:
+  - `INBOXANCHOR_ALIAS_MANAGED_ENABLED=true`
+  - `INBOXANCHOR_ALIAS_DOMAIN=your-domain.com`
+  - `INBOXANCHOR_ALIAS_RESOLVER_SECRET=...`
+- The backend exposes `POST /aliases/resolve` for an inbound alias gateway.
+- A Cloudflare Email Worker scaffold lives in `workers/alias-gateway/`.
+- The intended flow is:
+  1. Email is sent to `alias@your-domain.com`
+  2. Cloudflare Email Routing sends it to the Worker
+  3. The Worker calls InboxAnchor to resolve whether the alias is active
+  4. Active aliases forward to the target inbox
+  5. Revoked aliases are rejected
+
+This lets InboxAnchor own the public alias address while still forwarding to the user’s real inbox.
 
 - passwords are hashed with `pbkdf2_sha256`
 - iteration count: `240000`

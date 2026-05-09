@@ -10,7 +10,11 @@ from pydantic import BaseModel
 
 from inboxanchor.api.v1.routers.frontend import mark_frontend_provider_dirty
 from inboxanchor.config.settings import SETTINGS
-from inboxanchor.connectors.gmail_transport import GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE
+from inboxanchor.connectors.gmail_transport import (
+    GMAIL_MODIFY_SCOPE,
+    GMAIL_SEND_SCOPE,
+    GMAIL_SETTINGS_BASIC_SCOPE,
+)
 from inboxanchor.connectors.oauth_flow import build_authorization_url, exchange_code_for_token
 from inboxanchor.infra.auth import AuthError, AuthService
 from inboxanchor.infra.database import session_scope
@@ -18,7 +22,7 @@ from inboxanchor.infra.repository import InboxRepository
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 GMAIL_PKCE_REGISTRY: dict[str, dict[str, str]] = {}
-GMAIL_AUTH_SCOPES = [GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE]
+GMAIL_AUTH_SCOPES = [GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE, GMAIL_SETTINGS_BASIC_SCOPE]
 
 
 class SignupRequest(BaseModel):
