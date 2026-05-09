@@ -4,6 +4,7 @@ from copy import deepcopy
 from typing import Optional
 
 from inboxanchor.connectors.base import EmailProvider, ProviderActionResult
+from inboxanchor.core.time_windows import in_time_window
 from inboxanchor.models import EmailMessage
 
 
@@ -19,8 +20,17 @@ class FakeEmailProvider(EmailProvider):
         self.provider_name = provider_name
         self._emails = {email.id: deepcopy(email) for email in emails or []}
 
-    def list_unread(self, limit: int = 50, include_body: bool = True) -> list[EmailMessage]:
-        unread = [deepcopy(email) for email in self._emails.values() if email.unread]
+    def list_unread(
+        self,
+        limit: int = 50,
+        include_body: bool = True,
+        time_range: Optional[str] = None,
+    ) -> list[EmailMessage]:
+        unread = [
+            deepcopy(email)
+            for email in self._emails.values()
+            if email.unread and in_time_window(email.received_at, time_range)
+        ]
         unread.sort(key=lambda item: item.received_at, reverse=True)
         return unread[:limit]
 
@@ -30,8 +40,13 @@ class FakeEmailProvider(EmailProvider):
         limit: int = 50,
         batch_size: int = 100,
         include_body: bool = True,
+        time_range: Optional[str] = None,
     ):
-        unread = self.list_unread(limit=limit, include_body=include_body)
+        unread = self.list_unread(
+            limit=limit,
+            include_body=include_body,
+            time_range=time_range,
+        )
         for start in range(0, len(unread), batch_size):
             yield unread[start : start + batch_size]
 
@@ -43,10 +58,13 @@ class FakeEmailProvider(EmailProvider):
         include_body: bool = False,
         unread_only: bool = False,
         offset: int = 0,
+        time_range: Optional[str] = None,
     ):
         emails = [deepcopy(email) for email in self._emails.values()]
         if unread_only:
             emails = [email for email in emails if email.unread]
+        if time_range:
+            emails = [email for email in emails if in_time_window(email.received_at, time_range)]
         emails.sort(key=lambda item: item.received_at, reverse=True)
         emails = emails[offset : offset + limit]
         if not include_body:

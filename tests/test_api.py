@@ -631,6 +631,7 @@ def test_frontend_ops_backfill_can_resume_from_saved_offset(monkeypatch):
             include_body: bool = False,
             unread_only: bool = False,
             offset: int = 0,
+            time_range: Optional[str] = None,
         ):
             calls.append(
                 {
@@ -639,6 +640,7 @@ def test_frontend_ops_backfill_can_resume_from_saved_offset(monkeypatch):
                     "include_body": include_body,
                     "unread_only": unread_only,
                     "offset": offset,
+                    "time_range": time_range,
                 }
             )
             selected = emails[offset : offset + limit]
@@ -653,12 +655,12 @@ def test_frontend_ops_backfill_can_resume_from_saved_offset(monkeypatch):
     monkeypatch.setattr(
         frontend_router,
         "_get_cached_or_latest_run_id",
-        lambda provider_name: "resume-run",
+        lambda provider_name, **kwargs: "resume-run",
     )
     monkeypatch.setattr(
         frontend_router,
         "_build_ops_overview",
-        lambda provider_name, run_id: {
+        lambda provider_name, run_id, **kwargs: {
             "provider": provider_name,
             "runId": run_id,
             "cachedEmailsCount": 6,
@@ -672,13 +674,20 @@ def test_frontend_ops_backfill_can_resume_from_saved_offset(monkeypatch):
 
     first = client.post(
         "/ops/backfill",
-        json={"provider": "gmail", "limit": 25, "batch_size": 10},
+        json={"provider": "gmail", "limit": 25, "batch_size": 10, "time_range": "last_1_year"},
     )
     second = client.post(
         "/ops/backfill",
-        json={"provider": "gmail", "limit": 40, "batch_size": 10},
+        json={"provider": "gmail", "limit": 40, "batch_size": 10, "time_range": "last_1_year"},
     )
-    progress = client.get("/ops/progress", params={"provider": "gmail"})
+    third = client.post(
+        "/ops/backfill",
+        json={"provider": "gmail", "limit": 25, "batch_size": 10, "time_range": "last_month"},
+    )
+    progress = client.get(
+        "/ops/progress",
+        params={"provider": "gmail", "time_range": "last_1_year"},
+    )
 
     assert first.status_code == 200
     assert first.json()["processedTotal"] == 25
@@ -686,11 +695,25 @@ def test_frontend_ops_backfill_can_resume_from_saved_offset(monkeypatch):
     assert second.json()["count"] == 15
     assert second.json()["processedTotal"] == 40
     assert second.json()["resumeOffset"] == 40
+    assert third.status_code == 200
+    assert third.json()["resumeOffset"] == 25
     assert calls[0]["offset"] == 0
     assert calls[1]["offset"] == 25
+    assert calls[2]["offset"] == 0
+    assert calls[0]["time_range"] == "last_1_year"
+    assert calls[2]["time_range"] == "last_month"
     assert progress.status_code == 200
     assert progress.json()["resume_offset"] == 40
     assert progress.json()["completed"] is True
+
+
+def test_frontend_ops_overview_returns_selected_time_range():
+    response = client.get("/ops/overview", params={"time_range": "last_6_months"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["timeRange"] == "last_6_months"
+    assert payload["timeRangeLabel"] == "Last 6 months"
 
 
 def test_frontend_ops_overview_surfaces_live_provider_fetch_failure(monkeypatch):
@@ -765,8 +788,10 @@ def test_frontend_initial_live_run_bootstraps_with_smaller_limit(monkeypatch):
 
 
 def test_frontend_ops_progress_reflects_registry_state():
-    frontend_router.FRONTEND_PROGRESS["gmail"] = {
+    frontend_router.FRONTEND_PROGRESS["gmail::all_time"] = {
         "provider": "gmail",
+        "time_range": "all_time",
+        "time_range_label": "All time",
         "status": "running",
         "stage": "triaging",
         "target_count": 50,
@@ -882,8 +907,8 @@ def test_frontend_zero_live_run_triggers_fresh_refresh(monkeypatch):
     class ProbeProvider:
         provider_name = "gmail"
 
-        def list_unread(self, limit=50, include_body=True):
-            del limit, include_body
+        def list_unread(self, limit=50, include_body=True, time_range=None):
+            del limit, include_body, time_range
             return [SimpleNamespace(id="msg-live")]
 
     class RefreshEngine:

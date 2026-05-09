@@ -65,6 +65,7 @@ class TriageEngine:
         recommendation_preview_limit: int = 150,
         workspace_policy: Optional[WorkspacePolicy] = None,
         progress_callback: Optional[Callable[[dict], None]] = None,
+        time_range: Optional[str] = None,
     ) -> TriageRunResult:
         workspace_policy = workspace_policy or WorkspacePolicy()
         classifications: dict[str, EmailClassification] = {}
@@ -96,6 +97,7 @@ class TriageEngine:
             limit=limit,
             batch_size=batch_size,
             include_body=True,
+            time_range=time_range,
         ):
             batch_count += 1
             if progress_callback:

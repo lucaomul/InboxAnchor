@@ -18,6 +18,7 @@ import {
   type FetchEmailsParams,
   type StreamStatus,
 } from "@/lib/api-client";
+import type { MailboxTimeRange } from "@/lib/time-range";
 import {
   MOCK_EMAILS,
   MOCK_CLASSIFICATIONS,
@@ -50,61 +51,65 @@ export function useEmails(params?: FetchEmailsParams) {
   });
 }
 
-export function useEmailDetail(emailId: string | null) {
+export function useEmailDetail(emailId: string | null, timeRange: MailboxTimeRange) {
   return useQuery({
-    queryKey: ["emailDetail", emailId],
+    queryKey: ["emailDetail", emailId, timeRange],
     queryFn: async () => {
       if (!emailId || !isApiConfigured()) {
         return null;
       }
-      return fetchEmailById(emailId);
+      return fetchEmailById(emailId, timeRange);
     },
     enabled: !!emailId && isApiConfigured(),
     staleTime: 30_000,
   });
 }
 
-export function useClassifications() {
+export function useClassifications(timeRange: MailboxTimeRange) {
   return useQuery({
-    queryKey: ["classifications"],
+    queryKey: ["classifications", timeRange],
     queryFn: async () => {
       if (!isApiConfigured()) return MOCK_CLASSIFICATIONS;
-      return fetchClassifications();
+      return fetchClassifications(timeRange);
     },
     staleTime: 30_000,
   });
 }
 
-export function useRecommendations(emailId?: string | null, enabled: boolean = true) {
+export function useRecommendations(
+  emailId: string | null | undefined,
+  timeRange: MailboxTimeRange,
+  enabled: boolean = true,
+) {
   return useQuery({
-    queryKey: ["recommendations", emailId || "all"],
+    queryKey: ["recommendations", emailId || "all", timeRange],
     queryFn: async () => {
       if (!isApiConfigured()) return MOCK_RECOMMENDATIONS;
-      return fetchRecommendations(emailId);
+      return fetchRecommendations(emailId, timeRange);
     },
     enabled,
     staleTime: 30_000,
   });
 }
 
-export function useDigest() {
+export function useDigest(timeRange: MailboxTimeRange) {
   return useQuery({
-    queryKey: ["digest"],
+    queryKey: ["digest", timeRange],
     queryFn: async () => {
       if (!isApiConfigured()) return MOCK_DIGEST;
-      return fetchDigest();
+      return fetchDigest(timeRange);
     },
     staleTime: 30_000,
   });
 }
 
-export function useActionItems(emailId: string | null) {
+export function useActionItems(emailId: string | null, timeRange: MailboxTimeRange) {
   return useQuery({
-    queryKey: ["actions", emailId],
+    queryKey: ["actions", emailId, timeRange],
     queryFn: async () => {
       if (!emailId) return [];
       if (!isApiConfigured()) return MOCK_ACTION_ITEMS[emailId] || [];
-      return fetchActionItems(emailId);
+      return fetchActionItems(emailId, timeRange);
     },
     enabled: !!emailId,
     staleTime: 60_000,
@@ -157,8 +162,15 @@ function useInvalidateAll() {
 export function useApplyRecommendation() {
   const invalidate = useInvalidateAll();
   return useMutation({
-    mutationFn: ({ emailId, action }: { emailId: string; action: string }) =>
-      applyRecommendation(emailId, action),
+    mutationFn: ({
+      emailId,
+      action,
+      timeRange,
+    }: {
+      emailId: string;
+      action: string;
+      timeRange: MailboxTimeRange;
+    }) => applyRecommendation(emailId, action, timeRange),
     onSuccess: () => {
       invalidate();
       toast.success("Action applied successfully");
@@ -170,8 +182,15 @@ export function useApplyRecommendation() {
 export function useApproveRecommendation() {
   const invalidate = useInvalidateAll();
   return useMutation({
-    mutationFn: ({ emailId, action }: { emailId: string; action: string }) =>
-      approveRecommendation(emailId, action),
+    mutationFn: ({
+      emailId,
+      action,
+      timeRange,
+    }: {
+      emailId: string;
+      action: string;
+      timeRange: MailboxTimeRange;
+    }) => approveRecommendation(emailId, action, timeRange),
     onSuccess: () => {
       invalidate();
       toast.success("Recommendation approved");
@@ -183,8 +202,15 @@ export function useApproveRecommendation() {
 export function useBlockRecommendation() {
   const invalidate = useInvalidateAll();
   return useMutation({
-    mutationFn: ({ emailId, action }: { emailId: string; action: string }) =>
-      blockRecommendation(emailId, action),
+    mutationFn: ({
+      emailId,
+      action,
+      timeRange,
+    }: {
+      emailId: string;
+      action: string;
+      timeRange: MailboxTimeRange;
+    }) => blockRecommendation(emailId, action, timeRange),
     onSuccess: () => {
       invalidate();
       toast("Recommendation blocked", { description: "This action will not be applied automatically." });
@@ -196,7 +222,7 @@ export function useBlockRecommendation() {
 export function useApplyAllSafe() {
   const invalidate = useInvalidateAll();
   return useMutation({
-    mutationFn: applyAllSafe,
+    mutationFn: (timeRange: MailboxTimeRange) => applyAllSafe(timeRange),
     onSuccess: () => {
       invalidate();
       toast.success("All safe actions applied!");

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 from inboxanchor.core.triage_engine import TriageEngine
 from inboxanchor.infra.database import session_scope
 from inboxanchor.infra.repository import InboxRepository
@@ -20,7 +22,20 @@ class _IncrementalProviderProxy:
         limit: int = 50,
         batch_size: int = 100,
         include_body: bool = True,
+        time_range: Optional[str] = None,
     ):
+        if time_range:
+            try:
+                return self.provider.iter_unread_batches_since(
+                    self.checkpoint,
+                    limit=limit,
+                    batch_size=batch_size,
+                    include_body=include_body,
+                    time_range=time_range,
+                )
+            except TypeError as exc:
+                if "time_range" not in str(exc):
+                    raise
         return self.provider.iter_unread_batches_since(
             self.checkpoint,
             limit=limit,

@@ -21,6 +21,7 @@ import { useAuth } from "@/hooks/use-auth";
 import { useDebounce } from "@/hooks/use-debounce";
 import { useTheme } from "@/hooks/use-theme";
 import { useOpsProgress } from "@/hooks/use-ops";
+import { useMailboxTimeRange } from "@/hooks/use-mailbox-time-range";
 import { StickmanLoader, StickmanEmpty, StickmanStyles } from "@/components/StickmenAnimations";
 import { Input } from "@/components/ui/input";
 import {
@@ -42,6 +43,8 @@ import {
   X,
 } from "lucide-react";
 import { getApiUrl } from "@/lib/api-client";
+import { MAILBOX_TIME_RANGE_OPTIONS } from "@/lib/time-range";
+import type { MailboxTimeRange } from "@/lib/time-range";
 
 type View = "inbox" | "lanes";
 
@@ -58,6 +61,7 @@ export function InboxWorkspace() {
   const [page, setPage] = useState(0);
   const [showThemePicker, setShowThemePicker] = useState(false);
   const { theme, setTheme, themes } = useTheme();
+  const { timeRange, setTimeRange } = useMailboxTimeRange();
 
   const apiConnected = typeof window !== "undefined" && !!getApiUrl();
   const emailQueryParams = useMemo(
@@ -67,8 +71,9 @@ export function InboxWorkspace() {
       q: debouncedSearch || undefined,
       category: filterCategory || undefined,
       priority: filterPriority || undefined,
+      time_range: timeRange,
     }),
-    [debouncedSearch, filterCategory, filterPriority, page],
+    [debouncedSearch, filterCategory, filterPriority, page, timeRange],
   );
   const {
     data: emailsData,
@@ -82,14 +87,15 @@ export function InboxWorkspace() {
     error: recommendationsError,
   } = useRecommendations(
     view === "lanes" ? null : selectedEmailId,
+    timeRange,
     view === "lanes" || !!selectedEmailId,
   );
-  const { data: digest, isLoading: digestLoading, error: digestError } = useDigest();
-  const { data: selectedActions } = useActionItems(selectedEmailId);
-  const { data: selectedEmailDetail } = useEmailDetail(selectedEmailId);
+  const { data: digest, isLoading: digestLoading, error: digestError } = useDigest(timeRange);
+  const { data: selectedActions } = useActionItems(selectedEmailId, timeRange);
+  const { data: selectedEmailDetail } = useEmailDetail(selectedEmailId, timeRange);
   const { data: webhookHealth } = useWebhookHealth();
   const { status: streamStatus } = useEmailStream();
-  const { data: progress } = useOpsProgress(emailsLoading || digestLoading || recsLoading);
+  const { data: progress } = useOpsProgress(timeRange, emailsLoading || digestLoading || recsLoading);
 
   const emails = emailsData?.emails || [];
   const recs = recommendations || [];
@@ -103,7 +109,7 @@ export function InboxWorkspace() {
   useEffect(() => {
     setPage(0);
     setSelectedEmailId(null);
-  }, [debouncedSearch, filterCategory, filterPriority]);
+  }, [debouncedSearch, filterCategory, filterPriority, timeRange]);
 
   useEffect(() => {
     if (!selectedEmailId && emails.length > 0) {
@@ -124,7 +130,11 @@ export function InboxWorkspace() {
     ? recs.filter((r) => r.emailId === selectedEmailId)
     : [];
 
-  const hasFilters = !!debouncedSearch || !!filterCategory || !!filterPriority;
+  const hasFilters =
+    !!debouncedSearch
+    || !!filterCategory
+    || !!filterPriority
+    || timeRange !== "all_time";
   const totalFiltered = emailsData?.total || 0;
   const totalPages = Math.max(1, Math.ceil(totalFiltered / PAGE_SIZE));
   const pagedEmails = emails;
@@ -311,6 +321,17 @@ export function InboxWorkspace() {
           />
         </div>
         <select
+          value={timeRange}
+          onChange={(e) => setTimeRange(e.target.value as MailboxTimeRange)}
+          className="h-8 rounded-md border border-input bg-transparent px-2 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+        >
+          {MAILBOX_TIME_RANGE_OPTIONS.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+        <select
           value={filterCategory}
           onChange={(e) => setFilterCategory(e.target.value as EmailCategory | "")}
           className="h-8 rounded-md border border-input bg-transparent px-2 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
@@ -340,6 +361,7 @@ export function InboxWorkspace() {
           <button
             onClick={() => {
               setSearchQuery("");
+              setTimeRange("all_time");
               setFilterCategory("");
               setFilterPriority("");
             }}
@@ -463,6 +485,7 @@ export function InboxWorkspace() {
                   classification={selectedClassification}
                   recommendations={selectedRecs}
                   actionItems={selectedActions || []}
+                  timeRange={timeRange}
                 />
               ) : (
                 <div className="flex items-center justify-center h-full">

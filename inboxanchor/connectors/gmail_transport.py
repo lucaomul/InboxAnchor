@@ -14,6 +14,7 @@ from urllib.parse import quote
 
 from inboxanchor.connectors.gmail_client import GmailTransport
 from inboxanchor.connectors.oauth_flow import get_credentials
+from inboxanchor.core.time_windows import gmail_query_with_time_range
 from inboxanchor.models import EmailMessage
 
 logger = logging.getLogger(__name__)
@@ -305,14 +306,21 @@ class GoogleAPITransport(GmailTransport):
             unread="UNREAD" in labels,
         )
 
-    def _prime_page_token(self, *, limit: int, offset: int) -> Optional[str]:
+    def _prime_page_token(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        time_range: Optional[str] = None,
+    ) -> Optional[str]:
         current_offset = 0
         token = None
+        query = gmail_query_with_time_range("is:unread", time_range)
         while current_offset < offset:
             token = self._page_tokens.get(current_offset)
             if token is None and current_offset != 0:
                 return None
-            response = self._list_message_refs(limit=limit, page_token=token, q="is:unread")
+            response = self._list_message_refs(limit=limit, page_token=token, q=query)
             refs = response.get("messages", []) or []
             if not refs:
                 return None
@@ -322,25 +330,48 @@ class GoogleAPITransport(GmailTransport):
             token = next_token
         return self._page_tokens.get(offset)
 
-    def list_unread(self, limit: int) -> list[EmailMessage]:
+    def list_unread(
+        self,
+        limit: int,
+        *,
+        time_range: Optional[str] = None,
+    ) -> list[EmailMessage]:
         emails: list[EmailMessage] = []
         fetched = 0
         self._page_tokens = {0: None}
         while fetched < limit:
-            page = self.list_unread_page(min(100, limit - fetched), fetched)
+            page = self.list_unread_page(
+                min(100, limit - fetched),
+                fetched,
+                time_range=time_range,
+            )
             if not page:
                 break
             emails.extend(page)
             fetched += len(page)
         return emails
 
-    def list_unread_page(self, limit: int, offset: int) -> list[EmailMessage]:
+    def list_unread_page(
+        self,
+        limit: int,
+        offset: int,
+        *,
+        time_range: Optional[str] = None,
+    ) -> list[EmailMessage]:
         page_token = self._page_tokens.get(offset)
         if offset and offset not in self._page_tokens:
-            page_token = self._prime_page_token(limit=limit, offset=offset)
+            page_token = self._prime_page_token(
+                limit=limit,
+                offset=offset,
+                time_range=time_range,
+            )
         elif offset and page_token is None:
             return []
-        response = self._list_message_refs(limit=limit, page_token=page_token, q="is:unread")
+        response = self._list_message_refs(
+            limit=limit,
+            page_token=page_token,
+            q=gmail_query_with_time_range("is:unread", time_range),
+        )
         refs = response.get("messages", []) or []
         self._page_tokens[offset + len(refs)] = response.get("nextPageToken")
         return [
@@ -366,11 +397,12 @@ class GoogleAPITransport(GmailTransport):
         include_body: bool = False,
         unread_only: bool = False,
         offset: int = 0,
+        time_range: Optional[str] = None,
     ):
         remaining = limit
         page_token = None
         skipped = 0
-        query = "is:unread" if unread_only else None
+        query = gmail_query_with_time_range("is:unread" if unread_only else None, time_range)
         page_size = min(max(batch_size, 1), 500)
 
         while skipped < offset:

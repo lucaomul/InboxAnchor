@@ -7,7 +7,12 @@ from inboxanchor.models import EmailMessage
 
 
 class GmailTransport(Protocol):
-    def list_unread(self, limit: int) -> list[EmailMessage]: ...
+    def list_unread(
+        self,
+        limit: int,
+        *,
+        time_range: Optional[str] = None,
+    ) -> list[EmailMessage]: ...
     def list_unread_page(self, limit: int, offset: int) -> list[EmailMessage]: ...
     def get_message(self, email_id: str, include_body: bool = True) -> EmailMessage: ...
     def get_body(self, email_id: str) -> str: ...
@@ -19,6 +24,7 @@ class GmailTransport(Protocol):
         include_body: bool = False,
         unread_only: bool = False,
         offset: int = 0,
+        time_range: Optional[str] = None,
     ): ...
     def mark_read(self, email_ids: list[str]) -> None: ...
     def archive(self, email_ids: list[str]) -> None: ...
@@ -47,8 +53,16 @@ class GmailClient(EmailProvider):
             )
         return self.transport
 
-    def list_unread(self, limit: int = 50, include_body: bool = True) -> list[EmailMessage]:
-        return self._require_transport().list_unread(limit)
+    def list_unread(
+        self,
+        limit: int = 50,
+        include_body: bool = True,
+        time_range: Optional[str] = None,
+    ) -> list[EmailMessage]:
+        transport = self._require_transport()
+        if time_range:
+            return transport.list_unread(limit, time_range=time_range)
+        return transport.list_unread(limit)
 
     def iter_unread_batches(
         self,
@@ -56,21 +70,27 @@ class GmailClient(EmailProvider):
         limit: int = 50,
         batch_size: int = 100,
         include_body: bool = True,
+        time_range: Optional[str] = None,
     ):
         transport = self._require_transport()
         if hasattr(transport, "list_unread_page"):
-            fetched = 0
-            offset = 0
-            while fetched < limit:
-                page = transport.list_unread_page(min(batch_size, limit - fetched), offset)
-                if not page:
-                    break
-                yield page
-                fetched += len(page)
-                offset += len(page)
-            return
+            if not time_range:
+                fetched = 0
+                offset = 0
+                while fetched < limit:
+                    page = transport.list_unread_page(min(batch_size, limit - fetched), offset)
+                    if not page:
+                        break
+                    yield page
+                    fetched += len(page)
+                    offset += len(page)
+                return
 
-        emails = transport.list_unread(limit)
+        emails = (
+            transport.list_unread(limit, time_range=time_range)
+            if time_range
+            else transport.list_unread(limit)
+        )
         for start in range(0, len(emails), batch_size):
             yield emails[start : start + batch_size]
 
@@ -82,6 +102,7 @@ class GmailClient(EmailProvider):
         include_body: bool = False,
         unread_only: bool = False,
         offset: int = 0,
+        time_range: Optional[str] = None,
     ):
         transport = self._require_transport()
         if callable(getattr(transport, "iter_mailbox_batches", None)):
@@ -91,11 +112,16 @@ class GmailClient(EmailProvider):
                 include_body=include_body,
                 unread_only=unread_only,
                 offset=offset,
+                time_range=time_range,
             )
             return
 
         if unread_only:
-            emails = transport.list_unread(limit + offset)
+            emails = (
+                transport.list_unread(limit + offset, time_range=time_range)
+                if time_range
+                else transport.list_unread(limit + offset)
+            )
             emails = emails[offset : offset + limit]
             for start in range(0, len(emails), batch_size):
                 yield emails[start : start + batch_size]
@@ -116,6 +142,7 @@ class GmailClient(EmailProvider):
         limit: int = 50,
         batch_size: int = 100,
         include_body: bool = True,
+        time_range: Optional[str] = None,
     ):
         transport = self._require_transport()
         if callable(getattr(transport, "iter_unread_batches_since", None)):
@@ -124,11 +151,13 @@ class GmailClient(EmailProvider):
                 limit=limit,
                 batch_size=batch_size,
                 include_body=include_body,
+                time_range=time_range,
             )
         return self.iter_unread_batches(
             limit=limit,
             batch_size=batch_size,
             include_body=include_body,
+            time_range=time_range,
         )
 
     def get_incremental_checkpoint(self) -> Optional[str]:

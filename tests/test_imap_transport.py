@@ -87,3 +87,25 @@ def test_imap_transport_mark_read_and_archive(monkeypatch):
     assert read_result.executed is True
     assert archive_result.executed is True
     assert "archive" in archive_result.details.lower()
+
+
+def test_imap_transport_uses_date_window_search_criteria(monkeypatch):
+    monkeypatch.setattr("imaplib.IMAP4_SSL", StubIMAPClient)
+    transport = ImaplibTransport(
+        host="imap.example.com",
+        port=993,
+        username="user@example.com",
+        password="secret",
+        provider_name="imap",
+    )
+
+    transport.list_unread(limit=10, time_range="last_month")
+
+    search_actions = [
+        action for action in transport._client.actions
+        if action[0] == "uid" and action[1].lower() == "search"
+    ]
+    assert search_actions
+    criteria = search_actions[0][2]
+    assert "SINCE" in criteria
+    assert "BEFORE" in criteria

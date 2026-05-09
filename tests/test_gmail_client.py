@@ -23,7 +23,8 @@ class StubGmailTransport:
             unread=True,
         )
 
-    def list_unread(self, limit: int):
+    def list_unread(self, limit: int, *, time_range=None):
+        del time_range
         return [self.message]
 
     def get_message(self, email_id: str):

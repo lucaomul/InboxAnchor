@@ -8,6 +8,7 @@ import {
   CATEGORY_CONFIG,
   PRIORITY_CONFIG,
 } from "@/lib/mock-data";
+import type { MailboxTimeRange } from "@/lib/time-range";
 import { Archive, CheckCircle, Flag, Loader2, Reply, Shield, ShieldAlert, ShieldOff, XCircle } from "lucide-react";
 import {
   useApplyRecommendation,
@@ -20,6 +21,7 @@ interface EmailDetailProps {
   classification: EmailClassification;
   recommendations: EmailRecommendation[];
   actionItems: EmailActionItem[];
+  timeRange: MailboxTimeRange;
 }
 
 const ACTION_ICONS: Record<string, React.ReactNode> = {
@@ -36,7 +38,13 @@ const STATUS_STYLES: Record<string, { badge: "safe" | "warning" | "critical"; ic
   blocked: { badge: "critical", icon: <ShieldOff className="w-3.5 h-3.5" /> },
 };
 
-export function EmailDetail({ email, classification, recommendations, actionItems }: EmailDetailProps) {
+export function EmailDetail({
+  email,
+  classification,
+  recommendations,
+  actionItems,
+  timeRange,
+}: EmailDetailProps) {
   const catCfg =
     CATEGORY_CONFIG[classification.category] ?? {
       label: classification.category || "Unknown",
@@ -146,7 +154,11 @@ export function EmailDetail({ email, classification, recommendations, actionItem
                       variant="ghost"
                       className="text-safe shrink-0"
                       disabled={applyMutation.isPending}
-                      onClick={() => applyMutation.mutate({ emailId: rec.emailId, action: rec.recommendedAction })}
+                      onClick={() => applyMutation.mutate({
+                        emailId: rec.emailId,
+                        action: rec.recommendedAction,
+                        timeRange,
+                      })}
                     >
                       {applyMutation.isPending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
                       Apply
@@ -159,7 +171,11 @@ export function EmailDetail({ email, classification, recommendations, actionItem
                       variant="outline"
                       className="text-safe"
                       disabled={approveMutation.isPending}
-                      onClick={() => approveMutation.mutate({ emailId: rec.emailId, action: rec.recommendedAction })}
+                      onClick={() => approveMutation.mutate({
+                        emailId: rec.emailId,
+                        action: rec.recommendedAction,
+                        timeRange,
+                      })}
                     >
                       {approveMutation.isPending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
                       Approve
@@ -169,7 +185,11 @@ export function EmailDetail({ email, classification, recommendations, actionItem
                       variant="ghost"
                       className="text-destructive"
                       disabled={blockMutation.isPending}
-                      onClick={() => blockMutation.mutate({ emailId: rec.emailId, action: rec.recommendedAction })}
+                      onClick={() => blockMutation.mutate({
+                        emailId: rec.emailId,
+                        action: rec.recommendedAction,
+                        timeRange,
+                      })}
                     >
                       <XCircle className="w-3.5 h-3.5" />
                     </Button>

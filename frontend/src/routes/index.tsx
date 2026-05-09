@@ -15,6 +15,7 @@ import {
   useRunSafeCleanupWorkflow,
 } from "@/hooks/use-ops";
 import { useTheme } from "@/hooks/use-theme";
+import { useMailboxTimeRange } from "@/hooks/use-mailbox-time-range";
 import {
   Activity,
   Anchor,
@@ -33,6 +34,8 @@ import {
   Wifi,
   WifiOff,
 } from "lucide-react";
+import { MAILBOX_TIME_RANGE_OPTIONS } from "@/lib/time-range";
+import type { MailboxTimeRange } from "@/lib/time-range";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -63,7 +66,8 @@ const CATEGORY_LABELS: Record<string, string> = {
 function CommandCenter() {
   const { email: userEmail, logout } = useAuth();
   const { theme, setTheme, themes } = useTheme();
-  const { data: overview, isLoading, isError, error } = useOpsOverview();
+  const { timeRange, setTimeRange } = useMailboxTimeRange();
+  const { data: overview, isLoading, isError, error } = useOpsOverview(timeRange);
   const scanMutation = useRunOpsScan();
   const backfillMutation = useRunMailboxBackfill();
   const autoLabelMutation = useRunAutoLabel();
@@ -77,7 +81,7 @@ function CommandCenter() {
     autoLabelMutation.isPending ||
     cleanupMutation.isPending ||
     fullAnchorMutation.isPending;
-  const { data: progress } = useOpsProgress(isLoading || busy);
+  const { data: progress } = useOpsProgress(timeRange, isLoading || busy);
   const showLoader =
     isLoading ||
     busy ||
@@ -214,6 +218,20 @@ function CommandCenter() {
                   </p>
                 </div>
                 <div className="flex flex-wrap gap-2">
+                  <div className="inline-flex items-center gap-2 rounded-md border border-border bg-background px-3 py-2 text-xs text-muted-foreground">
+                    <span className="font-medium text-foreground">Target window</span>
+                    <select
+                      value={timeRange}
+                      onChange={(e) => setTimeRange(e.target.value as MailboxTimeRange)}
+                      className="bg-transparent text-xs text-foreground focus:outline-none"
+                    >
+                      {MAILBOX_TIME_RANGE_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
                   <Link
                     to="/inbox"
                     className="inline-flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
@@ -223,7 +241,7 @@ function CommandCenter() {
                   </Link>
                   <Button
                     variant="outline"
-                    onClick={() => scanMutation.mutate()}
+                    onClick={() => scanMutation.mutate(timeRange)}
                     disabled={busy}
                   >
                     <Activity className="mr-2 h-4 w-4" />
@@ -276,7 +294,7 @@ function CommandCenter() {
                       the API URL pointed at the running backend, then retry a fresh unread scan.
                     </p>
                     <div className="pt-1">
-                      <Button onClick={() => scanMutation.mutate()} disabled={busy}>
+                      <Button onClick={() => scanMutation.mutate(timeRange)} disabled={busy}>
                         {scanMutation.isPending ? "Retrying..." : "Retry unread scan"}
                       </Button>
                     </div>
@@ -360,7 +378,7 @@ function CommandCenter() {
                 impact={overview?.workflows.find((item) => item.slug === "backfill")?.impact}
                 cta="Cache history"
                 loading={backfillMutation.isPending}
-                onClick={() => backfillMutation.mutate()}
+                onClick={() => backfillMutation.mutate(timeRange)}
               />
               <WorkflowCard
                 title="Auto-label unread mail"
@@ -369,7 +387,7 @@ function CommandCenter() {
                 impact={overview?.workflows.find((item) => item.slug === "auto-label")?.impact}
                 cta="Run labels"
                 loading={autoLabelMutation.isPending}
-                onClick={() => autoLabelMutation.mutate()}
+                onClick={() => autoLabelMutation.mutate(timeRange)}
               />
               <WorkflowCard
                 title="Safe cleanup"
@@ -378,7 +396,7 @@ function CommandCenter() {
                 impact={overview?.workflows.find((item) => item.slug === "safe-cleanup")?.impact}
                 cta="Run cleanup"
                 loading={cleanupMutation.isPending}
-                onClick={() => cleanupMutation.mutate()}
+                onClick={() => cleanupMutation.mutate(timeRange)}
               />
               <WorkflowCard
                 title="Mailbox upgrade sweep"
@@ -387,7 +405,7 @@ function CommandCenter() {
                 impact={overview?.workflows.find((item) => item.slug === "full-anchor")?.impact}
                 cta="Upgrade mailbox"
                 loading={fullAnchorMutation.isPending}
-                onClick={() => fullAnchorMutation.mutate()}
+                onClick={() => fullAnchorMutation.mutate(timeRange)}
                 featured
               />
               <WorkflowCard

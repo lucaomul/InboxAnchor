@@ -26,8 +26,13 @@ class EmailProvider(ABC):
         limit: int = 50,
         batch_size: int = 100,
         include_body: bool = True,
+        time_range: Optional[str] = None,
     ):
-        emails = self.list_unread(limit=limit, include_body=include_body)
+        emails = self.list_unread(
+            limit=limit,
+            include_body=include_body,
+            time_range=time_range,
+        )
         for start in range(0, len(emails), batch_size):
             yield emails[start : start + batch_size]
 
@@ -39,9 +44,14 @@ class EmailProvider(ABC):
         include_body: bool = False,
         unread_only: bool = False,
         offset: int = 0,
+        time_range: Optional[str] = None,
     ):
         if unread_only:
-            emails = self.list_unread(limit=limit + offset, include_body=include_body)
+            emails = self.list_unread(
+                limit=limit + offset,
+                include_body=include_body,
+                time_range=time_range,
+            )
             emails = emails[offset : offset + limit]
             for start in range(0, len(emails), batch_size):
                 yield emails[start : start + batch_size]
@@ -60,18 +70,25 @@ class EmailProvider(ABC):
         limit: int = 50,
         batch_size: int = 100,
         include_body: bool = True,
+        time_range: Optional[str] = None,
     ):
         return self.iter_unread_batches(
             limit=limit,
             batch_size=batch_size,
             include_body=include_body,
+            time_range=time_range,
         )
 
     def get_incremental_checkpoint(self) -> Optional[str]:
         return None
 
     @abstractmethod
-    def list_unread(self, limit: int = 50, include_body: bool = True) -> list[EmailMessage]:
+    def list_unread(
+        self,
+        limit: int = 50,
+        include_body: bool = True,
+        time_range: Optional[str] = None,
+    ) -> list[EmailMessage]:
         raise NotImplementedError
 
     @abstractmethod

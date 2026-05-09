@@ -10,6 +10,7 @@ import {
   runOpsScan,
   runSafeCleanupWorkflow,
 } from "@/lib/api-client";
+import type { MailboxTimeRange } from "@/lib/time-range";
 
 function useInvalidateWorkspace() {
   const qc = useQueryClient();
@@ -27,14 +28,14 @@ function isApiConfigured() {
   return typeof window !== "undefined" && !!getApiUrl();
 }
 
-export function useOpsOverview() {
+export function useOpsOverview(timeRange: MailboxTimeRange) {
   return useQuery({
-    queryKey: ["opsOverview"],
+    queryKey: ["opsOverview", timeRange],
     queryFn: async () => {
       if (!isApiConfigured()) {
         return null;
       }
-      return fetchOpsOverview();
+      return fetchOpsOverview(timeRange);
     },
     enabled: isApiConfigured(),
     staleTime: 15_000,
@@ -42,14 +43,14 @@ export function useOpsOverview() {
   });
 }
 
-export function useOpsProgress(enabled: boolean = true) {
+export function useOpsProgress(timeRange: MailboxTimeRange, enabled: boolean = true) {
   return useQuery({
-    queryKey: ["opsProgress"],
+    queryKey: ["opsProgress", timeRange],
     queryFn: async () => {
       if (!isApiConfigured()) {
         return null;
       }
-      return fetchOpsProgress();
+      return fetchOpsProgress(timeRange);
     },
     enabled: isApiConfigured() && enabled,
     refetchInterval: (query) =>
@@ -61,7 +62,7 @@ export function useOpsProgress(enabled: boolean = true) {
 export function useRunOpsScan() {
   const invalidate = useInvalidateWorkspace();
   return useMutation({
-    mutationFn: runOpsScan,
+    mutationFn: (timeRange: MailboxTimeRange) => runOpsScan(timeRange),
     onSuccess: (result) => {
       invalidate();
       toast.success("Unread scan refreshed", {
@@ -75,7 +76,7 @@ export function useRunOpsScan() {
 export function useRunAutoLabel() {
   const invalidate = useInvalidateWorkspace();
   return useMutation({
-    mutationFn: runAutoLabel,
+    mutationFn: (timeRange: MailboxTimeRange) => runAutoLabel(timeRange),
     onSuccess: (result) => {
       invalidate();
       toast.success("Auto-label sweep complete", {
@@ -89,7 +90,7 @@ export function useRunAutoLabel() {
 export function useRunMailboxBackfill() {
   const invalidate = useInvalidateWorkspace();
   return useMutation({
-    mutationFn: runMailboxBackfill,
+    mutationFn: (timeRange: MailboxTimeRange) => runMailboxBackfill(timeRange),
     onSuccess: (result) => {
       invalidate();
       toast.success("Mailbox memory sync complete", {
@@ -103,7 +104,7 @@ export function useRunMailboxBackfill() {
 export function useRunSafeCleanupWorkflow() {
   const invalidate = useInvalidateWorkspace();
   return useMutation({
-    mutationFn: runSafeCleanupWorkflow,
+    mutationFn: (timeRange: MailboxTimeRange) => runSafeCleanupWorkflow(timeRange),
     onSuccess: (result) => {
       invalidate();
       toast.success("Safe cleanup applied", {
@@ -117,7 +118,7 @@ export function useRunSafeCleanupWorkflow() {
 export function useRunFullAnchorWorkflow() {
   const invalidate = useInvalidateWorkspace();
   return useMutation({
-    mutationFn: runFullAnchorWorkflow,
+    mutationFn: (timeRange: MailboxTimeRange) => runFullAnchorWorkflow(timeRange),
     onSuccess: (result) => {
       invalidate();
       toast.success("Mailbox upgrade sweep complete", {

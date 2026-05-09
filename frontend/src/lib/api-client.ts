@@ -8,6 +8,7 @@ import type {
   EmailActionItem,
   InboxDigest,
 } from "./mock-data";
+import type { MailboxTimeRange, MailboxTimeRangeOption } from "./time-range";
 import { z } from "zod";
 
 const API_URL_KEY = "inboxanchor_api_url";
@@ -321,6 +322,7 @@ export interface FetchEmailsParams {
   category?: string;
   priority?: string;
   unread_only?: boolean;
+  time_range?: MailboxTimeRange;
 }
 
 export interface FetchEmailsResponse {
@@ -336,65 +338,114 @@ export async function fetchEmails(params?: FetchEmailsParams): Promise<FetchEmai
   if (params?.category) qs.set("category", params.category);
   if (params?.priority) qs.set("priority", params.priority);
   if (params?.unread_only) qs.set("unread_only", "true");
+  if (params?.time_range) qs.set("time_range", params.time_range);
   const query = qs.toString();
   return apiFetch<FetchEmailsResponse>(`/emails${query ? `?${query}` : ""}`);
 }
 
-export async function fetchEmailById(emailId: string): Promise<EmailMessage> {
-  return apiFetch<EmailMessage>(`/emails/${emailId}`);
+export async function fetchEmailById(
+  emailId: string,
+  timeRange?: MailboxTimeRange,
+): Promise<EmailMessage> {
+  const qs = new URLSearchParams();
+  if (timeRange) qs.set("time_range", timeRange);
+  const query = qs.toString();
+  return apiFetch<EmailMessage>(`/emails/${emailId}${query ? `?${query}` : ""}`);
 }
 
 // --- Classifications ---
 
-export async function fetchClassifications(): Promise<Record<string, EmailClassification>> {
-  return apiFetch<Record<string, EmailClassification>>("/classifications");
+export async function fetchClassifications(
+  timeRange?: MailboxTimeRange,
+): Promise<Record<string, EmailClassification>> {
+  const qs = new URLSearchParams();
+  if (timeRange) qs.set("time_range", timeRange);
+  const query = qs.toString();
+  return apiFetch<Record<string, EmailClassification>>(`/classifications${query ? `?${query}` : ""}`);
 }
 
 // --- Recommendations ---
 
-export async function fetchRecommendations(emailId?: string | null): Promise<EmailRecommendation[]> {
+export async function fetchRecommendations(
+  emailId?: string | null,
+  timeRange?: MailboxTimeRange,
+): Promise<EmailRecommendation[]> {
   const qs = new URLSearchParams();
   if (emailId) qs.set("email_id", emailId);
+  if (timeRange) qs.set("time_range", timeRange);
   const query = qs.toString();
   return apiFetch<EmailRecommendation[]>(`/recommendations${query ? `?${query}` : ""}`);
 }
 
 // --- Action Items ---
 
-export async function fetchActionItems(emailId: string): Promise<EmailActionItem[]> {
-  return apiFetch<EmailActionItem[]>(`/emails/${emailId}/actions`);
+export async function fetchActionItems(
+  emailId: string,
+  timeRange?: MailboxTimeRange,
+): Promise<EmailActionItem[]> {
+  const qs = new URLSearchParams();
+  if (timeRange) qs.set("time_range", timeRange);
+  const query = qs.toString();
+  return apiFetch<EmailActionItem[]>(`/emails/${emailId}/actions${query ? `?${query}` : ""}`);
 }
 
 // --- Digest ---
 
-export async function fetchDigest(): Promise<InboxDigest> {
-  return apiFetch<InboxDigest>("/digest");
+export async function fetchDigest(timeRange?: MailboxTimeRange): Promise<InboxDigest> {
+  const qs = new URLSearchParams();
+  if (timeRange) qs.set("time_range", timeRange);
+  const query = qs.toString();
+  return apiFetch<InboxDigest>(`/digest${query ? `?${query}` : ""}`);
 }
 
 // --- Triage actions ---
 
-export async function applyRecommendation(emailId: string, action: string): Promise<void> {
-  await apiFetch(`/recommendations/${emailId}/apply`, {
+export async function applyRecommendation(
+  emailId: string,
+  action: string,
+  timeRange?: MailboxTimeRange,
+): Promise<void> {
+  const qs = new URLSearchParams();
+  if (timeRange) qs.set("time_range", timeRange);
+  const query = qs.toString();
+  await apiFetch(`/recommendations/${emailId}/apply${query ? `?${query}` : ""}`, {
     method: "POST",
     body: JSON.stringify({ action }),
   });
 }
 
-export async function applyAllSafe(): Promise<void> {
-  await apiFetch("/recommendations/apply-all-safe", { method: "POST" });
+export async function applyAllSafe(timeRange?: MailboxTimeRange): Promise<void> {
+  const qs = new URLSearchParams();
+  if (timeRange) qs.set("time_range", timeRange);
+  const query = qs.toString();
+  await apiFetch(`/recommendations/apply-all-safe${query ? `?${query}` : ""}`, { method: "POST" });
 }
 
 // --- Approve / Block ---
 
-export async function approveRecommendation(emailId: string, action: string): Promise<void> {
-  await apiFetch(`/recommendations/${emailId}/approve`, {
+export async function approveRecommendation(
+  emailId: string,
+  action: string,
+  timeRange?: MailboxTimeRange,
+): Promise<void> {
+  const qs = new URLSearchParams();
+  if (timeRange) qs.set("time_range", timeRange);
+  const query = qs.toString();
+  await apiFetch(`/recommendations/${emailId}/approve${query ? `?${query}` : ""}`, {
     method: "POST",
     body: JSON.stringify({ action }),
   });
 }
 
-export async function blockRecommendation(emailId: string, action: string): Promise<void> {
-  await apiFetch(`/recommendations/${emailId}/block`, {
+export async function blockRecommendation(
+  emailId: string,
+  action: string,
+  timeRange?: MailboxTimeRange,
+): Promise<void> {
+  const qs = new URLSearchParams();
+  if (timeRange) qs.set("time_range", timeRange);
+  const query = qs.toString();
+  await apiFetch(`/recommendations/${emailId}/block${query ? `?${query}` : ""}`, {
     method: "POST",
     body: JSON.stringify({ action }),
   });
@@ -424,6 +475,9 @@ export interface OpsWorkflowCard {
 
 export interface OpsOverview {
   provider: string;
+  timeRange: MailboxTimeRange;
+  timeRangeLabel: string;
+  timeRangeOptions: MailboxTimeRangeOption[];
   runId: string;
   unreadCount: number;
   highPriorityCount: number;
@@ -456,6 +510,8 @@ export interface WorkflowMutationResult {
 
 export interface OpsProgress {
   provider: string;
+  time_range: MailboxTimeRange;
+  time_range_label: string;
   mode: "scan" | "backfill";
   status: "idle" | "running" | "complete" | "error";
   stage: string;
@@ -475,22 +531,28 @@ export interface OpsProgress {
   updated_at: string;
 }
 
-export async function fetchOpsOverview(): Promise<OpsOverview> {
-  return apiFetch<OpsOverview>("/ops/overview");
+export async function fetchOpsOverview(timeRange?: MailboxTimeRange): Promise<OpsOverview> {
+  const qs = new URLSearchParams();
+  if (timeRange) qs.set("time_range", timeRange);
+  const query = qs.toString();
+  return apiFetch<OpsOverview>(`/ops/overview${query ? `?${query}` : ""}`);
 }
 
-export async function fetchOpsProgress(): Promise<OpsProgress> {
-  return apiFetch<OpsProgress>("/ops/progress");
+export async function fetchOpsProgress(timeRange?: MailboxTimeRange): Promise<OpsProgress> {
+  const qs = new URLSearchParams();
+  if (timeRange) qs.set("time_range", timeRange);
+  const query = qs.toString();
+  return apiFetch<OpsProgress>(`/ops/progress${query ? `?${query}` : ""}`);
 }
 
-export async function runOpsScan(): Promise<OpsOverview> {
+export async function runOpsScan(timeRange?: MailboxTimeRange): Promise<OpsOverview> {
   return apiFetch<OpsOverview>("/ops/scan", {
     method: "POST",
-    body: JSON.stringify({ force_refresh: true }),
+    body: JSON.stringify({ force_refresh: true, time_range: timeRange }),
   });
 }
 
-export async function runMailboxBackfill(): Promise<WorkflowMutationResult> {
+export async function runMailboxBackfill(timeRange?: MailboxTimeRange): Promise<WorkflowMutationResult> {
   return apiFetch<WorkflowMutationResult>("/ops/backfill", {
     method: "POST",
     body: JSON.stringify({
@@ -499,28 +561,33 @@ export async function runMailboxBackfill(): Promise<WorkflowMutationResult> {
       batch_size: 250,
       include_body: false,
       unread_only: false,
+      time_range: timeRange,
     }),
   });
 }
 
-export async function runAutoLabel(): Promise<WorkflowMutationResult> {
+export async function runAutoLabel(timeRange?: MailboxTimeRange): Promise<WorkflowMutationResult> {
   return apiFetch<WorkflowMutationResult>("/ops/auto-label", {
     method: "POST",
-    body: JSON.stringify({ force_refresh: true }),
+    body: JSON.stringify({ force_refresh: true, time_range: timeRange }),
   });
 }
 
-export async function runSafeCleanupWorkflow(): Promise<WorkflowMutationResult> {
+export async function runSafeCleanupWorkflow(
+  timeRange?: MailboxTimeRange,
+): Promise<WorkflowMutationResult> {
   return apiFetch<WorkflowMutationResult>("/ops/safe-cleanup", {
     method: "POST",
-    body: JSON.stringify({ force_refresh: true }),
+    body: JSON.stringify({ force_refresh: true, time_range: timeRange }),
   });
 }
 
-export async function runFullAnchorWorkflow(): Promise<WorkflowMutationResult> {
+export async function runFullAnchorWorkflow(
+  timeRange?: MailboxTimeRange,
+): Promise<WorkflowMutationResult> {
   return apiFetch<WorkflowMutationResult>("/ops/full-anchor", {
     method: "POST",
-    body: JSON.stringify({ force_refresh: true }),
+    body: JSON.stringify({ force_refresh: true, time_range: timeRange }),
   });
 }
 

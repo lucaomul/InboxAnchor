@@ -13,6 +13,7 @@ InboxAnchor is a safety-first inbox triage system for overloaded email accounts.
 - Separates recommendations into safe, requires-approval, and blocked lanes
 - Persists triage runs, recommendations, audit history, provider state, and workspace settings
 - Builds a local mailbox-memory cache for older email history, resumes historical syncs, and hydrates full bodies lazily when needed
+- Scopes scans, labeling, cleanup, and mailbox-memory backfill to practical windows such as today, last month, last year, or 10+ years ago
 - Supports bulk lane actions, operator playbooks, focus views, follow-up radar, and reminder center workflows in the dashboard
 - Exposes a FastAPI backend and a Streamlit workspace on top of the same core engine
 - Includes a full React frontend in `frontend/` with a premium command center, welcome/auth flow, inbox workspace, and settings surface wired to the FastAPI backend
@@ -68,6 +69,8 @@ frontend/         TanStack/React product UI, frontend routes, and modern compone
   Checkpoint-aware wrapper for incremental runs.
 - `inboxanchor/infra/repository.py`
   Persists triage runs plus the mailbox-memory cache used for historical sync and lazy hydration.
+- `inboxanchor/core/time_windows.py`
+  Shared date-window presets for provider-native Gmail queries, IMAP criteria, cache stats, and command-center workflows.
 - `inboxanchor/infra/auth.py`
   Account registration, password verification, session issuance, and logout.
 - `inboxanchor/app/dashboard.py`
@@ -266,11 +269,11 @@ The Streamlit workspace is account-aware and requires sign-in unless you intenti
 
 - `GET /ops/overview` — command-center summary for the current provider
 - `GET /ops/progress` — live scan or mailbox-memory progress
-- `POST /ops/scan` — rebuild the unread working set
-- `POST /ops/backfill` — cache historical mailbox metadata with resumable progress, lightweight indexing, and optional lazy hydration
-- `POST /ops/auto-label` — apply InboxAnchor labels to the current unread set
-- `POST /ops/safe-cleanup` — execute only low-risk cleanup actions
-- `POST /ops/full-anchor` — label first, then run safe cleanup
+- `POST /ops/scan` — rebuild the unread working set for a selected time window
+- `POST /ops/backfill` — cache historical mailbox metadata with resumable progress, lightweight indexing, optional lazy hydration, and scoped date windows up to 20K emails
+- `POST /ops/auto-label` — apply InboxAnchor labels to the current unread set inside the active window
+- `POST /ops/safe-cleanup` — execute only low-risk cleanup actions inside the active window
+- `POST /ops/full-anchor` — label first, then run safe cleanup for the same window
 
 ## Dashboard
 
@@ -279,7 +282,7 @@ The Streamlit workspace currently includes:
 - account access with sign-in, sign-up, and demo mode
 - operator playbooks for common workflows
 - command center controls for provider, batch sizing, and preview caps
-- resumable mailbox-memory builder for large historical inboxes
+- resumable mailbox-memory builder for large historical inboxes with date-window presets
 - inbox overview and category map
 - approval center and decision lanes
 - focus inbox split into reply pressure, approvals, sensitive mail, and cleanup
@@ -304,6 +307,7 @@ The test suite is offline and deterministic. It covers:
 - Gmail connector behavior
 - IMAP transport behavior
 - API routes
+- time-window aware command-center workflows and backfill resume behavior
 - dashboard helper logic
 - audit logging and persistence
 
@@ -317,6 +321,7 @@ InboxAnchor is already strong for:
 - approval and audit workflow validation
 - large unread-inbox simulation
 - large historical mailbox caching with resumable backfill
+- operator-friendly cleanup windows from today to 10+ years
 
 Still pending before calling it fully production-ready:
 

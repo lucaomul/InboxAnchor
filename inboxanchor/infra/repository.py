@@ -5,6 +5,7 @@ from typing import Optional
 
 from sqlalchemy import and_, func, or_
 
+from inboxanchor.core.time_windows import resolve_time_window
 from inboxanchor.infra.database import (
     ActionItemORM,
     AuditLogORM,
@@ -41,6 +42,7 @@ class InboxRepository:
         category: Optional[str] = None,
         q: Optional[str] = None,
         unread_only: bool = False,
+        time_range: Optional[str] = None,
     ):
         query = (
             self.session.query(EmailRecordORM, ClassificationORM)
@@ -59,6 +61,12 @@ class InboxRepository:
             query = query.filter(ClassificationORM.category == category)
         if unread_only:
             query = query.filter(EmailRecordORM.unread.is_(True))
+        if time_range:
+            window = resolve_time_window(time_range)
+            if window.start_at is not None:
+                query = query.filter(EmailRecordORM.received_at >= window.start_at)
+            if window.end_at is not None:
+                query = query.filter(EmailRecordORM.received_at < window.end_at)
         if q:
             pattern = f"%{q.strip()}%"
             query = query.filter(
@@ -323,12 +331,19 @@ class InboxRepository:
         *,
         unread_only: Optional[bool] = None,
         hydrated_only: bool = False,
+        time_range: Optional[str] = None,
     ) -> int:
         query = self.session.query(MailboxEmailORM).filter(MailboxEmailORM.provider == provider)
         if unread_only is True:
             query = query.filter(MailboxEmailORM.unread.is_(True))
         elif unread_only is False:
             query = query.filter(MailboxEmailORM.unread.is_(False))
+        if time_range:
+            window = resolve_time_window(time_range)
+            if window.start_at is not None:
+                query = query.filter(MailboxEmailORM.received_at >= window.start_at)
+            if window.end_at is not None:
+                query = query.filter(MailboxEmailORM.received_at < window.end_at)
         if hydrated_only:
             query = query.filter(func.length(func.trim(MailboxEmailORM.body_full)) > 0)
         return query.count()
@@ -341,12 +356,19 @@ class InboxRepository:
         offset: int = 0,
         unread_only: Optional[bool] = None,
         q: Optional[str] = None,
+        time_range: Optional[str] = None,
     ) -> list[dict]:
         query = self.session.query(MailboxEmailORM).filter(MailboxEmailORM.provider == provider)
         if unread_only is True:
             query = query.filter(MailboxEmailORM.unread.is_(True))
         elif unread_only is False:
             query = query.filter(MailboxEmailORM.unread.is_(False))
+        if time_range:
+            window = resolve_time_window(time_range)
+            if window.start_at is not None:
+                query = query.filter(MailboxEmailORM.received_at >= window.start_at)
+            if window.end_at is not None:
+                query = query.filter(MailboxEmailORM.received_at < window.end_at)
         if q:
             pattern = f"%{q.strip()}%"
             query = query.filter(
@@ -365,8 +387,14 @@ class InboxRepository:
         )
         return [self._mailbox_email_payload(row) for row in rows]
 
-    def get_mailbox_cache_stats(self, provider: str) -> dict:
+    def get_mailbox_cache_stats(self, provider: str, *, time_range: Optional[str] = None) -> dict:
         query = self.session.query(MailboxEmailORM).filter(MailboxEmailORM.provider == provider)
+        if time_range:
+            window = resolve_time_window(time_range)
+            if window.start_at is not None:
+                query = query.filter(MailboxEmailORM.received_at >= window.start_at)
+            if window.end_at is not None:
+                query = query.filter(MailboxEmailORM.received_at < window.end_at)
         cached_count = query.count()
         unread_count = query.filter(MailboxEmailORM.unread.is_(True)).count()
         hydrated_count = query.filter(func.length(func.trim(MailboxEmailORM.body_full)) > 0).count()
@@ -675,6 +703,7 @@ class InboxRepository:
         category: Optional[str] = None,
         q: Optional[str] = None,
         unread_only: bool = False,
+        time_range: Optional[str] = None,
     ) -> list[dict]:
         query = self._run_email_details_query(
             run_id,
@@ -682,6 +711,7 @@ class InboxRepository:
             category=category,
             q=q,
             unread_only=unread_only,
+            time_range=time_range,
         )
         rows = (
             query.order_by(EmailRecordORM.received_at.desc())
@@ -757,6 +787,7 @@ class InboxRepository:
         category: Optional[str] = None,
         q: Optional[str] = None,
         unread_only: bool = False,
+        time_range: Optional[str] = None,
     ) -> int:
         return self._run_email_details_query(
             run_id,
@@ -764,6 +795,7 @@ class InboxRepository:
             category=category,
             q=q,
             unread_only=unread_only,
+            time_range=time_range,
         ).count()
 
     def count_run_high_priority_emails(self, run_id: str) -> int:

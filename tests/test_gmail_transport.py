@@ -225,6 +225,53 @@ def test_google_api_transport_mailbox_backfill_can_resume_from_offset():
     assert session.calls[1][2]["pageToken"] == "page-2"
 
 
+def test_google_api_transport_applies_time_range_query_to_unread_listing():
+    session = StubSession(
+        [
+            StubResponse({"messages": []}),
+        ]
+    )
+
+    transport = GoogleAPITransport(
+        credentials_path="~/credentials.json",
+        token_path="~/token.json",
+        session=session,
+    )
+
+    transport.list_unread(limit=5, time_range="last_6_months")
+
+    query = session.calls[0][2]["q"]
+    assert "is:unread" in query
+    assert "after:" in query
+
+
+def test_google_api_transport_applies_time_range_query_to_mailbox_backfill():
+    session = StubSession(
+        [
+            StubResponse({"messages": []}),
+        ]
+    )
+
+    transport = GoogleAPITransport(
+        credentials_path="~/credentials.json",
+        token_path="~/token.json",
+        session=session,
+    )
+
+    list(
+        transport.iter_mailbox_batches(
+            limit=50,
+            batch_size=25,
+            include_body=False,
+            unread_only=False,
+            time_range="older_than_10_years",
+        )
+    )
+
+    query = session.calls[0][2]["q"]
+    assert "before:" in query
+
+
 def test_google_api_transport_mark_read_uses_batch_modify_endpoint():
     session = StubSession([StubResponse({})])
     transport = GoogleAPITransport(

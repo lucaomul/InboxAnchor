@@ -12,6 +12,12 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from inboxanchor.bootstrap import InboxAnchorService
+from inboxanchor.core.time_windows import (
+    ALL_TIME_RANGE,
+    available_time_ranges,
+    normalize_time_range,
+    time_range_label,
+)
 from inboxanchor.infra.audit_log import AuditLogger
 from inboxanchor.infra.auth import AuthService
 from inboxanchor.infra.database import session_scope
@@ -74,6 +80,7 @@ class FrontendRecommendationActionRequest(BaseModel):
 class FrontendProviderWorkflowRequest(BaseModel):
     provider: Optional[str] = None
     force_refresh: bool = True
+    time_range: Optional[str] = None
 
 
 class FrontendMailboxBackfillRequest(BaseModel):
@@ -83,6 +90,18 @@ class FrontendMailboxBackfillRequest(BaseModel):
     batch_size: int = Field(default=250, ge=10, le=1000)
     include_body: bool = False
     unread_only: bool = False
+    time_range: Optional[str] = None
+
+
+def _scope_key(provider_name: str, time_range: Optional[str]) -> str:
+    return f"{provider_name}::{normalize_time_range(time_range)}"
+
+
+def _scope_sync_kind(time_range: Optional[str]) -> str:
+    normalized = normalize_time_range(time_range)
+    if normalized == ALL_TIME_RANGE:
+        return MAILBOX_BACKFILL_SYNC_KIND
+    return f"{MAILBOX_BACKFILL_SYNC_KIND}:{normalized}"
 
 
 def _extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
@@ -136,11 +155,15 @@ def _service_for_provider(provider_name: str) -> InboxAnchorService:
 
 
 def mark_frontend_provider_dirty(provider_name: str) -> None:
-    FRONTEND_RUN_CACHE.pop(provider_name, None)
     FRONTEND_SERVICE_CACHE.pop(provider_name, None)
     FRONTEND_BLOCK_REGISTRY.pop(provider_name, None)
-    FRONTEND_PROVIDER_ERRORS.pop(provider_name, None)
-    FRONTEND_PROGRESS.pop(provider_name, None)
+    for registry in (FRONTEND_RUN_CACHE, FRONTEND_PROVIDER_ERRORS, FRONTEND_PROGRESS):
+        registry.pop(provider_name, None)
+        for key in [item for item in registry if item.startswith(f"{provider_name}::")]:
+            registry.pop(key, None)
+    with FRONTEND_ACTIVE_RUNS_LOCK:
+        for key in [item for item in FRONTEND_ACTIVE_RUNS if item.startswith(f"{provider_name}::")]:
+            FRONTEND_ACTIVE_RUNS.pop(key, None)
     FRONTEND_FORCE_REFRESH_PROVIDERS.add(provider_name)
 
 
@@ -164,14 +187,22 @@ def _provider_runtime_error_message(provider_name: str, exc: Exception) -> str:
 
 def _raise_provider_runtime_error(provider_name: str, exc: Exception) -> None:
     message = _provider_runtime_error_message(provider_name, exc)
-    FRONTEND_PROVIDER_ERRORS[provider_name] = message
     raise HTTPException(status_code=502, detail=message) from exc
 
 
-def _update_frontend_progress(provider_name: str, payload: dict) -> None:
-    previous = FRONTEND_PROGRESS.get(provider_name, {})
+def _update_frontend_progress(
+    provider_name: str,
+    payload: dict,
+    *,
+    time_range: Optional[str] = None,
+) -> None:
+    normalized_time_range = normalize_time_range(time_range or payload.get("time_range"))
+    scope_key = _scope_key(provider_name, normalized_time_range)
+    previous = FRONTEND_PROGRESS.get(scope_key, {})
     progress = {
         "provider": provider_name,
+        "time_range": normalized_time_range,
+        "time_range_label": time_range_label(normalized_time_range),
         "mode": previous.get("mode", "scan"),
         "status": previous.get("status", "running"),
         "stage": previous.get("stage", "starting"),
@@ -231,7 +262,11 @@ def _update_frontend_progress(provider_name: str, payload: dict) -> None:
         progress["run_id"] = payload["run_id"]
     if "error" in payload:
         progress["error"] = payload["error"]
-    FRONTEND_PROGRESS[provider_name] = progress
+    FRONTEND_PROGRESS[scope_key] = progress
+    if progress["error"]:
+        FRONTEND_PROVIDER_ERRORS[scope_key] = progress["error"]
+    else:
+        FRONTEND_PROVIDER_ERRORS.pop(scope_key, None)
     if progress["status"] == "running":
         STREAM_HUB.emit(
             {
@@ -241,14 +276,19 @@ def _update_frontend_progress(provider_name: str, payload: dict) -> None:
         )
 
 
-def _wait_for_frontend_job(job: FrontendRunJob, provider_name: str) -> tuple[str, str]:
+def _wait_for_frontend_job(
+    job: FrontendRunJob,
+    provider_name: str,
+    *,
+    time_range: Optional[str] = None,
+) -> tuple[str, str]:
+    scope_key = _scope_key(provider_name, time_range)
     completed = job.event.wait(timeout=180)
     if not completed:
         message = (
             f"InboxAnchor timed out while preparing the live {provider_name} inbox. "
             "Retry the unread scan."
         )
-        FRONTEND_PROVIDER_ERRORS[provider_name] = message
         _update_frontend_progress(
             provider_name,
             {
@@ -256,14 +296,14 @@ def _wait_for_frontend_job(job: FrontendRunJob, provider_name: str) -> tuple[str
                 "stage": "timeout",
                 "error": message,
             },
+            time_range=time_range,
         )
         raise HTTPException(status_code=504, detail=message)
     if job.error:
-        FRONTEND_PROVIDER_ERRORS[provider_name] = job.error
         raise HTTPException(status_code=502, detail=job.error)
     if not job.run_id:
         raise HTTPException(status_code=500, detail="Frontend run finished without a run id.")
-    FRONTEND_RUN_CACHE[provider_name] = job.run_id
+    FRONTEND_RUN_CACHE[scope_key] = job.run_id
     return job.run_id, provider_name
 
 
@@ -279,20 +319,33 @@ def _zero_run_needs_refresh(
     repository: InboxRepository,
     provider_name: str,
     run_id: str,
+    *,
+    time_range: Optional[str] = None,
 ) -> bool:
     if not _provider_has_live_sync(service, provider_name):
         return False
     if repository.count_run_email_details(run_id) > 0:
         return False
     try:
-        unread_probe = service.provider.list_unread(limit=1, include_body=False)
+        unread_probe = service.provider.list_unread(
+            limit=1,
+            include_body=False,
+            time_range=time_range,
+        )
     except Exception as exc:
         _raise_provider_runtime_error(provider_name, exc)
     return len(unread_probe) > 0
 
 
-def _ensure_frontend_run(*, provider: Optional[str] = None, force: bool = False) -> tuple[str, str]:
+def _ensure_frontend_run(
+    *,
+    provider: Optional[str] = None,
+    force: bool = False,
+    time_range: Optional[str] = None,
+) -> tuple[str, str]:
     provider_name = _get_provider_name(provider)
+    normalized_time_range = normalize_time_range(time_range)
+    scope_key = _scope_key(provider_name, normalized_time_range)
     if provider_name in FRONTEND_FORCE_REFRESH_PROVIDERS:
         force = True
         FRONTEND_FORCE_REFRESH_PROVIDERS.discard(provider_name)
@@ -303,24 +356,32 @@ def _ensure_frontend_run(*, provider: Optional[str] = None, force: bool = False)
     with session_scope() as session:
         repository = InboxRepository(session)
         if not force:
-            cached_run_id = FRONTEND_RUN_CACHE.get(provider_name)
+            cached_run_id = FRONTEND_RUN_CACHE.get(scope_key)
             if cached_run_id and repository.get_run(cached_run_id):
                 if _zero_run_needs_refresh(
                     service,
                     repository,
                     provider_name,
                     cached_run_id,
+                    time_range=normalized_time_range,
                 ):
-                    FRONTEND_RUN_CACHE.pop(provider_name, None)
+                    FRONTEND_RUN_CACHE.pop(scope_key, None)
                 else:
                     return cached_run_id, provider_name
-            latest_run_id = repository.get_latest_run_id(provider_name)
-            if latest_run_id:
-                if _zero_run_needs_refresh(service, repository, provider_name, latest_run_id):
-                    latest_run_id = None
-                else:
-                    FRONTEND_RUN_CACHE[provider_name] = latest_run_id
-                    return latest_run_id, provider_name
+            if normalized_time_range == ALL_TIME_RANGE:
+                latest_run_id = repository.get_latest_run_id(provider_name)
+                if latest_run_id:
+                    if _zero_run_needs_refresh(
+                        service,
+                        repository,
+                        provider_name,
+                        latest_run_id,
+                        time_range=normalized_time_range,
+                    ):
+                        latest_run_id = None
+                    else:
+                        FRONTEND_RUN_CACHE[scope_key] = latest_run_id
+                        return latest_run_id, provider_name
 
     bootstrap_limit = min(settings.default_scan_limit, 50)
     bootstrap_batch_size = min(settings.default_batch_size, 50)
@@ -333,15 +394,15 @@ def _ensure_frontend_run(*, provider: Optional[str] = None, force: bool = False)
 
     wait_job: Optional[FrontendRunJob] = None
     with FRONTEND_ACTIVE_RUNS_LOCK:
-        active_job = FRONTEND_ACTIVE_RUNS.get(provider_name)
+        active_job = FRONTEND_ACTIVE_RUNS.get(scope_key)
         if active_job is not None:
             wait_job = active_job
         else:
             job = FrontendRunJob(provider_name=provider_name)
-            FRONTEND_ACTIVE_RUNS[provider_name] = job
+            FRONTEND_ACTIVE_RUNS[scope_key] = job
 
     if wait_job is not None:
-        return _wait_for_frontend_job(wait_job, provider_name)
+        return _wait_for_frontend_job(wait_job, provider_name, time_range=normalized_time_range)
 
     _update_frontend_progress(
         provider_name,
@@ -358,6 +419,7 @@ def _ensure_frontend_run(*, provider: Optional[str] = None, force: bool = False)
             "run_id": latest_run_id,
             "error": None,
         },
+        time_range=normalized_time_range,
     )
 
     try:
@@ -383,18 +445,22 @@ def _ensure_frontend_run(*, provider: Optional[str] = None, force: bool = False)
                 )
             ),
             workspace_policy=settings.policy,
-            progress_callback=lambda payload: _update_frontend_progress(provider_name, payload),
+            progress_callback=lambda payload: _update_frontend_progress(
+                provider_name,
+                payload,
+                time_range=normalized_time_range,
+            ),
+            time_range=normalized_time_range,
         )
     except HTTPException:
         job.error = "InboxAnchor could not prepare the live mailbox."
         job.event.set()
         with FRONTEND_ACTIVE_RUNS_LOCK:
-            FRONTEND_ACTIVE_RUNS.pop(provider_name, None)
+            FRONTEND_ACTIVE_RUNS.pop(scope_key, None)
         raise
     except Exception as exc:
         message = _provider_runtime_error_message(provider_name, exc)
         job.error = message
-        FRONTEND_PROVIDER_ERRORS[provider_name] = message
         _update_frontend_progress(
             provider_name,
             {
@@ -403,14 +469,14 @@ def _ensure_frontend_run(*, provider: Optional[str] = None, force: bool = False)
                 "stage": "failed",
                 "error": message,
             },
+            time_range=normalized_time_range,
         )
         job.event.set()
         with FRONTEND_ACTIVE_RUNS_LOCK:
-            FRONTEND_ACTIVE_RUNS.pop(provider_name, None)
+            FRONTEND_ACTIVE_RUNS.pop(scope_key, None)
         raise HTTPException(status_code=502, detail=message) from exc
 
-    FRONTEND_RUN_CACHE[provider_name] = result.run_id
-    FRONTEND_PROVIDER_ERRORS.pop(provider_name, None)
+    FRONTEND_RUN_CACHE[scope_key] = result.run_id
     scanned_emails = getattr(
         result,
         "scanned_emails",
@@ -435,11 +501,12 @@ def _ensure_frontend_run(*, provider: Optional[str] = None, force: bool = False)
             "run_id": result.run_id,
             "error": None,
         },
+        time_range=normalized_time_range,
     )
     job.run_id = result.run_id
     job.event.set()
     with FRONTEND_ACTIVE_RUNS_LOCK:
-        FRONTEND_ACTIVE_RUNS.pop(provider_name, None)
+        FRONTEND_ACTIVE_RUNS.pop(scope_key, None)
     STREAM_HUB.emit(
         {
             "type": "triage_refreshed",
@@ -568,22 +635,39 @@ def _load_mailbox_email_map(provider_name: str, email_ids: list[str]) -> dict[st
         return repository.get_mailbox_email_map(provider_name, email_ids)
 
 
-def _load_mailbox_cache_stats(provider_name: str) -> dict:
+def _load_mailbox_cache_stats(provider_name: str, *, time_range: Optional[str] = None) -> dict:
     with session_scope() as session:
         repository = InboxRepository(session)
-        return repository.get_mailbox_cache_stats(provider_name)
+        return repository.get_mailbox_cache_stats(
+            provider_name,
+            time_range=normalize_time_range(time_range),
+        )
 
 
-def _load_mailbox_sync_state(provider_name: str) -> Optional[dict]:
+def _load_mailbox_sync_state(
+    provider_name: str,
+    *,
+    time_range: Optional[str] = None,
+) -> Optional[dict]:
     with session_scope() as session:
         repository = InboxRepository(session)
-        return repository.get_provider_sync_state(provider_name, MAILBOX_BACKFILL_SYNC_KIND)
+        return repository.get_provider_sync_state(
+            provider_name,
+            _scope_sync_kind(time_range),
+        )
 
 
-def _get_cached_or_latest_run_id(provider_name: str) -> Optional[str]:
-    cached = FRONTEND_RUN_CACHE.get(provider_name)
+def _get_cached_or_latest_run_id(
+    provider_name: str,
+    *,
+    time_range: Optional[str] = None,
+) -> Optional[str]:
+    normalized_time_range = normalize_time_range(time_range)
+    cached = FRONTEND_RUN_CACHE.get(_scope_key(provider_name, normalized_time_range))
     if cached:
         return cached
+    if normalized_time_range != ALL_TIME_RANGE:
+        return None
     with session_scope() as session:
         return InboxRepository(session).get_latest_run_id(provider_name)
 
@@ -701,13 +785,19 @@ def _apply_provider_action(
     }
 
 
-def _build_ops_overview(provider_name: str, run_id: str) -> dict:
+def _build_ops_overview(
+    provider_name: str,
+    run_id: str,
+    *,
+    time_range: Optional[str] = None,
+) -> dict:
+    normalized_time_range = normalize_time_range(time_range)
     settings = _get_workspace_settings()
     digest = _load_digest(run_id)
     blocked = FRONTEND_BLOCK_REGISTRY.setdefault(provider_name, set())
     connection = InboxAnchorService().load_provider_connection(provider_name)
-    cache_stats = _load_mailbox_cache_stats(provider_name)
-    sync_state = _load_mailbox_sync_state(provider_name)
+    cache_stats = _load_mailbox_cache_stats(provider_name, time_range=normalized_time_range)
+    sync_state = _load_mailbox_sync_state(provider_name, time_range=normalized_time_range)
     historical_target = min(max(settings.default_scan_limit * 4, 5000), 20000)
     mailbox_target = (
         max(historical_target, int(sync_state.get("target_count") or 0))
@@ -743,6 +833,9 @@ def _build_ops_overview(provider_name: str, run_id: str) -> dict:
 
     return {
         "provider": provider_name,
+        "timeRange": normalized_time_range,
+        "timeRangeLabel": time_range_label(normalized_time_range),
+        "timeRangeOptions": available_time_ranges(),
         "runId": run_id,
         "unreadCount": digest["total_unread"],
         "highPriorityCount": high_priority_count,
@@ -767,7 +860,10 @@ def _build_ops_overview(provider_name: str, run_id: str) -> dict:
                 "slug": "scan",
                 "label": "Fresh unread scan",
                 "description": "Rebuild the unread inventory before taking action.",
-                "impact": f"Scans up to {settings.default_scan_limit} unread emails.",
+                "impact": (
+                    f"Scans up to {settings.default_scan_limit} unread emails in "
+                    f"{time_range_label(normalized_time_range).lower()}."
+                ),
             },
             {
                 "slug": "backfill",
@@ -777,7 +873,8 @@ def _build_ops_overview(provider_name: str, run_id: str) -> dict:
                     "a huge live triage run."
                 ),
                 "impact": (
-                    f"Cache up to {mailbox_target} historical emails so search, "
+                    f"Cache up to {mailbox_target} historical emails for "
+                    f"{time_range_label(normalized_time_range).lower()} so search, "
                     "hydration, and future syncs have more context."
                 ),
             },
@@ -786,7 +883,8 @@ def _build_ops_overview(provider_name: str, run_id: str) -> dict:
                 "label": "Auto-label unread mail",
                 "description": "Apply category, urgency, attachment, and action labels.",
                 "impact": (
-                    f"{auto_label_candidates} unread emails can receive helpful "
+                    f"{auto_label_candidates} unread emails in "
+                    f"{time_range_label(normalized_time_range).lower()} can receive helpful "
                     "labels right now."
                 ),
             },
@@ -794,15 +892,19 @@ def _build_ops_overview(provider_name: str, run_id: str) -> dict:
                 "slug": "safe-cleanup",
                 "label": "Run safe cleanup",
                 "description": "Apply only low-risk mark-read and archive actions.",
-                "impact": f"{safe_count} recommendations are safe to execute immediately.",
+                "impact": (
+                    f"{safe_count} recommendations in "
+                    f"{time_range_label(normalized_time_range).lower()} are safe to execute "
+                    "immediately."
+                ),
             },
             {
                 "slug": "full-anchor",
                 "label": "Mailbox upgrade sweep",
                 "description": "Label first, then run safe cleanup on the same unread set.",
                 "impact": (
-                    "Best for making Gmail, Yahoo, and IMAP inboxes visibly cleaner "
-                    "without unsafe deletion."
+                    f"Best for making {time_range_label(normalized_time_range).lower()} in "
+                    "Gmail, Yahoo, and IMAP inboxes visibly cleaner without unsafe deletion."
                 ),
             },
         ],
@@ -814,11 +916,12 @@ def frontend_emails(
     q: str = "",
     category: str = "",
     priority: str = "",
+    time_range: str = "",
     unread_only: bool = Query(default=False),
     limit: int = Query(default=25, ge=1, le=250),
     offset: int = Query(default=0, ge=0),
 ):
-    run_id, provider_name = _ensure_frontend_run()
+    run_id, provider_name = _ensure_frontend_run(time_range=time_range or None)
     with session_scope() as session:
         repository = InboxRepository(session)
         total = repository.count_run_email_details(
@@ -827,6 +930,7 @@ def frontend_emails(
             category=category or None,
             q=q or None,
             unread_only=unread_only,
+            time_range=time_range or None,
         )
         page = repository.list_run_email_details(
             run_id,
@@ -836,6 +940,7 @@ def frontend_emails(
             category=category or None,
             q=q or None,
             unread_only=unread_only,
+            time_range=time_range or None,
         )
     mailbox_map = _load_mailbox_email_map(provider_name, [item["email_id"] for item in page])
     return {
@@ -848,8 +953,8 @@ def frontend_emails(
 
 
 @router.get("/emails/{email_id}")
-def frontend_email(email_id: str):
-    run_id, provider_name = _ensure_frontend_run()
+def frontend_email(email_id: str, time_range: str = ""):
+    run_id, provider_name = _ensure_frontend_run(time_range=time_range or None)
     with session_scope() as session:
         detail = InboxRepository(session).get_run_email_detail(run_id, email_id)
     if detail is None:
@@ -865,8 +970,8 @@ def frontend_email(email_id: str):
 
 
 @router.get("/classifications")
-def frontend_classifications():
-    run_id, _ = _ensure_frontend_run()
+def frontend_classifications(time_range: str = ""):
+    run_id, _ = _ensure_frontend_run(time_range=time_range or None)
     details = _load_email_details(run_id)
     return {
         item["email_id"]: _frontend_classification_payload(item)
@@ -875,8 +980,8 @@ def frontend_classifications():
 
 
 @router.get("/recommendations")
-def frontend_recommendations(email_id: str = ""):
-    run_id, provider_name = _ensure_frontend_run()
+def frontend_recommendations(email_id: str = "", time_range: str = ""):
+    run_id, provider_name = _ensure_frontend_run(time_range=time_range or None)
     blocked = FRONTEND_BLOCK_REGISTRY.setdefault(provider_name, set())
     if email_id:
         with session_scope() as session:
@@ -891,8 +996,8 @@ def frontend_recommendations(email_id: str = ""):
 
 
 @router.get("/emails/{email_id}/actions")
-def frontend_action_items(email_id: str):
-    run_id, _ = _ensure_frontend_run()
+def frontend_action_items(email_id: str, time_range: str = ""):
+    run_id, _ = _ensure_frontend_run(time_range=time_range or None)
     items = _load_action_items(run_id, email_id)
     return [
         {
@@ -906,8 +1011,8 @@ def frontend_action_items(email_id: str):
 
 
 @router.get("/digest")
-def frontend_digest():
-    run_id, _ = _ensure_frontend_run()
+def frontend_digest(time_range: str = ""):
+    run_id, _ = _ensure_frontend_run(time_range=time_range or None)
     digest = _load_digest(run_id)
     return {
         "totalUnread": digest["total_unread"],
@@ -918,19 +1023,24 @@ def frontend_digest():
 
 
 @router.get("/ops/overview")
-def frontend_ops_overview(provider: str = ""):
-    run_id, provider_name = _ensure_frontend_run(provider=provider or None)
-    return _build_ops_overview(provider_name, run_id)
+def frontend_ops_overview(provider: str = "", time_range: str = ""):
+    run_id, provider_name = _ensure_frontend_run(
+        provider=provider or None,
+        time_range=time_range or None,
+    )
+    return _build_ops_overview(provider_name, run_id, time_range=time_range or None)
 
 
 @router.get("/ops/progress")
-def frontend_ops_progress(provider: str = ""):
+def frontend_ops_progress(provider: str = "", time_range: str = ""):
     provider_name = _get_provider_name(provider or None)
-    progress = FRONTEND_PROGRESS.get(provider_name)
+    normalized_time_range = normalize_time_range(time_range or None)
+    scope_key = _scope_key(provider_name, normalized_time_range)
+    progress = FRONTEND_PROGRESS.get(scope_key)
     if progress:
         return progress
-    cache_stats = _load_mailbox_cache_stats(provider_name)
-    sync_state = _load_mailbox_sync_state(provider_name)
+    cache_stats = _load_mailbox_cache_stats(provider_name, time_range=normalized_time_range)
+    sync_state = _load_mailbox_sync_state(provider_name, time_range=normalized_time_range)
     if sync_state:
         target_count = int(sync_state.get("target_count") or 0)
         processed_count = int(sync_state.get("processed_count") or 0)
@@ -938,6 +1048,8 @@ def frontend_ops_progress(provider: str = ""):
         completed = bool(sync_state.get("completed"))
         return {
             "provider": provider_name,
+            "time_range": normalized_time_range,
+            "time_range_label": time_range_label(normalized_time_range),
             "mode": "backfill",
             "status": "complete" if completed else "paused",
             "stage": "backfill_ready" if completed else "backfill_resume",
@@ -955,12 +1067,14 @@ def frontend_ops_progress(provider: str = ""):
             "resume_offset": resume_offset,
             "remaining_count": max(target_count - resume_offset, 0),
             "completed": completed,
-            "run_id": FRONTEND_RUN_CACHE.get(provider_name),
-            "error": FRONTEND_PROVIDER_ERRORS.get(provider_name),
+            "run_id": FRONTEND_RUN_CACHE.get(scope_key),
+            "error": FRONTEND_PROVIDER_ERRORS.get(scope_key),
             "updated_at": sync_state.get("updated_at", datetime.now(timezone.utc).isoformat()),
         }
     return {
         "provider": provider_name,
+        "time_range": normalized_time_range,
+        "time_range_label": time_range_label(normalized_time_range),
         "mode": "scan",
         "status": "idle",
         "stage": "idle",
@@ -978,8 +1092,8 @@ def frontend_ops_progress(provider: str = ""):
         "resume_offset": 0,
         "remaining_count": 0,
         "completed": False,
-        "run_id": FRONTEND_RUN_CACHE.get(provider_name),
-        "error": FRONTEND_PROVIDER_ERRORS.get(provider_name),
+        "run_id": FRONTEND_RUN_CACHE.get(scope_key),
+        "error": FRONTEND_PROVIDER_ERRORS.get(scope_key),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -989,8 +1103,9 @@ def frontend_ops_scan(payload: FrontendProviderWorkflowRequest):
     run_id, provider_name = _ensure_frontend_run(
         provider=payload.provider,
         force=payload.force_refresh,
+        time_range=payload.time_range,
     )
-    overview = _build_ops_overview(provider_name, run_id)
+    overview = _build_ops_overview(provider_name, run_id, time_range=payload.time_range)
     STREAM_HUB.emit(
         {
             "type": "scan_completed",
@@ -1004,6 +1119,8 @@ def frontend_ops_scan(payload: FrontendProviderWorkflowRequest):
 @router.post("/ops/backfill")
 def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
     provider_name = _get_provider_name(payload.provider)
+    normalized_time_range = normalize_time_range(payload.time_range)
+    sync_kind = _scope_sync_kind(normalized_time_range)
     service = _service_for_provider(provider_name)
     start_offset = 0
     processed_total = 0
@@ -1015,15 +1132,19 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
     with session_scope() as session:
         repository = InboxRepository(session)
         if payload.force_refresh:
-            repository.clear_provider_sync_state(provider_name, MAILBOX_BACKFILL_SYNC_KIND)
-        sync_state = repository.get_provider_sync_state(provider_name, MAILBOX_BACKFILL_SYNC_KIND)
-        cache_stats = repository.get_mailbox_cache_stats(provider_name)
+            repository.clear_provider_sync_state(provider_name, sync_kind)
+        sync_state = repository.get_provider_sync_state(provider_name, sync_kind)
+        cache_stats = repository.get_mailbox_cache_stats(
+            provider_name,
+            time_range=normalized_time_range,
+        )
 
     if (
         sync_state
         and not payload.force_refresh
         and bool(sync_state.get("include_body")) == payload.include_body
         and bool(sync_state.get("unread_only")) == payload.unread_only
+        and normalize_time_range(sync_state.get("time_range")) == normalized_time_range
     ):
         start_offset = min(
             int(sync_state.get("next_offset") or sync_state.get("processed_count") or 0),
@@ -1037,10 +1158,20 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
         batch_count = int(sync_state.get("batch_count") or 0)
         latest_subject = sync_state.get("latest_subject")
         if bool(sync_state.get("completed")) and start_offset >= payload.limit:
-            run_id = _get_cached_or_latest_run_id(provider_name)
+            run_id = _get_cached_or_latest_run_id(
+                provider_name,
+                time_range=normalized_time_range,
+            )
             if run_id is None:
-                run_id, _ = _ensure_frontend_run(provider=provider_name)
-            overview = _build_ops_overview(provider_name, run_id)
+                run_id, _ = _ensure_frontend_run(
+                    provider=provider_name,
+                    time_range=normalized_time_range,
+                )
+            overview = _build_ops_overview(
+                provider_name,
+                run_id,
+                time_range=normalized_time_range,
+            )
             _update_frontend_progress(
                 provider_name,
                 {
@@ -1061,6 +1192,7 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
                     "completed": True,
                     "error": None,
                 },
+                time_range=normalized_time_range,
             )
             return {
                 "count": 0,
@@ -1095,6 +1227,7 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
             "completed": False,
             "error": None,
         },
+        time_range=normalized_time_range,
     )
 
     try:
@@ -1104,6 +1237,7 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
             include_body=payload.include_body,
             unread_only=payload.unread_only,
             offset=start_offset,
+            time_range=normalized_time_range,
         ):
             batch_count += 1
             with session_scope() as session:
@@ -1114,10 +1248,13 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
                     processed_total += 1
                     if (email.body_full or "").strip():
                         hydrated_total += 1
-                cache_stats = repository.get_mailbox_cache_stats(provider_name)
+                cache_stats = repository.get_mailbox_cache_stats(
+                    provider_name,
+                    time_range=normalized_time_range,
+                )
                 repository.save_provider_sync_state(
                     provider_name,
-                    MAILBOX_BACKFILL_SYNC_KIND,
+                    sync_kind,
                     {
                         "target_count": payload.limit,
                         "processed_count": processed_total,
@@ -1127,6 +1264,7 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
                         "cached_count": cache_stats["cached_count"],
                         "include_body": payload.include_body,
                         "unread_only": payload.unread_only,
+                        "time_range": normalized_time_range,
                         "completed": False,
                         "latest_subject": batch[0].subject if batch else latest_subject,
                     },
@@ -1151,6 +1289,7 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
                     "remaining_count": max(payload.limit - processed_total, 0),
                     "completed": False,
                 },
+                time_range=normalized_time_range,
             )
     except NotImplementedError as exc:
         message = str(exc)
@@ -1162,11 +1301,11 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
                 "stage": "unsupported",
                 "error": message,
             },
+            time_range=normalized_time_range,
         )
         raise HTTPException(status_code=400, detail=message) from exc
     except Exception as exc:
         message = _provider_runtime_error_message(provider_name, exc)
-        FRONTEND_PROVIDER_ERRORS[provider_name] = message
         _update_frontend_progress(
             provider_name,
             {
@@ -1175,16 +1314,17 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
                 "stage": "failed",
                 "error": message,
             },
+            time_range=normalized_time_range,
         )
         raise HTTPException(status_code=502, detail=message) from exc
 
-    cache_stats = _load_mailbox_cache_stats(provider_name)
+    cache_stats = _load_mailbox_cache_stats(provider_name, time_range=normalized_time_range)
     completed = processed_total >= payload.limit or processed_this_run == 0
     with session_scope() as session:
         repository = InboxRepository(session)
         repository.save_provider_sync_state(
             provider_name,
-            MAILBOX_BACKFILL_SYNC_KIND,
+            sync_kind,
             {
                 "target_count": payload.limit,
                 "processed_count": processed_total,
@@ -1194,6 +1334,7 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
                 "cached_count": cache_stats["cached_count"],
                 "include_body": payload.include_body,
                 "unread_only": payload.unread_only,
+                "time_range": normalized_time_range,
                 "completed": completed,
                 "latest_subject": latest_subject,
             },
@@ -1218,15 +1359,23 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
             "completed": completed,
             "error": None,
         },
+        time_range=normalized_time_range,
     )
 
-    run_id = _get_cached_or_latest_run_id(provider_name)
+    run_id = _get_cached_or_latest_run_id(provider_name, time_range=normalized_time_range)
     if run_id is None:
-        run_id, _ = _ensure_frontend_run(provider=provider_name)
+        run_id, _ = _ensure_frontend_run(
+            provider=provider_name,
+            time_range=normalized_time_range,
+        )
     elif payload.force_refresh:
-        run_id, _ = _ensure_frontend_run(provider=provider_name, force=True)
+        run_id, _ = _ensure_frontend_run(
+            provider=provider_name,
+            force=True,
+            time_range=normalized_time_range,
+        )
 
-    overview = _build_ops_overview(provider_name, run_id)
+    overview = _build_ops_overview(provider_name, run_id, time_range=normalized_time_range)
     STREAM_HUB.emit(
         {
             "type": "mailbox_backfill_completed",
@@ -1249,7 +1398,10 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
 
 @router.post("/ops/auto-label")
 def frontend_ops_auto_label(payload: FrontendProviderWorkflowRequest):
-    run_id, provider_name = _ensure_frontend_run(provider=payload.provider)
+    run_id, provider_name = _ensure_frontend_run(
+        provider=payload.provider,
+        time_range=payload.time_range,
+    )
     details = _load_email_details(run_id)
     applied: list[dict] = []
     for detail in details:
@@ -1273,8 +1425,13 @@ def frontend_ops_auto_label(payload: FrontendProviderWorkflowRequest):
     refreshed_run_id, _ = _ensure_frontend_run(
         provider=provider_name,
         force=payload.force_refresh,
+        time_range=payload.time_range,
     )
-    overview = _build_ops_overview(provider_name, refreshed_run_id)
+    overview = _build_ops_overview(
+        provider_name,
+        refreshed_run_id,
+        time_range=payload.time_range,
+    )
     STREAM_HUB.emit(
         {
             "type": "auto_label_completed",
@@ -1288,7 +1445,10 @@ def frontend_ops_auto_label(payload: FrontendProviderWorkflowRequest):
 
 @router.post("/ops/safe-cleanup")
 def frontend_ops_safe_cleanup(payload: FrontendProviderWorkflowRequest):
-    run_id, provider_name = _ensure_frontend_run(provider=payload.provider)
+    run_id, provider_name = _ensure_frontend_run(
+        provider=payload.provider,
+        time_range=payload.time_range,
+    )
     blocked = FRONTEND_BLOCK_REGISTRY.setdefault(provider_name, set())
     details = _load_recommendation_details(run_id)
     applied: list[dict] = []
@@ -1315,8 +1475,13 @@ def frontend_ops_safe_cleanup(payload: FrontendProviderWorkflowRequest):
     refreshed_run_id, _ = _ensure_frontend_run(
         provider=provider_name,
         force=payload.force_refresh,
+        time_range=payload.time_range,
     )
-    overview = _build_ops_overview(provider_name, refreshed_run_id)
+    overview = _build_ops_overview(
+        provider_name,
+        refreshed_run_id,
+        time_range=payload.time_range,
+    )
     STREAM_HUB.emit(
         {
             "type": "safe_cleanup_completed",
@@ -1334,12 +1499,14 @@ def frontend_ops_full_anchor(payload: FrontendProviderWorkflowRequest):
         FrontendProviderWorkflowRequest(
             provider=payload.provider,
             force_refresh=False,
+            time_range=payload.time_range,
         )
     )
     cleanup_result = frontend_ops_safe_cleanup(
         FrontendProviderWorkflowRequest(
             provider=payload.provider,
             force_refresh=payload.force_refresh,
+            time_range=payload.time_range,
         )
     )
     return {
@@ -1350,8 +1517,11 @@ def frontend_ops_full_anchor(payload: FrontendProviderWorkflowRequest):
 
 
 @router.post("/recommendations/apply-all-safe")
-def frontend_apply_all_safe(authorization: Optional[str] = Header(default=None)):
-    run_id, provider_name = _ensure_frontend_run()
+def frontend_apply_all_safe(
+    authorization: Optional[str] = Header(default=None),
+    time_range: str = "",
+):
+    run_id, provider_name = _ensure_frontend_run(time_range=time_range or None)
     blocked = FRONTEND_BLOCK_REGISTRY.setdefault(provider_name, set())
     details = _load_recommendation_details(run_id)
     applied: list[dict] = []
@@ -1373,7 +1543,11 @@ def frontend_apply_all_safe(authorization: Optional[str] = Header(default=None))
         )
         blocked.discard(detail["email_id"])
 
-    refreshed_run_id, _ = _ensure_frontend_run(provider=provider_name, force=True)
+    refreshed_run_id, _ = _ensure_frontend_run(
+        provider=provider_name,
+        force=True,
+        time_range=time_range or None,
+    )
     STREAM_HUB.emit(
         {
             "type": "actions_applied",
@@ -1390,8 +1564,9 @@ def frontend_apply_recommendation(
     email_id: str,
     payload: FrontendRecommendationActionRequest,
     authorization: Optional[str] = Header(default=None),
+    time_range: str = "",
 ):
-    run_id, provider_name = _ensure_frontend_run()
+    run_id, provider_name = _ensure_frontend_run(time_range=time_range or None)
     detail = _find_recommendation_detail(run_id, email_id)
     recommendation = _frontend_recommendation_payload(detail)
     result = _apply_provider_action(
@@ -1405,7 +1580,11 @@ def frontend_apply_recommendation(
         safety_status=SafetyStatus.allowed,
     )
     FRONTEND_BLOCK_REGISTRY.setdefault(provider_name, set()).discard(email_id)
-    refreshed_run_id, _ = _ensure_frontend_run(provider=provider_name, force=True)
+    refreshed_run_id, _ = _ensure_frontend_run(
+        provider=provider_name,
+        force=True,
+        time_range=time_range or None,
+    )
     STREAM_HUB.emit(
         {
             "type": "recommendation_applied",
@@ -1422,8 +1601,9 @@ def frontend_approve_recommendation(
     email_id: str,
     payload: FrontendRecommendationActionRequest,
     authorization: Optional[str] = Header(default=None),
+    time_range: str = "",
 ):
-    run_id, provider_name = _ensure_frontend_run()
+    run_id, provider_name = _ensure_frontend_run(time_range=time_range or None)
     detail = _find_recommendation_detail(run_id, email_id)
     recommendation = _frontend_recommendation_payload(detail)
     result = _apply_provider_action(
@@ -1446,7 +1626,11 @@ def frontend_approve_recommendation(
             "actor": actor_email,
         }
     )
-    _ensure_frontend_run(provider=provider_name, force=True)
+    _ensure_frontend_run(
+        provider=provider_name,
+        force=True,
+        time_range=time_range or None,
+    )
     return {"ok": True, **result}
 
 
@@ -1455,8 +1639,9 @@ def frontend_block_recommendation(
     email_id: str,
     payload: FrontendRecommendationActionRequest,
     authorization: Optional[str] = Header(default=None),
+    time_range: str = "",
 ):
-    run_id, provider_name = _ensure_frontend_run()
+    run_id, provider_name = _ensure_frontend_run(time_range=time_range or None)
     detail = _find_recommendation_detail(run_id, email_id)
     recommendation = _frontend_recommendation_payload(detail, blocked=True)
     blocked = FRONTEND_BLOCK_REGISTRY.setdefault(provider_name, set())
