@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from inboxanchor.bootstrap import build_demo_emails
@@ -9,7 +10,9 @@ def test_relative_sqlite_url_resolves_to_app_data_directory():
     resolved = _resolve_database_url("sqlite:///./inboxanchor.db")
 
     assert resolved.startswith("sqlite:///")
-    assert "/inboxanchor/inboxanchor.db" in resolved
+    expected_dir = os.getenv("INBOXANCHOR_DATA_DIR", "")
+    assert resolved.endswith("/inboxanchor.db")
+    assert expected_dir in resolved
 
 
 def test_absolute_sqlite_url_is_preserved_when_parent_is_writable(tmp_path):

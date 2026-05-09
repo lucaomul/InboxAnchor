@@ -1192,6 +1192,69 @@ def test_frontend_zero_live_run_triggers_fresh_refresh(monkeypatch):
     assert provider_name == "gmail"
 
 
+def test_frontend_zero_bounded_run_uses_cached_scope_without_live_probe(monkeypatch):
+    frontend_router.FRONTEND_RUN_CACHE.clear()
+    frontend_router.FRONTEND_SERVICE_CACHE.clear()
+    frontend_router.FRONTEND_BLOCK_REGISTRY.clear()
+    frontend_router.FRONTEND_FORCE_REFRESH_PROVIDERS.clear()
+    frontend_router.FRONTEND_PROVIDER_ERRORS.clear()
+    frontend_router.FRONTEND_PROGRESS.clear()
+    frontend_router.FRONTEND_ACTIVE_RUNS.clear()
+
+    scoped_key = frontend_router._scope_key("gmail", "older_than_10_years")
+    frontend_router.FRONTEND_RUN_CACHE[scoped_key] = "zero-bounded-run"
+
+    class ZeroBoundedRepository:
+        def __init__(self, session):
+            self.session = session
+
+        def get_run(self, run_id):
+            assert run_id == "zero-bounded-run"
+            return {"run_id": run_id}
+
+        def count_run_email_details(self, run_id, **kwargs):
+            del kwargs
+            assert run_id == "zero-bounded-run"
+            return 0
+
+    class NoProbeProvider:
+        provider_name = "gmail"
+
+        def list_unread(self, *args, **kwargs):
+            raise AssertionError("Historical zero runs should not probe Gmail again.")
+
+    class ConnectedService:
+        def __init__(self):
+            self.provider = NoProbeProvider()
+
+        def load_provider_connection(self, provider_name):
+            return SimpleNamespace(
+                provider=provider_name,
+                status="connected",
+                sync_enabled=True,
+            )
+
+    @contextmanager
+    def fake_session_scope():
+        yield object()
+
+    monkeypatch.setattr(frontend_router, "InboxRepository", ZeroBoundedRepository)
+    monkeypatch.setattr(frontend_router, "session_scope", fake_session_scope)
+    monkeypatch.setattr(
+        frontend_router,
+        "_service_for_provider",
+        lambda provider_name: ConnectedService(),
+    )
+
+    run_id, provider_name = frontend_router._ensure_frontend_run(
+        provider="gmail",
+        time_range="older_than_10_years",
+    )
+
+    assert run_id == "zero-bounded-run"
+    assert provider_name == "gmail"
+
+
 def test_frontend_gmail_auth_routes_issue_local_session(monkeypatch, tmp_path):
     credentials_path = tmp_path / "credentials.json"
     token_path = tmp_path / "token.json"

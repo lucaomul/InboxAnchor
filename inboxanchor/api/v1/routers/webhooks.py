@@ -17,6 +17,7 @@ def gmail_webhook(payload: dict):
         settings = service.load_workspace_settings()
         result = service.engine.run(
             dry_run=True,
+            incremental=True,
             limit=settings.default_scan_limit,
             batch_size=settings.default_batch_size,
             confidence_threshold=settings.default_confidence_threshold,

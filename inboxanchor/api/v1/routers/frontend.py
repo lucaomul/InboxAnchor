@@ -392,6 +392,8 @@ def _zero_run_needs_refresh(
         return False
     if repository.count_run_email_details(run_id) > 0:
         return False
+    if normalize_time_range(time_range) != ALL_TIME_RANGE:
+        return False
     try:
         unread_probe = service.provider.list_unread(
             limit=1,

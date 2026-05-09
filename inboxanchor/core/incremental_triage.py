@@ -67,8 +67,10 @@ class IncrementalTriageEngine:
     def run(self, **kwargs):
         original_provider = self.engine.provider
         checkpoint = self._get_checkpoint()
+        incremental = bool(kwargs.pop("incremental", False))
         use_incremental = (
-            checkpoint
+            incremental
+            and checkpoint
             and callable(getattr(original_provider, "supports_incremental_sync", None))
             and original_provider.supports_incremental_sync()
         )

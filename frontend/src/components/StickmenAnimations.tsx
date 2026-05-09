@@ -177,7 +177,7 @@ export function StickmanLoader({
           </div>
         ) : null}
         {resolvedFunMode ? (
-          <StickmanInboxRunner autoplay {...runnerProps} />
+          <StickmanInboxRunner {...runnerProps} />
         ) : (
           <div className="flex w-full max-w-[360px] flex-col items-center gap-4 rounded-2xl border border-border bg-background/80 p-6 shadow-sm">
             <div className="h-12 w-12 animate-spin rounded-full border-4 border-border border-t-primary" />

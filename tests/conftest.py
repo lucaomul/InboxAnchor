@@ -1,4 +1,17 @@
+"""Pytest state reset with an isolated test database."""
+
+# ruff: noqa: E402
+
+import os
+import tempfile
+from pathlib import Path
+
 import pytest
+
+TEST_DATA_DIR = Path(tempfile.gettempdir()) / "inboxanchor-tests"
+TEST_DATA_DIR.mkdir(parents=True, exist_ok=True)
+os.environ["INBOXANCHOR_DATA_DIR"] = str(TEST_DATA_DIR)
+os.environ["DATABASE_URL"] = f"sqlite:///{TEST_DATA_DIR / 'inboxanchor-test.db'}"
 
 from inboxanchor.api.main import APPROVAL_REGISTRY, get_service
 from inboxanchor.api.v1.routers.frontend import (

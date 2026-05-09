@@ -9,6 +9,12 @@ InboxAnchor is a safety-first inbox triage system for overloaded email accounts.
 The demo reel shows the command center, live unread-scan progress, the stickman loading game, inbox triage, mailbox upgrade actions, and managed privacy aliases in one short product loop.
 It intentionally uses curated demo data for privacy, so the capture never exposes sensitive content from a real mailbox.
 
+## Walkthrough Video
+
+<video src="docs/assets/inboxanchor-demo.mp4" controls muted playsinline poster="docs/assets/inboxanchor-demo-poster.png" width="100%"></video>
+
+If your GitHub client does not render embedded video, open the [full walkthrough MP4](docs/assets/inboxanchor-demo.mp4) directly.
+
 ## What It Does
 
 - Connects to demo, Gmail, and IMAP-family provider paths through a shared provider abstraction

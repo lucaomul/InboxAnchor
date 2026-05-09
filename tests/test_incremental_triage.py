@@ -43,7 +43,7 @@ def test_incremental_triage_uses_and_updates_checkpoint():
     with session_scope() as session:
         InboxRepository(session).save_checkpoint("incremental", "history-1")
 
-    result = engine.run(dry_run=True, limit=10)
+    result = engine.run(dry_run=True, limit=10, incremental=True)
 
     assert provider.received_checkpoint == "history-1"
     assert result.total_emails == 2
@@ -51,3 +51,17 @@ def test_incremental_triage_uses_and_updates_checkpoint():
     with session_scope() as session:
         checkpoint = InboxRepository(session).get_checkpoint("incremental")
     assert checkpoint == "next-history"
+
+
+def test_incremental_triage_defaults_to_full_unread_scan():
+    provider = IncrementalProvider(build_demo_emails())
+    base_engine = TriageEngine(provider)
+    engine = IncrementalTriageEngine(base_engine, provider_name="incremental")
+
+    with session_scope() as session:
+        InboxRepository(session).save_checkpoint("incremental", "history-1")
+
+    result = engine.run(dry_run=True, limit=10)
+
+    assert provider.received_checkpoint is None
+    assert result.total_emails == len(build_demo_emails())
