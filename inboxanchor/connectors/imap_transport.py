@@ -14,6 +14,7 @@ from typing import Optional
 
 from inboxanchor.connectors.base import EmailProvider, ProviderActionResult
 from inboxanchor.core.time_windows import imap_since_before_for_time_range, resolve_time_window
+from inboxanchor.infra.text_normalizer import normalize_email_body_text
 from inboxanchor.models import EmailMessage
 
 logger = logging.getLogger(__name__)
@@ -207,16 +208,18 @@ class ImaplibTransport(EmailProvider):
                     continue
                 text = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
                 if content_type == "text/plain" and plain_body is None:
-                    plain_body = text.strip()
+                    plain_body = normalize_email_body_text(text.strip())
                 elif content_type == "text/html" and html_body is None:
-                    html_body = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", unescape(text))).strip()
+                    html_body = normalize_email_body_text(
+                        re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", unescape(text))).strip()
+                    )
         else:
             payload = message.get_payload(decode=True) or b""
-            plain_body = payload.decode(
+            plain_body = normalize_email_body_text(payload.decode(
                 message.get_content_charset() or "utf-8",
                 errors="replace",
-            ).strip()
-        return plain_body or html_body or ""
+            ).strip())
+        return normalize_email_body_text(plain_body or html_body or "")
 
     def _message_to_email(
         self,
@@ -471,6 +474,39 @@ class ImaplibTransport(EmailProvider):
             email_ids=email_ids,
             dry_run=dry_run,
             executed=not dry_run,
+            details=details,
+        )
+
+    def remove_labels(
+        self,
+        email_ids: list[str],
+        labels: list[str],
+        *,
+        dry_run: bool = True,
+    ) -> ProviderActionResult:
+        details = f"IMAP label removal prepared: {', '.join(labels)}"
+        executed = not dry_run
+        if not dry_run and email_ids and labels:
+            client = self._connect()
+            uid_csv = ",".join(email_ids)
+            if "X-GM-EXT-1" in self._capabilities:
+                label_payload = "(" + " ".join(f'"{label}"' for label in labels) + ")"
+                status, _ = client.uid("STORE", uid_csv, "-X-GM-LABELS", label_payload)
+                if status != "OK":
+                    raise IMAPTransportError("Could not remove Gmail IMAP labels.")
+                details = f"IMAP labels removed via X-GM-LABELS: {', '.join(labels)}"
+            else:
+                executed = False
+                details = (
+                    "This IMAP provider does not expose safe label removal through folders. "
+                    "InboxAnchor skipped label cleanup."
+                )
+        return ProviderActionResult(
+            provider=self.provider_name,
+            action="remove_labels",
+            email_ids=email_ids,
+            dry_run=dry_run,
+            executed=executed,
             details=details,
         )
 

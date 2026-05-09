@@ -12,6 +12,8 @@ except ImportError:  # pragma: no cover - Python < 3.11 fallback
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from inboxanchor.infra.text_normalizer import normalize_email_body_text
+
 
 class EmailCategory(StrEnum):
     urgent = "urgent"
@@ -61,7 +63,9 @@ class EmailMessage(BaseModel):
     unread: bool = True
 
     def content_for_processing(self, *, max_chars: Optional[int] = None) -> str:
-        text = (self.body_full or self.body_preview or self.snippet).strip()
+        text = normalize_email_body_text(
+            (self.body_full or self.body_preview or self.snippet).strip()
+        )
         if max_chars is not None and len(text) > max_chars:
             return text[:max_chars]
         return text

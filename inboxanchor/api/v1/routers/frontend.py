@@ -24,6 +24,12 @@ from inboxanchor.infra.audit_log import AuditLogger
 from inboxanchor.infra.auth import AuthService
 from inboxanchor.infra.database import session_scope
 from inboxanchor.infra.repository import InboxRepository
+from inboxanchor.infra.text_normalizer import normalize_email_body_text
+from inboxanchor.mail_intelligence import (
+    dedupe_labels,
+    recommend_mailbox_labels,
+    select_inboxanchor_labels,
+)
 from inboxanchor.models import AutomationDecision, EmailAlias, SafetyStatus, WorkspaceSettings
 
 router = APIRouter(tags=["frontend-compat"])
@@ -263,6 +269,7 @@ def _update_frontend_progress(
         "cached_count": previous.get("cached_count", 0),
         "hydrated_count": previous.get("hydrated_count", 0),
         "labeled_count": previous.get("labeled_count", 0),
+        "labels_removed_count": previous.get("labels_removed_count", 0),
         "archived_count": previous.get("archived_count", 0),
         "marked_read_count": previous.get("marked_read_count", 0),
         "trashed_count": previous.get("trashed_count", 0),
@@ -302,6 +309,8 @@ def _update_frontend_progress(
         progress["hydrated_count"] = payload["hydrated_count"]
     if "labeled_count" in payload:
         progress["labeled_count"] = payload["labeled_count"]
+    if "labels_removed_count" in payload:
+        progress["labels_removed_count"] = payload["labels_removed_count"]
     if "archived_count" in payload:
         progress["archived_count"] = payload["archived_count"]
     if "marked_read_count" in payload:
@@ -595,37 +604,14 @@ def _ensure_frontend_run(
     return result.run_id, provider_name
 
 
-def _normalize_label(label: str) -> str:
-    return label.strip().replace(" ", "-").lower()
-
-
-def _dedupe_labels(labels: list[str]) -> list[str]:
-    seen: set[str] = set()
-    output: list[str] = []
-    for label in labels:
-        normalized = _normalize_label(label)
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        output.append(normalized)
-    return output
-
-
 def _frontend_recommendation_payload(detail: dict, *, blocked: bool = False) -> dict:
     classification = detail["classification"]
-    category = classification["category"]
     priority = classification["priority"]
     recommended_action = detail["recommended_action"]
 
-    proposed_labels = _dedupe_labels(
+    proposed_labels = dedupe_labels(
         detail.get("proposed_labels", [])
-        + ([] if category == "unknown" else [category])
-        + ([f"priority-{priority}"] if priority in {"critical", "high"} else [])
-        + (
-            ["action-needed"]
-            if category in {"work", "finance", "opportunity", "urgent"}
-            else []
-        )
+        + _recommended_labels_for_email(detail)
     )
 
     if recommended_action == "review":
@@ -655,20 +641,15 @@ def _frontend_recommendation_payload(detail: dict, *, blocked: bool = False) -> 
 
 def _recommended_labels_for_email(detail: dict) -> list[str]:
     classification = detail["classification"]
-    category = classification["category"]
-    priority = classification["priority"]
-    labels = []
-    if category and category != "unknown":
-        labels.append(category)
-    if priority in {"critical", "high"}:
-        labels.append(f"priority-{priority}")
-    if detail["has_attachments"]:
-        labels.append("has-attachments")
-    if category in {"urgent", "work", "finance", "opportunity"}:
-        labels.append("needs-action")
-    if category in {"newsletter", "promo", "low_priority"}:
-        labels.append("cleanup-candidate")
-    return _dedupe_labels(labels)
+    return recommend_mailbox_labels(
+        sender=detail.get("sender", ""),
+        subject=detail.get("subject", ""),
+        snippet=detail.get("snippet", ""),
+        body=detail.get("body_preview", ""),
+        has_attachments=detail.get("has_attachments", False),
+        category=classification["category"],
+        priority=classification["priority"],
+    )
 
 
 def _reply_draft_for_email(run_id: str, email_id: str) -> Optional[str]:
@@ -847,8 +828,8 @@ def _frontend_email_payload(
     can_reply: Optional[bool] = None,
     reply_to_address: Optional[str] = None,
 ) -> dict:
-    body_preview = detail.get("body_preview", "")
-    body_full = (mailbox_email or {}).get("body_full", body_preview)
+    body_preview = normalize_email_body_text(detail.get("body_preview", ""))
+    body_full = normalize_email_body_text((mailbox_email or {}).get("body_full", body_preview))
     return {
         "id": detail["email_id"],
         "threadId": detail["thread_id"],
@@ -983,6 +964,12 @@ def _find_recommendation_detail(run_id: str, email_id: str) -> dict:
     return detail
 
 
+def _labels_to_remove_for_email(detail: dict) -> list[str]:
+    suggested = _recommended_labels_for_email(detail)
+    existing = [str(label) for label in detail.get("labels", [])]
+    return select_inboxanchor_labels(existing, suggested)
+
+
 def _apply_provider_action(
     provider_name: str,
     email_id: str,
@@ -1038,6 +1025,54 @@ def _apply_provider_action(
         "action": action,
         "finalAction": final_action,
         "labelsApplied": labels,
+    }
+
+
+def _remove_provider_labels(
+    provider_name: str,
+    email_id: str,
+    labels: list[str],
+    *,
+    reason: str,
+    confidence: float,
+    approved_by_user: bool,
+    safety_status: str,
+) -> dict:
+    if not labels:
+        return {
+            "emailId": email_id,
+            "action": "remove_labels",
+            "finalAction": "labels_unchanged",
+            "labelsRemoved": [],
+        }
+
+    service = _service_for_provider(provider_name)
+    provider = service.provider
+    try:
+        provider.remove_labels([email_id], labels, dry_run=False)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_provider_runtime_error(provider_name, exc)
+
+    decision = AutomationDecision(
+        email_id=email_id,
+        proposed_action="remove_labels",
+        final_action="labels_removed",
+        approved_by_user=approved_by_user,
+        reason=reason,
+        confidence=confidence,
+        safety_verifier_status=safety_status,
+    )
+    audit_logger = AuditLogger()
+    audit_entry = audit_logger.create_entry(decision)
+    with session_scope() as session:
+        InboxRepository(session).add_audit_entry(audit_entry)
+    return {
+        "emailId": email_id,
+        "action": "remove_labels",
+        "finalAction": "labels_removed",
+        "labelsRemoved": labels,
     }
 
 
@@ -1142,6 +1177,15 @@ def _build_ops_overview(
                     f"{auto_label_candidates} unread emails in "
                     f"{time_range_label(normalized_time_range).lower()} can receive helpful "
                     "labels right now."
+                ),
+            },
+            {
+                "slug": "clean-labels",
+                "label": "Reset InboxAnchor labels",
+                "description": "Remove only InboxAnchor-generated labels from the mailbox window.",
+                "impact": (
+                    f"Useful when {time_range_label(normalized_time_range).lower()} needs a clean "
+                    "label reset without touching the underlying emails."
                 ),
             },
             {
@@ -1569,6 +1613,7 @@ def frontend_ops_progress(provider: str = "", time_range: str = ""):
             "cached_count": cache_stats["cached_count"],
             "hydrated_count": cache_stats["hydrated_count"],
             "labeled_count": int(sync_state.get("labeled_count") or 0),
+            "labels_removed_count": int(sync_state.get("labels_removed_count") or 0),
             "archived_count": int(sync_state.get("archived_count") or 0),
             "marked_read_count": int(sync_state.get("marked_read_count") or 0),
             "trashed_count": int(sync_state.get("trashed_count") or 0),
@@ -1600,6 +1645,7 @@ def frontend_ops_progress(provider: str = "", time_range: str = ""):
         "cached_count": 0,
         "hydrated_count": 0,
         "labeled_count": 0,
+        "labels_removed_count": 0,
         "archived_count": 0,
         "marked_read_count": 0,
         "trashed_count": 0,
@@ -2011,6 +2057,104 @@ def frontend_ops_auto_label(payload: FrontendProviderWorkflowRequest):
         }
     )
     return {"applied": applied, "count": len(applied), "overview": overview}
+
+
+@router.post("/ops/clean-labels")
+def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
+    run_id, provider_name = _ensure_frontend_run(
+        provider=payload.provider,
+        time_range=payload.time_range,
+    )
+    details = _load_email_details(run_id)
+    targets = [
+        (detail, _labels_to_remove_for_email(detail))
+        for detail in details
+    ]
+    targets = [(detail, labels) for detail, labels in targets if labels]
+    removed: list[dict] = []
+    _update_frontend_progress(
+        provider_name,
+        {
+            "mode": "workflow",
+            "status": "running",
+            "stage": "cleaning_labels",
+            "limit": len(targets),
+            "processed_emails": 0,
+            "read_count": len(details),
+            "labeled_count": 0,
+            "labels_removed_count": 0,
+            "archived_count": 0,
+            "marked_read_count": 0,
+            "trashed_count": 0,
+            "reply_sent_count": 0,
+            "latest_action": "remove_labels",
+            "error": None,
+        },
+        time_range=payload.time_range,
+    )
+    for index, (detail, labels) in enumerate(targets, start=1):
+        classification = detail["classification"]
+        removed.append(
+            _remove_provider_labels(
+                provider_name,
+                detail["email_id"],
+                labels,
+                reason="Removed InboxAnchor-generated labels without changing the email itself.",
+                confidence=classification["confidence"],
+                approved_by_user=True,
+                safety_status=SafetyStatus.allowed,
+            )
+        )
+        _update_frontend_progress(
+            provider_name,
+            {
+                "mode": "workflow",
+                "status": "running",
+                "stage": "cleaning_labels",
+                "limit": len(targets),
+                "processed_emails": index,
+                "read_count": len(details),
+                "labels_removed_count": index,
+                "latest_subject": detail["subject"],
+                "latest_action": "remove_labels",
+            },
+            time_range=payload.time_range,
+        )
+
+    refreshed_run_id, _ = _ensure_frontend_run(
+        provider=provider_name,
+        force=payload.force_refresh,
+        time_range=payload.time_range,
+    )
+    overview = _build_ops_overview(
+        provider_name,
+        refreshed_run_id,
+        time_range=payload.time_range,
+    )
+    _update_frontend_progress(
+        provider_name,
+        {
+            "mode": "workflow",
+            "status": "complete",
+            "stage": "labels_reset",
+            "limit": len(targets),
+            "processed_emails": len(targets),
+            "read_count": len(details),
+            "labels_removed_count": len(removed),
+            "latest_action": "remove_labels",
+            "error": None,
+        },
+        time_range=payload.time_range,
+    )
+    STREAM_HUB.emit(
+        {
+            "type": "label_cleanup_completed",
+            "provider": provider_name,
+            "run_id": refreshed_run_id,
+            "count": len(removed),
+        }
+    )
+    return {"applied": removed, "count": len(removed), "overview": overview}
 
 
 @router.post("/ops/safe-cleanup")

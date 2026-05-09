@@ -30,6 +30,7 @@ class GmailTransport(Protocol):
     def archive(self, email_ids: list[str]) -> None: ...
     def trash(self, email_ids: list[str]) -> None: ...
     def apply_labels(self, email_ids: list[str], labels: list[str]) -> None: ...
+    def remove_labels(self, email_ids: list[str], labels: list[str]) -> None: ...
     def ensure_alias_routing(self, alias_address: str, *, label_name: str) -> None: ...
     def remove_alias_routing(self, alias_address: str) -> None: ...
     def send_reply(
@@ -266,6 +267,24 @@ class GmailClient(EmailProvider):
             dry_run=dry_run,
             executed=not dry_run,
             details=f"Gmail labels prepared: {', '.join(labels)}",
+        )
+
+    def remove_labels(
+        self,
+        email_ids: list[str],
+        labels: list[str],
+        *,
+        dry_run: bool = True,
+    ) -> ProviderActionResult:
+        if not dry_run:
+            self._require_transport().remove_labels(email_ids, labels)
+        return ProviderActionResult(
+            provider=self.provider_name,
+            action="remove_labels",
+            email_ids=email_ids,
+            dry_run=dry_run,
+            executed=not dry_run,
+            details=f"Gmail label removal prepared: {', '.join(labels)}",
         )
 
     def ensure_alias_routing(

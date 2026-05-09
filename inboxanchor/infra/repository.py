@@ -21,6 +21,7 @@ from inboxanchor.infra.database import (
     TriageRunORM,
     WorkspaceSettingsORM,
 )
+from inboxanchor.infra.text_normalizer import normalize_email_body_text
 from inboxanchor.models import (
     AuditLogEntry,
     EmailAlias,
@@ -246,13 +247,18 @@ class InboxRepository:
         incoming_body_full = getattr(email, "body_full", None)
         if incoming_body_full is None:
             incoming_body_full = email.body_preview or email.snippet
-        body_full = incoming_body_full.strip() if isinstance(incoming_body_full, str) else ""
+        body_full = (
+            normalize_email_body_text(incoming_body_full)
+            if isinstance(incoming_body_full, str)
+            else ""
+        )
         if (
             not body_full
             and (email.body_preview or "").strip()
             and email.body_preview != email.snippet
         ):
-            body_full = email.body_preview.strip()
+            body_full = normalize_email_body_text(email.body_preview)
+        body_preview = normalize_email_body_text(email.body_preview or email.snippet)
         if row is not None and not body_full and row.body_full:
             body_full = row.body_full
         payload = {
@@ -260,7 +266,7 @@ class InboxRepository:
             "sender": email.sender,
             "subject": email.subject,
             "snippet": email.snippet,
-            "body_preview": email.body_preview,
+            "body_preview": body_preview,
             "body_full": body_full,
             "received_at": email.received_at,
             "labels": email.labels,
@@ -309,10 +315,10 @@ class InboxRepository:
         )
         if row is None:
             return None
-        normalized_body = (body_full or "").strip()
+        normalized_body = normalize_email_body_text(body_full or "")
         row.body_full = normalized_body
         if body_preview is not None:
-            row.body_preview = body_preview
+            row.body_preview = normalize_email_body_text(body_preview)
         elif normalized_body:
             row.body_preview = normalized_body[:500]
         row.last_synced_at = datetime.now(timezone.utc)

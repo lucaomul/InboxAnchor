@@ -16,6 +16,7 @@ from urllib.parse import quote
 from inboxanchor.connectors.gmail_client import GmailTransport
 from inboxanchor.connectors.oauth_flow import get_credentials
 from inboxanchor.core.time_windows import gmail_query_with_time_range, in_time_window
+from inboxanchor.infra.text_normalizer import normalize_email_body_text
 from inboxanchor.models import EmailMessage
 
 logger = logging.getLogger(__name__)
@@ -252,7 +253,7 @@ class GoogleAPITransport(GmailTransport):
         mime_type = payload.get("mimeType", "")
         body_data = payload.get("body", {}).get("data")
         if mime_type == "text/plain" and body_data:
-            return self._decode_body_data(body_data).strip()
+            return normalize_email_body_text(self._decode_body_data(body_data).strip())
 
         text_plain = None
         text_html = None
@@ -261,10 +262,12 @@ class GoogleAPITransport(GmailTransport):
             if not part_data:
                 continue
             if part.get("mimeType") == "text/plain" and text_plain is None:
-                text_plain = self._decode_body_data(part_data).strip()
+                text_plain = normalize_email_body_text(self._decode_body_data(part_data).strip())
             elif part.get("mimeType") == "text/html" and text_html is None:
-                text_html = self._strip_html(self._decode_body_data(part_data))
-        return text_plain or text_html or ""
+                text_html = normalize_email_body_text(
+                    self._strip_html(self._decode_body_data(part_data))
+                )
+        return normalize_email_body_text(text_plain or text_html or "")
 
     def _has_attachments(self, payload: dict) -> bool:
         if payload.get("filename"):
@@ -392,7 +395,7 @@ class GoogleAPITransport(GmailTransport):
 
     def get_body(self, email_id: str) -> str:
         message = self._fetch_message_resource(email_id, include_body=True)
-        return self._extract_best_body(message.get("payload", {}))
+        return normalize_email_body_text(self._extract_best_body(message.get("payload", {})))
 
     def iter_mailbox_batches(
         self,
@@ -539,6 +542,12 @@ class GoogleAPITransport(GmailTransport):
             return
         label_ids = [self._label_name_to_id(label) for label in labels]
         self._batch_modify(email_ids, add_label_ids=label_ids)
+
+    def remove_labels(self, email_ids: list[str], labels: list[str]) -> None:
+        if not labels:
+            return
+        label_ids = [self._label_name_to_id(label) for label in labels]
+        self._batch_modify(email_ids, remove_label_ids=label_ids)
 
     def _list_filters(self) -> list[dict]:
         if self._service is not None:

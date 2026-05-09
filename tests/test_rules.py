@@ -56,3 +56,30 @@ def test_newsletter_rule_respects_workspace_policy_threshold():
 
     assert recommendation.recommended_action == "review"
     assert recommendation.status == RecommendationStatus.requires_approval
+
+
+def test_high_value_newsletter_stays_in_review():
+    email = EmailMessage(
+        id="newsletter-3",
+        thread_id="thread-3",
+        sender="briefing@techcrunch.com",
+        subject="TechCrunch Daily: the latest in AI",
+        snippet="Your daily startup and AI briefing is here.",
+        body_preview="Daily briefing with startup, venture, and AI news. Unsubscribe anytime.",
+        received_at=datetime.now(timezone.utc) - timedelta(days=1),
+        labels=["inbox"],
+        has_attachments=False,
+        unread=True,
+    )
+    classification = EmailClassification(
+        category=EmailCategory.newsletter,
+        priority=PriorityLevel.medium,
+        confidence=0.97,
+        reason="Newsletter markers detected.",
+    )
+
+    recommendation = RulesEngine().recommend(email, classification)
+
+    assert recommendation.recommended_action == "review"
+    assert recommendation.status == RecommendationStatus.requires_approval
+    assert "newsletters/high-value" in recommendation.proposed_labels

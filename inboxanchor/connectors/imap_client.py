@@ -181,6 +181,27 @@ class IMAPEmailClient(EmailProvider):
             details=f"IMAP labels prepared: {', '.join(labels)}",
         )
 
+    def remove_labels(
+        self,
+        email_ids: list[str],
+        labels: list[str],
+        *,
+        dry_run: bool = True,
+    ) -> ProviderActionResult:
+        if not dry_run:
+            for email_id in email_ids:
+                self._messages[email_id].labels = sorted(
+                    label for label in self._messages[email_id].labels if label not in labels
+                )
+        return ProviderActionResult(
+            provider=self.provider_name,
+            action="remove_labels",
+            email_ids=email_ids,
+            dry_run=dry_run,
+            executed=not dry_run,
+            details=f"IMAP label removal prepared: {', '.join(labels)}",
+        )
+
     def send_reply(
         self,
         email_id: str,

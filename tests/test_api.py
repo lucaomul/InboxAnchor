@@ -191,8 +191,8 @@ def test_approval_flow_and_execution():
     target = next(
         rec
         for rec in payload["recommendations"]
-        if rec["recommended_action"] == "archive"
-        and rec["status"] == "requires_approval"
+        if rec["status"] == "requires_approval"
+        and rec["recommended_action"] != "trash"
     )
 
     approve_response = client.post(
@@ -353,8 +353,8 @@ def test_execute_uses_provider_from_stored_run(mocker):
     target = next(
         rec
         for rec in payload["recommendations"]
-        if rec["recommended_action"] == "archive"
-        and rec["status"] == "requires_approval"
+        if rec["status"] == "requires_approval"
+        and rec["recommended_action"] != "trash"
     )
     client.post("/actions/approve", json={"run_id": run_id, "email_ids": [target["email_id"]]})
 
@@ -596,6 +596,40 @@ def test_frontend_ops_workflows_expose_mailbox_upgrade_features():
     progress_payload = progress_response.json()
     assert {"labeled_count", "archived_count", "marked_read_count", "reply_sent_count"} <= set(
         progress_payload.keys()
+    )
+
+
+def test_frontend_clean_labels_removes_inboxanchor_labels_only():
+    auto_label_response = client.post("/ops/auto-label", json={"force_refresh": True})
+    assert auto_label_response.status_code == 200
+    assert auto_label_response.json()["count"] >= 1
+
+    emails_after_label = client.get("/emails").json()["emails"]
+    generated_labels_before = {
+        email["id"]: [
+            label
+            for label in email["labels"]
+            if "/" in label or label.startswith("priority/")
+        ]
+        for email in emails_after_label
+    }
+    assert any(labels for labels in generated_labels_before.values())
+
+    cleanup_response = client.post("/ops/clean-labels", json={"force_refresh": True})
+    assert cleanup_response.status_code == 200
+    assert cleanup_response.json()["count"] >= 1
+
+    emails_after_cleanup = client.get("/emails").json()["emails"]
+    generated_labels_after = {
+        email["id"]: [
+            label
+            for label in email["labels"]
+            if "/" in label or label.startswith("priority/")
+        ]
+        for email in emails_after_cleanup
+    }
+    assert sum(len(labels) for labels in generated_labels_after.values()) < sum(
+        len(labels) for labels in generated_labels_before.values()
     )
 
 

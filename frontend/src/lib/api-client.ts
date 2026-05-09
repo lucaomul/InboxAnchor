@@ -546,6 +546,7 @@ export interface OpsProgress {
   cached_count: number;
   hydrated_count: number;
   labeled_count: number;
+  labels_removed_count: number;
   archived_count: number;
   marked_read_count: number;
   trashed_count: number;
@@ -596,6 +597,13 @@ export async function runMailboxBackfill(timeRange?: MailboxTimeRange): Promise<
 
 export async function runAutoLabel(timeRange?: MailboxTimeRange): Promise<WorkflowMutationResult> {
   return apiFetch<WorkflowMutationResult>("/ops/auto-label", {
+    method: "POST",
+    body: JSON.stringify({ force_refresh: true, time_range: timeRange }),
+  });
+}
+
+export async function runLabelCleanup(timeRange?: MailboxTimeRange): Promise<WorkflowMutationResult> {
+  return apiFetch<WorkflowMutationResult>("/ops/clean-labels", {
     method: "POST",
     body: JSON.stringify({ force_refresh: true, time_range: timeRange }),
   });

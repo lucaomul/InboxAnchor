@@ -9,6 +9,7 @@ import {
   useOpsOverview,
   useOpsProgress,
   useRunAutoLabel,
+  useRunLabelCleanup,
   useRunMailboxBackfill,
   useRunFullAnchorWorkflow,
   useRunOpsScan,
@@ -21,6 +22,7 @@ import {
   Anchor,
   AlertTriangle,
   ArrowRight,
+  Eraser,
   Inbox,
   Layers3,
   LogOut,
@@ -71,6 +73,7 @@ function CommandCenter() {
   const scanMutation = useRunOpsScan();
   const backfillMutation = useRunMailboxBackfill();
   const autoLabelMutation = useRunAutoLabel();
+  const cleanLabelsMutation = useRunLabelCleanup();
   const cleanupMutation = useRunSafeCleanupWorkflow();
   const fullAnchorMutation = useRunFullAnchorWorkflow();
   const overviewError = error instanceof Error ? error.message : "InboxAnchor could not load the live mailbox overview yet.";
@@ -79,6 +82,7 @@ function CommandCenter() {
     scanMutation.isPending ||
     backfillMutation.isPending ||
     autoLabelMutation.isPending ||
+    cleanLabelsMutation.isPending ||
     cleanupMutation.isPending ||
     fullAnchorMutation.isPending;
   const { data: progress } = useOpsProgress(timeRange, isLoading || busy);
@@ -95,6 +99,13 @@ function CommandCenter() {
           { label: "Hydrated", value: progress.hydrated_count },
           { label: "Batches", value: progress.batch_count },
         ]
+      : progress.latest_action === "remove_labels"
+        ? [
+            { label: "Emails read", value: progress.read_count },
+            { label: "Labels removed", value: progress.labels_removed_count },
+            { label: "Processed", value: progress.processed_count },
+            { label: "Remaining", value: Math.max(progress.target_count - progress.processed_count, 0) },
+          ]
       : progress.mode === "workflow"
         ? [
             { label: "Emails read", value: progress.read_count },
@@ -400,6 +411,15 @@ function CommandCenter() {
                 cta="Run labels"
                 loading={autoLabelMutation.isPending}
                 onClick={() => autoLabelMutation.mutate(timeRange)}
+              />
+              <WorkflowCard
+                title="Reset InboxAnchor labels"
+                icon={<Eraser className="h-4 w-4" />}
+                description="Remove only InboxAnchor-generated labels from the selected mailbox window without deleting or archiving any email."
+                impact={overview?.workflows.find((item) => item.slug === "clean-labels")?.impact}
+                cta="Clean labels"
+                loading={cleanLabelsMutation.isPending}
+                onClick={() => cleanLabelsMutation.mutate(timeRange)}
               />
               <WorkflowCard
                 title="Safe cleanup"

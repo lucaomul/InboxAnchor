@@ -140,6 +140,16 @@ class EmailProvider(ABC):
     ) -> ProviderActionResult:
         raise NotImplementedError
 
+    @abstractmethod
+    def remove_labels(
+        self,
+        email_ids: list[str],
+        labels: list[str],
+        *,
+        dry_run: bool = True,
+    ) -> ProviderActionResult:
+        raise NotImplementedError
+
     def send_reply(
         self,
         email_id: str,

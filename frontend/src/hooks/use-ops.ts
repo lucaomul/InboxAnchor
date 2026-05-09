@@ -6,6 +6,7 @@ import {
   getApiUrl,
   runMailboxBackfill,
   runAutoLabel,
+  runLabelCleanup,
   runFullAnchorWorkflow,
   runOpsScan,
   runSafeCleanupWorkflow,
@@ -98,6 +99,20 @@ export function useRunMailboxBackfill() {
       });
     },
     onError: (err) => toast.error(`Failed to build mailbox memory: ${err.message}`),
+  });
+}
+
+export function useRunLabelCleanup() {
+  const invalidate = useInvalidateWorkspace();
+  return useMutation({
+    mutationFn: (timeRange: MailboxTimeRange) => runLabelCleanup(timeRange),
+    onSuccess: (result) => {
+      invalidate();
+      toast.success("InboxAnchor labels removed", {
+        description: `${result.count || 0} emails had InboxAnchor-generated labels removed without touching the messages.`,
+      });
+    },
+    onError: (err) => toast.error(`Failed to clean labels: ${err.message}`),
   });
 }
 
