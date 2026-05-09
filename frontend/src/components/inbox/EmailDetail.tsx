@@ -37,8 +37,16 @@ const STATUS_STYLES: Record<string, { badge: "safe" | "warning" | "critical"; ic
 };
 
 export function EmailDetail({ email, classification, recommendations, actionItems }: EmailDetailProps) {
-  const catCfg = CATEGORY_CONFIG[classification.category];
-  const priCfg = PRIORITY_CONFIG[classification.priority];
+  const catCfg =
+    CATEGORY_CONFIG[classification.category] ?? {
+      label: classification.category || "Unknown",
+      color: "bg-muted text-muted-foreground",
+    };
+  const priCfg =
+    PRIORITY_CONFIG[classification.priority] ?? {
+      label: classification.priority || "Unknown",
+      color: "bg-muted text-muted-foreground",
+    };
   const applyMutation = useApplyRecommendation();
   const approveMutation = useApproveRecommendation();
   const blockMutation = useBlockRecommendation();
@@ -52,7 +60,16 @@ export function EmailDetail({ email, classification, recommendations, actionItem
         <p className="text-sm text-muted-foreground mt-1">From: {email.sender}</p>
         <div className="flex items-center gap-2 mt-2">
           <Badge variant="muted" className={catCfg.color}>{catCfg.label}</Badge>
-          <Badge variant={classification.priority === "critical" ? "critical" : classification.priority === "high" ? "warning" : "muted"}>
+          <Badge
+            variant={
+              classification.priority === "critical"
+                ? "critical"
+                : classification.priority === "high"
+                  ? "warning"
+                  : "muted"
+            }
+            className={classification.priority === "medium" || classification.priority === "low" ? priCfg.color : undefined}
+          >
             {priCfg.label}
           </Badge>
           <span className="text-xs text-muted-foreground">
@@ -98,7 +115,7 @@ export function EmailDetail({ email, classification, recommendations, actionItem
           <h3 className="text-sm font-semibold text-foreground mb-2">Recommendations</h3>
           <div className="flex flex-col gap-2">
             {recommendations.map((rec) => {
-              const statusStyle = STATUS_STYLES[rec.status];
+              const statusStyle = STATUS_STYLES[rec.status] ?? STATUS_STYLES.requires_approval;
               return (
                 <div key={rec.emailId + rec.recommendedAction} className="flex items-start gap-3 rounded-md bg-card p-3 border border-border">
                   <div className="shrink-0 mt-0.5 text-muted-foreground">
