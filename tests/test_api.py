@@ -1658,6 +1658,7 @@ def test_frontend_ops_progress_sync_state_uses_mailbox_workflow_counts(monkeypat
     frontend_router.FRONTEND_PROGRESS.clear()
     frontend_router.FRONTEND_PROVIDER_ERRORS.clear()
     frontend_router.FRONTEND_RUN_CACHE.clear()
+    captured: dict[str, object] = {}
 
     monkeypatch.setattr(
         frontend_router,
@@ -1687,7 +1688,10 @@ def test_frontend_ops_progress_sync_state_uses_mailbox_workflow_counts(monkeypat
     monkeypatch.setattr(
         frontend_router,
         "_load_mailbox_workflow_counts",
-        lambda provider_name, unread_only=None, time_range=None: {
+        lambda provider_name, unread_only=None, time_range=None: captured.update(
+            {"provider": provider_name, "unread_only": unread_only, "time_range": time_range}
+        )
+        or {
             "action_item_count": 86,
             "recommendation_count": 275,
         },
@@ -1703,6 +1707,11 @@ def test_frontend_ops_progress_sync_state_uses_mailbox_workflow_counts(monkeypat
     assert payload["action_item_count"] == 86
     assert payload["recommendation_count"] == 275
     assert payload["latest_subject"] == "Older archive sync"
+    assert captured == {
+        "provider": "gmail",
+        "unread_only": None,
+        "time_range": "all_time",
+    }
 
 
 def test_frontend_ensure_run_reuses_inflight_provider_job(monkeypatch):

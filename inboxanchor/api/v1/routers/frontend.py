@@ -1008,6 +1008,10 @@ def _load_mailbox_workflow_counts(
     }
 
 
+def _mailbox_workflow_unread_filter(unread_only: Optional[bool]) -> Optional[bool]:
+    return True if unread_only is True else None
+
+
 def _mailbox_email_to_model(mailbox_email: dict) -> EmailMessage:
     received_at = datetime.fromisoformat(str(mailbox_email["received_at"]))
     if received_at.tzinfo is None:
@@ -2732,10 +2736,10 @@ def frontend_ops_progress(provider: str = "", time_range: str = ""):
     cache_stats = _load_mailbox_cache_stats(provider_name, time_range=normalized_time_range)
     sync_state = _load_mailbox_sync_state(provider_name, time_range=normalized_time_range)
     if sync_state:
-        sync_unread_only = sync_state.get("unread_only")
+        sync_unread_only = _mailbox_workflow_unread_filter(sync_state.get("unread_only"))
         workflow_counts = _load_mailbox_workflow_counts(
             provider_name,
-            unread_only=sync_unread_only if sync_unread_only is not None else None,
+            unread_only=sync_unread_only,
             time_range=normalized_time_range,
         )
         target_count = int(sync_state.get("target_count") or 0)
@@ -2851,7 +2855,7 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
         )
     workflow_counts = _load_mailbox_workflow_counts(
         provider_name,
-        unread_only=payload.unread_only,
+        unread_only=_mailbox_workflow_unread_filter(payload.unread_only),
         time_range=normalized_time_range,
     )
 
@@ -3013,13 +3017,13 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
                 )
                 recommendation_stats = repository.get_mailbox_recommendation_stats(
                     provider_name,
-                    unread_only=payload.unread_only,
+                    unread_only=_mailbox_workflow_unread_filter(payload.unread_only),
                     time_range=normalized_time_range,
                 )
                 workflow_counts = {
                     "action_item_count": repository.count_mailbox_action_items(
                         provider_name,
-                        unread_only=payload.unread_only,
+                        unread_only=_mailbox_workflow_unread_filter(payload.unread_only),
                         time_range=normalized_time_range,
                     ),
                     "recommendation_count": (
@@ -3104,13 +3108,13 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
         repository = InboxRepository(session)
         recommendation_stats = repository.get_mailbox_recommendation_stats(
             provider_name,
-            unread_only=payload.unread_only,
+            unread_only=_mailbox_workflow_unread_filter(payload.unread_only),
             time_range=normalized_time_range,
         )
         workflow_counts = {
             "action_item_count": repository.count_mailbox_action_items(
                 provider_name,
-                unread_only=payload.unread_only,
+                unread_only=_mailbox_workflow_unread_filter(payload.unread_only),
                 time_range=normalized_time_range,
             ),
             "recommendation_count": (
