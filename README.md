@@ -12,8 +12,8 @@ InboxAnchor is a safety-first inbox triage system for overloaded email accounts.
 - Runs a safety verifier before any mailbox action is executed
 - Separates recommendations into safe, requires-approval, and blocked lanes
 - Persists triage runs, recommendations, audit history, provider state, and workspace settings
+- Builds a local mailbox-memory cache for older email history, resumes historical syncs, and hydrates full bodies lazily when needed
 - Supports bulk lane actions, operator playbooks, focus views, follow-up radar, and reminder center workflows in the dashboard
-- Shows live unread-scan progress with a wait-state loader that can run in `Fun Mode` or `Serious Mode`
 - Exposes a FastAPI backend and a Streamlit workspace on top of the same core engine
 - Includes a full React frontend in `frontend/` with a premium command center, welcome/auth flow, inbox workspace, and settings surface wired to the FastAPI backend
 
@@ -33,6 +33,8 @@ flowchart LR
     Recommendations --> Approval["Human Approval"]
     Approval --> Actions["Provider Actions"]
     Actions --> Audit["Audit Log"]
+    Provider --> Cache["Mailbox Memory Cache"]
+    Cache --> Engine
     Engine --> Persistence["SQLAlchemy Persistence"]
 ```
 
@@ -57,19 +59,21 @@ frontend/         TanStack/React product UI, frontend routes, and modern compone
 ### Core Components
 
 - `inboxanchor/agents/`
-  LLM-backed task agents with heuristic fallback. OpenAI and Groq are supported through the shared provider layer, but obvious inbox cases stay rules-first so the model mainly steps in on ambiguous edge cases.
+  LLM-backed task agents with heuristic fallback. OpenAI and Groq are supported through the shared provider layer.
 - `inboxanchor/connectors/`
   Demo mailbox support, Gmail OAuth transport, and IMAP-family transport support.
 - `inboxanchor/core/triage_engine.py`
   Main orchestration loop for classification, prioritization, extraction, drafting, recommendations, and persistence.
 - `inboxanchor/core/incremental_triage.py`
   Checkpoint-aware wrapper for incremental runs.
+- `inboxanchor/infra/repository.py`
+  Persists triage runs plus the mailbox-memory cache used for historical sync and lazy hydration.
 - `inboxanchor/infra/auth.py`
   Account registration, password verification, session issuance, and logout.
 - `inboxanchor/app/dashboard.py`
   Account-aware operations workspace with playbooks, focus inbox, approval center, and run explorer.
 - `frontend/`
-  React product shell with a mailbox command center, welcome/login experience, inbox workspace, settings flow, and modern UI primitives wired to the current FastAPI backend.
+  React product shell with a mailbox command center, welcome/login experience, inbox workspace, settings flow, wait-state loader/game, and modern UI primitives wired to the current FastAPI backend.
 
 ## Safety Design
 
@@ -84,10 +88,11 @@ InboxAnchor is built around conservative defaults.
 
 ## LLM Providers
 
-The task agents use real LLM calls where it matters and fall back to heuristics when needed. InboxAnchor is intentionally rules-first: obvious newsletters, promos, spam-like messages, low-priority updates, and straightforward finance mail stay deterministic, while the LLM is reserved more for ambiguous work, opportunity, urgent, and coordination-heavy threads.
+The task agents use real LLM calls where it matters and fall back to heuristics when possible.
 
 - Supported providers: `openai`, `groq`, and `mock`
 - Provider selection: `INBOXANCHOR_LLM_PROVIDER`
+- Default operating model: rules-first for obvious newsletters, promos, spam, and low-risk cleanup; LLM escalation for ambiguous work, urgency, and action-extraction cases
 - Typical OpenAI setup:
 
 ```bash
@@ -204,7 +209,6 @@ Important:
 - this frontend started from the separate `lucaomul/inbox-assistant` codebase
 - the visual shell, routes, and components are now in-repo and adapted to the InboxAnchor FastAPI backend
 - the React app now serves as the premium product shell, while the Streamlit workspace remains available for Python-native operations and admin flows
-- live wait states include a progress-aware loader with `Fun Mode` and `Serious Mode`
 
 ## Authentication
 
@@ -258,6 +262,16 @@ The Streamlit workspace is account-aware and requires sign-in unless you intenti
 - `GET /oauth/gmail/callback` — complete Gmail OAuth and persist provider connection state
 - `POST /webhooks/gmail` — accept Gmail push notifications and trigger triage
 
+### Frontend Command Center
+
+- `GET /ops/overview` — command-center summary for the current provider
+- `GET /ops/progress` — live scan or mailbox-memory progress
+- `POST /ops/scan` — rebuild the unread working set
+- `POST /ops/backfill` — cache historical mailbox metadata with resumable progress, lightweight indexing, and optional lazy hydration
+- `POST /ops/auto-label` — apply InboxAnchor labels to the current unread set
+- `POST /ops/safe-cleanup` — execute only low-risk cleanup actions
+- `POST /ops/full-anchor` — label first, then run safe cleanup
+
 ## Dashboard
 
 The Streamlit workspace currently includes:
@@ -265,6 +279,7 @@ The Streamlit workspace currently includes:
 - account access with sign-in, sign-up, and demo mode
 - operator playbooks for common workflows
 - command center controls for provider, batch sizing, and preview caps
+- resumable mailbox-memory builder for large historical inboxes
 - inbox overview and category map
 - approval center and decision lanes
 - focus inbox split into reply pressure, approvals, sensitive mail, and cleanup
@@ -301,13 +316,13 @@ InboxAnchor is already strong for:
 - inbox policy experimentation
 - approval and audit workflow validation
 - large unread-inbox simulation
+- large historical mailbox caching with resumable backfill
 
 Still pending before calling it fully production-ready:
 
 - battle-tested live mailbox onboarding across Gmail and IMAP-family providers
 - deeper multi-user SaaS controls
 - more mature shared inbox / assignment workflows
-- historical backfill and larger-than-unread mailbox sync beyond the current working set
 - broader deployment and secrets-management hardening
 
 ## Roadmap

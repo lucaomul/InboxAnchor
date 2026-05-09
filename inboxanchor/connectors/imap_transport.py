@@ -128,8 +128,14 @@ class ImaplibTransport(EmailProvider):
         parsed = datetime.fromisoformat(checkpoint.replace("Z", "+00:00"))
         return parsed.astimezone(timezone.utc).strftime("%d-%b-%Y")
 
-    def _search_uids(self, *, limit: int, since: Optional[str] = None) -> list[str]:
-        criteria = ["UNSEEN"]
+    def _search_uids(
+        self,
+        *,
+        limit: int,
+        since: Optional[str] = None,
+        unread_only: bool = True,
+    ) -> list[str]:
+        criteria = ["UNSEEN"] if unread_only else ["ALL"]
         if since:
             criteria.extend(["SINCE", since])
         raw = self._uid_command("search", None, *criteria)
@@ -272,6 +278,23 @@ class ImaplibTransport(EmailProvider):
         for start in range(0, len(uids), batch_size):
             yield self._build_messages(uids[start : start + batch_size], include_body=include_body)
 
+    def iter_mailbox_batches(
+        self,
+        *,
+        limit: int = 500,
+        batch_size: int = 100,
+        include_body: bool = False,
+        unread_only: bool = False,
+        offset: int = 0,
+    ):
+        uids = self._search_uids(limit=limit + offset, unread_only=unread_only)
+        uids = uids[offset : offset + limit]
+        for start in range(0, len(uids), batch_size):
+            yield self._build_messages(
+                uids[start : start + batch_size],
+                include_body=include_body,
+            )
+
     def iter_unread_batches_since(
         self,
         checkpoint: str,
@@ -280,7 +303,10 @@ class ImaplibTransport(EmailProvider):
         batch_size: int = 100,
         include_body: bool = True,
     ):
-        uids = self._search_uids(limit=limit, since=self._format_since_date(checkpoint))
+        uids = self._search_uids(
+            limit=limit,
+            since=self._format_since_date(checkpoint),
+        )
         for start in range(0, len(uids), batch_size):
             yield self._build_messages(uids[start : start + batch_size], include_body=include_body)
 

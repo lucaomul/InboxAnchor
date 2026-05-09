@@ -159,12 +159,22 @@ class GoogleAPITransport(GmailTransport):
 
         return {}
 
-    def _list_message_refs(self, *, limit: int, page_token: Optional[str] = None) -> dict:
+    def _chunk_email_ids(self, email_ids: list[str], *, chunk_size: int = 1000):
+        for start in range(0, len(email_ids), chunk_size):
+            yield email_ids[start : start + chunk_size]
+
+    def _list_message_refs(
+        self,
+        *,
+        limit: int,
+        page_token: Optional[str] = None,
+        q: Optional[str] = None,
+    ) -> dict:
         if self._service is not None:
             service = self._build_service()
             request = service.users().messages().list(
                 userId=self.user_id,
-                q="is:unread",
+                q=q,
                 maxResults=min(limit, 500),
                 pageToken=page_token,
                 includeSpamTrash=False,
@@ -175,46 +185,45 @@ class GoogleAPITransport(GmailTransport):
             "GET",
             "messages",
             params={
-                "q": "is:unread",
+                "q": q,
                 "maxResults": min(limit, 500),
                 "pageToken": page_token,
                 "includeSpamTrash": "false",
             },
         )
 
-    def _fetch_message_resource(self, email_id: str) -> dict:
+    def _fetch_message_resource(self, email_id: str, *, include_body: bool = True) -> dict:
+        format_name = "full" if include_body else "metadata"
         if self._service is not None:
             service = self._build_service()
-            request = service.users().messages().get(
-                userId=self.user_id,
-                id=email_id,
-                format="full",
-            )
-            return self._execute_legacy(request)
-
-        return self._request_json(
-            "GET",
-            f"messages/{quote(email_id, safe='')}",
-            params={"format": "full"},
-        )
-
-    def _fetch_message_metadata_resource(self, email_id: str) -> dict:
-        if self._service is not None:
-            service = self._build_service()
-            request = service.users().messages().get(
-                userId=self.user_id,
-                id=email_id,
-                format="metadata",
-                metadataHeaders=["From", "To", "Subject", "Date", "Message-ID"],
-            )
+            params = {
+                "userId": self.user_id,
+                "id": email_id,
+                "format": format_name,
+            }
+            if not include_body:
+                params["metadataHeaders"] = ["From", "To", "Subject", "Date", "Message-ID"]
+            request = service.users().messages().get(**params)
             return self._execute_legacy(request)
 
         return self._request_json(
             "GET",
             f"messages/{quote(email_id, safe='')}",
             params={
-                "format": "metadata",
-                "metadataHeaders": ["From", "To", "Subject", "Date", "Message-ID"],
+                "format": format_name,
+                **(
+                    {
+                        "metadataHeaders": [
+                            "From",
+                            "To",
+                            "Subject",
+                            "Date",
+                            "Message-ID",
+                        ]
+                    }
+                    if not include_body
+                    else {}
+                ),
             },
         )
 
@@ -276,19 +285,20 @@ class GoogleAPITransport(GmailTransport):
             return parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
 
-    def _message_to_email(self, message: dict) -> EmailMessage:
+    def _message_to_email(self, message: dict, *, include_body: bool = True) -> EmailMessage:
         payload = message.get("payload", {})
         headers = self._extract_headers(payload)
-        body = self._extract_best_body(payload)
+        body = self._extract_best_body(payload) if include_body else ""
         labels = message.get("labelIds", []) or []
+        snippet = message.get("snippet", "")
         return EmailMessage(
             id=message["id"],
             thread_id=message.get("threadId") or message["id"],
             sender=headers.get("from", ""),
             subject=headers.get("subject", ""),
-            snippet=message.get("snippet", ""),
-            body_preview=(body or message.get("snippet", ""))[:500],
-            body_full=body or message.get("snippet", ""),
+            snippet=snippet,
+            body_preview=(body or snippet)[:500],
+            body_full=body if include_body else "",
             received_at=self._parse_received_at(headers.get("date", "")),
             labels=labels,
             has_attachments=self._has_attachments(payload),
@@ -302,7 +312,7 @@ class GoogleAPITransport(GmailTransport):
             token = self._page_tokens.get(current_offset)
             if token is None and current_offset != 0:
                 return None
-            response = self._list_message_refs(limit=limit, page_token=token)
+            response = self._list_message_refs(limit=limit, page_token=token, q="is:unread")
             refs = response.get("messages", []) or []
             if not refs:
                 return None
@@ -330,51 +340,107 @@ class GoogleAPITransport(GmailTransport):
             page_token = self._prime_page_token(limit=limit, offset=offset)
         elif offset and page_token is None:
             return []
-        response = self._list_message_refs(limit=limit, page_token=page_token)
+        response = self._list_message_refs(limit=limit, page_token=page_token, q="is:unread")
         refs = response.get("messages", []) or []
         self._page_tokens[offset + len(refs)] = response.get("nextPageToken")
-        return [self._message_to_email(self._fetch_message_resource(item["id"])) for item in refs]
+        return [
+            self._message_to_email(self._fetch_message_resource(item["id"], include_body=True))
+            for item in refs
+        ]
 
-    def get_message(self, email_id: str) -> EmailMessage:
-        return self._message_to_email(self._fetch_message_resource(email_id))
+    def get_message(self, email_id: str, include_body: bool = True) -> EmailMessage:
+        return self._message_to_email(
+            self._fetch_message_resource(email_id, include_body=include_body),
+            include_body=include_body,
+        )
 
     def get_body(self, email_id: str) -> str:
-        message = self._fetch_message_resource(email_id)
+        message = self._fetch_message_resource(email_id, include_body=True)
         return self._extract_best_body(message.get("payload", {}))
 
-    def mark_read(self, email_ids: list[str]) -> None:
-        for email_id in email_ids:
+    def iter_mailbox_batches(
+        self,
+        *,
+        limit: int = 500,
+        batch_size: int = 100,
+        include_body: bool = False,
+        unread_only: bool = False,
+        offset: int = 0,
+    ):
+        remaining = limit
+        page_token = None
+        skipped = 0
+        query = "is:unread" if unread_only else None
+        page_size = min(max(batch_size, 1), 500)
+
+        while skipped < offset:
+            response = self._list_message_refs(
+                limit=min(page_size, offset - skipped),
+                page_token=page_token,
+                q=query,
+            )
+            refs = response.get("messages", []) or []
+            if not refs:
+                return
+            skipped += len(refs)
+            page_token = response.get("nextPageToken")
+            if not page_token and skipped < offset:
+                return
+
+        while remaining > 0:
+            page_limit = min(page_size, remaining)
+            response = self._list_message_refs(limit=page_limit, page_token=page_token, q=query)
+            refs = response.get("messages", []) or []
+            if not refs:
+                break
+            yield [
+                self.get_message(ref["id"], include_body=include_body)
+                for ref in refs
+            ]
+            remaining -= len(refs)
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+
+    def _batch_modify(
+        self,
+        email_ids: list[str],
+        *,
+        add_label_ids: Optional[list[str]] = None,
+        remove_label_ids: Optional[list[str]] = None,
+    ) -> None:
+        if not email_ids:
+            return
+
+        body_base = {}
+        if add_label_ids:
+            body_base["addLabelIds"] = add_label_ids
+        if remove_label_ids:
+            body_base["removeLabelIds"] = remove_label_ids
+        if not body_base:
+            return
+
+        for chunk in self._chunk_email_ids(email_ids):
+            body = {"ids": chunk, **body_base}
             if self._service is not None:
                 service = self._build_service()
-                request = service.users().messages().modify(
+                request = service.users().messages().batchModify(
                     userId=self.user_id,
-                    id=email_id,
-                    body={"removeLabelIds": ["UNREAD"]},
+                    body=body,
                 )
                 self._execute_legacy(request)
             else:
                 self._request_json(
                     "POST",
-                    f"messages/{quote(email_id, safe='')}/modify",
-                    json_body={"removeLabelIds": ["UNREAD"]},
+                    "messages/batchModify",
+                    json_body=body,
                 )
 
+    def mark_read(self, email_ids: list[str]) -> None:
+        self._batch_modify(email_ids, remove_label_ids=["UNREAD"])
+
     def archive(self, email_ids: list[str]) -> None:
-        for email_id in email_ids:
-            if self._service is not None:
-                service = self._build_service()
-                request = service.users().messages().modify(
-                    userId=self.user_id,
-                    id=email_id,
-                    body={"removeLabelIds": ["INBOX"]},
-                )
-                self._execute_legacy(request)
-            else:
-                self._request_json(
-                    "POST",
-                    f"messages/{quote(email_id, safe='')}/modify",
-                    json_body={"removeLabelIds": ["INBOX"]},
-                )
+        self._batch_modify(email_ids, remove_label_ids=["INBOX"])
 
     def trash(self, email_ids: list[str]) -> None:
         for email_id in email_ids:
@@ -435,21 +501,7 @@ class GoogleAPITransport(GmailTransport):
         if not labels:
             return
         label_ids = [self._label_name_to_id(label) for label in labels]
-        for email_id in email_ids:
-            if self._service is not None:
-                service = self._build_service()
-                request = service.users().messages().modify(
-                    userId=self.user_id,
-                    id=email_id,
-                    body={"addLabelIds": label_ids},
-                )
-                self._execute_legacy(request)
-            else:
-                self._request_json(
-                    "POST",
-                    f"messages/{quote(email_id, safe='')}/modify",
-                    json_body={"addLabelIds": label_ids},
-                )
+        self._batch_modify(email_ids, add_label_ids=label_ids)
 
     def list_changed_message_ids(
         self,

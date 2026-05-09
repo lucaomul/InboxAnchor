@@ -183,6 +183,15 @@ class ProviderCheckpointORM(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class ProviderSyncStateORM(Base):
+    __tablename__ = "provider_sync_states"
+
+    provider: Mapped[str] = mapped_column(String(32), primary_key=True)
+    sync_kind: Mapped[str] = mapped_column(String(64), primary_key=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class FollowUpReminderORM(Base):
     __tablename__ = "follow_up_reminders"
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, func, or_
 
 from inboxanchor.infra.database import (
     ActionItemORM,
@@ -14,6 +14,7 @@ from inboxanchor.infra.database import (
     MailboxEmailORM,
     ProviderCheckpointORM,
     ProviderConnectionORM,
+    ProviderSyncStateORM,
     RecommendationORM,
     TriageRunORM,
     WorkspaceSettingsORM,
@@ -214,7 +215,18 @@ class InboxRepository:
             )
             .first()
         )
-        body_full = (getattr(email, "body_full", "") or email.body_preview or email.snippet).strip()
+        incoming_body_full = getattr(email, "body_full", None)
+        if incoming_body_full is None:
+            incoming_body_full = email.body_preview or email.snippet
+        body_full = incoming_body_full.strip() if isinstance(incoming_body_full, str) else ""
+        if (
+            not body_full
+            and (email.body_preview or "").strip()
+            and email.body_preview != email.snippet
+        ):
+            body_full = email.body_preview.strip()
+        if row is not None and not body_full and row.body_full:
+            body_full = row.body_full
         payload = {
             "thread_id": email.thread_id,
             "sender": email.sender,
@@ -251,6 +263,34 @@ class InboxRepository:
         row.unread = payload["unread"]
         row.last_synced_at = payload["last_synced_at"]
 
+    def save_mailbox_email_body(
+        self,
+        provider: str,
+        email_id: str,
+        *,
+        body_full: str,
+        body_preview: Optional[str] = None,
+    ) -> Optional[dict]:
+        row = (
+            self.session.query(MailboxEmailORM)
+            .filter(
+                MailboxEmailORM.provider == provider,
+                MailboxEmailORM.email_id == email_id,
+            )
+            .first()
+        )
+        if row is None:
+            return None
+        normalized_body = (body_full or "").strip()
+        row.body_full = normalized_body
+        if body_preview is not None:
+            row.body_preview = body_preview
+        elif normalized_body:
+            row.body_preview = normalized_body[:500]
+        row.last_synced_at = datetime.now(timezone.utc)
+        self.session.flush()
+        return self._mailbox_email_payload(row)
+
     def get_mailbox_email(self, provider: str, email_id: str) -> Optional[dict]:
         row = (
             self.session.query(MailboxEmailORM)
@@ -276,6 +316,69 @@ class InboxRepository:
             .all()
         )
         return {row.email_id: self._mailbox_email_payload(row) for row in rows}
+
+    def count_mailbox_emails(
+        self,
+        provider: str,
+        *,
+        unread_only: Optional[bool] = None,
+        hydrated_only: bool = False,
+    ) -> int:
+        query = self.session.query(MailboxEmailORM).filter(MailboxEmailORM.provider == provider)
+        if unread_only is True:
+            query = query.filter(MailboxEmailORM.unread.is_(True))
+        elif unread_only is False:
+            query = query.filter(MailboxEmailORM.unread.is_(False))
+        if hydrated_only:
+            query = query.filter(func.length(func.trim(MailboxEmailORM.body_full)) > 0)
+        return query.count()
+
+    def list_mailbox_emails(
+        self,
+        provider: str,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        unread_only: Optional[bool] = None,
+        q: Optional[str] = None,
+    ) -> list[dict]:
+        query = self.session.query(MailboxEmailORM).filter(MailboxEmailORM.provider == provider)
+        if unread_only is True:
+            query = query.filter(MailboxEmailORM.unread.is_(True))
+        elif unread_only is False:
+            query = query.filter(MailboxEmailORM.unread.is_(False))
+        if q:
+            pattern = f"%{q.strip()}%"
+            query = query.filter(
+                or_(
+                    MailboxEmailORM.subject.ilike(pattern),
+                    MailboxEmailORM.sender.ilike(pattern),
+                    MailboxEmailORM.snippet.ilike(pattern),
+                    MailboxEmailORM.body_preview.ilike(pattern),
+                )
+            )
+        rows = (
+            query.order_by(MailboxEmailORM.received_at.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+        return [self._mailbox_email_payload(row) for row in rows]
+
+    def get_mailbox_cache_stats(self, provider: str) -> dict:
+        query = self.session.query(MailboxEmailORM).filter(MailboxEmailORM.provider == provider)
+        cached_count = query.count()
+        unread_count = query.filter(MailboxEmailORM.unread.is_(True)).count()
+        hydrated_count = query.filter(func.length(func.trim(MailboxEmailORM.body_full)) > 0).count()
+        oldest = query.order_by(MailboxEmailORM.received_at.asc()).first()
+        newest = query.order_by(MailboxEmailORM.received_at.desc()).first()
+        return {
+            "cached_count": cached_count,
+            "cached_unread_count": unread_count,
+            "hydrated_count": hydrated_count,
+            "oldest_cached_at": oldest.received_at.isoformat() if oldest else None,
+            "newest_cached_at": newest.received_at.isoformat() if newest else None,
+        }
 
     def list_runs(self, limit: int = 25) -> list[dict]:
         rows = (
@@ -374,6 +477,67 @@ class InboxRepository:
         else:
             row.checkpoint_value = checkpoint_value
             row.updated_at = datetime.now(timezone.utc)
+
+    def get_provider_sync_state(self, provider_name: str, sync_kind: str) -> Optional[dict]:
+        row = (
+            self.session.query(ProviderSyncStateORM)
+            .filter(
+                ProviderSyncStateORM.provider == provider_name,
+                ProviderSyncStateORM.sync_kind == sync_kind,
+            )
+            .first()
+        )
+        if row is None:
+            return None
+        payload = dict(row.payload or {})
+        payload.setdefault("provider", provider_name)
+        payload.setdefault("sync_kind", sync_kind)
+        payload["updated_at"] = row.updated_at.isoformat()
+        return payload
+
+    def save_provider_sync_state(
+        self,
+        provider_name: str,
+        sync_kind: str,
+        payload: dict,
+    ) -> dict:
+        row = (
+            self.session.query(ProviderSyncStateORM)
+            .filter(
+                ProviderSyncStateORM.provider == provider_name,
+                ProviderSyncStateORM.sync_kind == sync_kind,
+            )
+            .first()
+        )
+        normalized = dict(payload)
+        normalized.setdefault("provider", provider_name)
+        normalized.setdefault("sync_kind", sync_kind)
+        if row is None:
+            row = ProviderSyncStateORM(
+                provider=provider_name,
+                sync_kind=sync_kind,
+                payload=normalized,
+            )
+            self.session.add(row)
+        else:
+            row.payload = normalized
+            row.updated_at = datetime.now(timezone.utc)
+        self.session.flush()
+        stored = dict(normalized)
+        stored["updated_at"] = row.updated_at.isoformat()
+        return stored
+
+    def clear_provider_sync_state(self, provider_name: str, sync_kind: str) -> None:
+        row = (
+            self.session.query(ProviderSyncStateORM)
+            .filter(
+                ProviderSyncStateORM.provider == provider_name,
+                ProviderSyncStateORM.sync_kind == sync_kind,
+            )
+            .first()
+        )
+        if row is not None:
+            self.session.delete(row)
 
     def upsert_follow_up_reminder(
         self,

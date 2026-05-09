@@ -432,6 +432,11 @@ export interface OpsOverview {
   blockedCount: number;
   autoLabelCandidates: number;
   attachmentsCount: number;
+  cachedEmailsCount: number;
+  cachedUnreadCount: number;
+  hydratedEmailsCount: number;
+  oldestCachedAt: string | null;
+  newestCachedAt: string | null;
   categoryCounts: Record<string, number>;
   summary: string;
   liveConnected: boolean;
@@ -444,11 +449,14 @@ export interface WorkflowMutationResult {
   count?: number;
   labelsApplied?: number;
   cleanupApplied?: number;
+  cachedCount?: number;
+  hydratedCount?: number;
   overview: OpsOverview;
 }
 
 export interface OpsProgress {
   provider: string;
+  mode: "scan" | "backfill";
   status: "idle" | "running" | "complete" | "error";
   stage: string;
   target_count: number;
@@ -457,6 +465,10 @@ export interface OpsProgress {
   action_item_count: number;
   recommendation_count: number;
   batch_count: number;
+  cached_count: number;
+  hydrated_count: number;
+  oldest_cached_at?: string | null;
+  newest_cached_at?: string | null;
   latest_subject?: string | null;
   run_id?: string | null;
   error?: string | null;
@@ -475,6 +487,19 @@ export async function runOpsScan(): Promise<OpsOverview> {
   return apiFetch<OpsOverview>("/ops/scan", {
     method: "POST",
     body: JSON.stringify({ force_refresh: true }),
+  });
+}
+
+export async function runMailboxBackfill(): Promise<WorkflowMutationResult> {
+  return apiFetch<WorkflowMutationResult>("/ops/backfill", {
+    method: "POST",
+    body: JSON.stringify({
+      force_refresh: false,
+      limit: 20000,
+      batch_size: 250,
+      include_body: false,
+      unread_only: false,
+    }),
   });
 }
 

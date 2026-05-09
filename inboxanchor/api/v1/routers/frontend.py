@@ -9,7 +9,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from inboxanchor.bootstrap import InboxAnchorService
 from inboxanchor.infra.audit_log import AuditLogger
@@ -28,6 +28,7 @@ FRONTEND_PROVIDER_ERRORS: dict[str, str] = {}
 FRONTEND_PROGRESS: dict[str, dict] = {}
 FRONTEND_ACTIVE_RUNS: dict[str, "FrontendRunJob"] = {}
 FRONTEND_ACTIVE_RUNS_LOCK = threading.Lock()
+MAILBOX_BACKFILL_SYNC_KIND = "mailbox_backfill"
 
 
 @dataclass
@@ -73,6 +74,15 @@ class FrontendRecommendationActionRequest(BaseModel):
 class FrontendProviderWorkflowRequest(BaseModel):
     provider: Optional[str] = None
     force_refresh: bool = True
+
+
+class FrontendMailboxBackfillRequest(BaseModel):
+    provider: Optional[str] = None
+    force_refresh: bool = False
+    limit: int = Field(default=5000, ge=25, le=20000)
+    batch_size: int = Field(default=250, ge=10, le=1000)
+    include_body: bool = False
+    unread_only: bool = False
 
 
 def _extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
@@ -162,6 +172,7 @@ def _update_frontend_progress(provider_name: str, payload: dict) -> None:
     previous = FRONTEND_PROGRESS.get(provider_name, {})
     progress = {
         "provider": provider_name,
+        "mode": previous.get("mode", "scan"),
         "status": previous.get("status", "running"),
         "stage": previous.get("stage", "starting"),
         "target_count": previous.get("target_count", 0),
@@ -170,11 +181,20 @@ def _update_frontend_progress(provider_name: str, payload: dict) -> None:
         "action_item_count": previous.get("action_item_count", 0),
         "recommendation_count": previous.get("recommendation_count", 0),
         "batch_count": previous.get("batch_count", 0),
+        "cached_count": previous.get("cached_count", 0),
+        "hydrated_count": previous.get("hydrated_count", 0),
+        "oldest_cached_at": previous.get("oldest_cached_at"),
+        "newest_cached_at": previous.get("newest_cached_at"),
         "latest_subject": previous.get("latest_subject"),
+        "resume_offset": previous.get("resume_offset", 0),
+        "remaining_count": previous.get("remaining_count", 0),
+        "completed": previous.get("completed", False),
         "run_id": previous.get("run_id"),
         "error": previous.get("error"),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+    if "mode" in payload:
+        progress["mode"] = payload["mode"]
     if "status" in payload:
         progress["status"] = payload["status"]
     if "stage" in payload:
@@ -191,15 +211,34 @@ def _update_frontend_progress(provider_name: str, payload: dict) -> None:
         progress["recommendation_count"] = payload["recommendation_count"]
     if "batch_count" in payload:
         progress["batch_count"] = payload["batch_count"]
+    if "cached_count" in payload:
+        progress["cached_count"] = payload["cached_count"]
+    if "hydrated_count" in payload:
+        progress["hydrated_count"] = payload["hydrated_count"]
+    if "oldest_cached_at" in payload:
+        progress["oldest_cached_at"] = payload["oldest_cached_at"]
+    if "newest_cached_at" in payload:
+        progress["newest_cached_at"] = payload["newest_cached_at"]
     if "latest_subject" in payload:
         progress["latest_subject"] = payload["latest_subject"]
+    if "resume_offset" in payload:
+        progress["resume_offset"] = payload["resume_offset"]
+    if "remaining_count" in payload:
+        progress["remaining_count"] = payload["remaining_count"]
+    if "completed" in payload:
+        progress["completed"] = payload["completed"]
     if "run_id" in payload:
         progress["run_id"] = payload["run_id"]
     if "error" in payload:
         progress["error"] = payload["error"]
     FRONTEND_PROGRESS[provider_name] = progress
     if progress["status"] == "running":
-        STREAM_HUB.emit({"type": "scan_progress", **progress})
+        STREAM_HUB.emit(
+            {
+                "type": "backfill_progress" if progress["mode"] == "backfill" else "scan_progress",
+                **progress,
+            }
+        )
 
 
 def _wait_for_frontend_job(job: FrontendRunJob, provider_name: str) -> tuple[str, str]:
@@ -307,6 +346,7 @@ def _ensure_frontend_run(*, provider: Optional[str] = None, force: bool = False)
     _update_frontend_progress(
         provider_name,
         {
+            "mode": "scan",
             "status": "running",
             "stage": "bootstrapping" if initial_load else "refreshing",
             "limit": bootstrap_limit if initial_load else settings.default_scan_limit,
@@ -358,6 +398,7 @@ def _ensure_frontend_run(*, provider: Optional[str] = None, force: bool = False)
         _update_frontend_progress(
             provider_name,
             {
+                "mode": "scan",
                 "status": "error",
                 "stage": "failed",
                 "error": message,
@@ -382,6 +423,7 @@ def _ensure_frontend_run(*, provider: Optional[str] = None, force: bool = False)
     _update_frontend_progress(
         provider_name,
         {
+            "mode": "scan",
             "status": "complete",
             "stage": "ready",
             "limit": scanned_emails,
@@ -526,6 +568,53 @@ def _load_mailbox_email_map(provider_name: str, email_ids: list[str]) -> dict[st
         return repository.get_mailbox_email_map(provider_name, email_ids)
 
 
+def _load_mailbox_cache_stats(provider_name: str) -> dict:
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        return repository.get_mailbox_cache_stats(provider_name)
+
+
+def _load_mailbox_sync_state(provider_name: str) -> Optional[dict]:
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        return repository.get_provider_sync_state(provider_name, MAILBOX_BACKFILL_SYNC_KIND)
+
+
+def _get_cached_or_latest_run_id(provider_name: str) -> Optional[str]:
+    cached = FRONTEND_RUN_CACHE.get(provider_name)
+    if cached:
+        return cached
+    with session_scope() as session:
+        return InboxRepository(session).get_latest_run_id(provider_name)
+
+
+def _hydrate_mailbox_email_if_needed(
+    provider_name: str,
+    email_id: str,
+    detail: dict,
+    mailbox_email: Optional[dict],
+) -> Optional[dict]:
+    if provider_name == "fake":
+        return mailbox_email
+    if mailbox_email and (mailbox_email.get("body_full") or "").strip():
+        return mailbox_email
+
+    service = _service_for_provider(provider_name)
+    try:
+        body_full = service.provider.fetch_email_body(email_id)
+    except Exception as exc:
+        _raise_provider_runtime_error(provider_name, exc)
+
+    with session_scope() as session:
+        hydrated = InboxRepository(session).save_mailbox_email_body(
+            provider_name,
+            email_id,
+            body_full=body_full,
+            body_preview=(body_full or detail.get("body_preview", ""))[:500],
+        )
+    return hydrated or mailbox_email
+
+
 def _load_recommendation_details(run_id: str) -> list[dict]:
     with session_scope() as session:
         repository = InboxRepository(session)
@@ -617,6 +706,32 @@ def _build_ops_overview(provider_name: str, run_id: str) -> dict:
     digest = _load_digest(run_id)
     blocked = FRONTEND_BLOCK_REGISTRY.setdefault(provider_name, set())
     connection = InboxAnchorService().load_provider_connection(provider_name)
+    cache_stats = _load_mailbox_cache_stats(provider_name)
+    sync_state = _load_mailbox_sync_state(provider_name)
+    historical_target = min(max(settings.default_scan_limit * 4, 5000), 20000)
+    mailbox_target = (
+        max(historical_target, int(sync_state.get("target_count") or 0))
+        if sync_state
+        else historical_target
+    )
+    processed_total = max(
+        cache_stats["cached_count"],
+        int(sync_state.get("processed_count") or 0) if sync_state else 0,
+    )
+    resume_offset = min(
+        int(sync_state.get("next_offset") or processed_total) if sync_state else processed_total,
+        mailbox_target,
+    )
+    mailbox_memory = {
+        "targetCount": mailbox_target,
+        "processedTotal": processed_total,
+        "resumeOffset": resume_offset,
+        "remainingCount": max(mailbox_target - resume_offset, 0),
+        "completed": bool(sync_state.get("completed")) if sync_state else False,
+        "includeBody": bool(sync_state.get("include_body")) if sync_state else False,
+        "unreadOnly": bool(sync_state.get("unread_only")) if sync_state else False,
+        "lastBackfillAt": sync_state.get("updated_at") if sync_state else None,
+    }
     with session_scope() as session:
         repository = InboxRepository(session)
         safe_count = repository.count_run_recommendations_by_status(run_id, "safe")
@@ -636,6 +751,12 @@ def _build_ops_overview(provider_name: str, run_id: str) -> dict:
         "blockedCount": blocked_count + len(blocked),
         "autoLabelCandidates": auto_label_candidates,
         "attachmentsCount": attachment_count,
+        "cachedEmailsCount": cache_stats["cached_count"],
+        "cachedUnreadCount": cache_stats["cached_unread_count"],
+        "hydratedEmailsCount": cache_stats["hydrated_count"],
+        "oldestCachedAt": cache_stats["oldest_cached_at"],
+        "newestCachedAt": cache_stats["newest_cached_at"],
+        "mailboxMemory": mailbox_memory,
         "categoryCounts": digest["category_counts"],
         "summary": digest["summary"],
         "liveConnected": connection.sync_enabled,
@@ -647,6 +768,18 @@ def _build_ops_overview(provider_name: str, run_id: str) -> dict:
                 "label": "Fresh unread scan",
                 "description": "Rebuild the unread inventory before taking action.",
                 "impact": f"Scans up to {settings.default_scan_limit} unread emails.",
+            },
+            {
+                "slug": "backfill",
+                "label": "Build mailbox memory",
+                "description": (
+                    "Index older mailbox history into the local cache without forcing "
+                    "a huge live triage run."
+                ),
+                "impact": (
+                    f"Cache up to {mailbox_target} historical emails so search, "
+                    "hydration, and future syncs have more context."
+                ),
             },
             {
                 "slug": "auto-label",
@@ -722,7 +855,13 @@ def frontend_email(email_id: str):
     if detail is None:
         raise HTTPException(status_code=404, detail="Email not found")
     mailbox_map = _load_mailbox_email_map(provider_name, [email_id])
-    return _frontend_email_payload(detail, mailbox_map.get(email_id))
+    mailbox_email = _hydrate_mailbox_email_if_needed(
+        provider_name,
+        email_id,
+        detail,
+        mailbox_map.get(email_id),
+    )
+    return _frontend_email_payload(detail, mailbox_email)
 
 
 @router.get("/classifications")
@@ -790,8 +929,39 @@ def frontend_ops_progress(provider: str = ""):
     progress = FRONTEND_PROGRESS.get(provider_name)
     if progress:
         return progress
+    cache_stats = _load_mailbox_cache_stats(provider_name)
+    sync_state = _load_mailbox_sync_state(provider_name)
+    if sync_state:
+        target_count = int(sync_state.get("target_count") or 0)
+        processed_count = int(sync_state.get("processed_count") or 0)
+        resume_offset = int(sync_state.get("next_offset") or processed_count)
+        completed = bool(sync_state.get("completed"))
+        return {
+            "provider": provider_name,
+            "mode": "backfill",
+            "status": "complete" if completed else "paused",
+            "stage": "backfill_ready" if completed else "backfill_resume",
+            "target_count": target_count,
+            "processed_count": processed_count,
+            "read_count": processed_count,
+            "action_item_count": 0,
+            "recommendation_count": 0,
+            "batch_count": int(sync_state.get("batch_count") or 0),
+            "cached_count": cache_stats["cached_count"],
+            "hydrated_count": cache_stats["hydrated_count"],
+            "oldest_cached_at": cache_stats["oldest_cached_at"],
+            "newest_cached_at": cache_stats["newest_cached_at"],
+            "latest_subject": sync_state.get("latest_subject"),
+            "resume_offset": resume_offset,
+            "remaining_count": max(target_count - resume_offset, 0),
+            "completed": completed,
+            "run_id": FRONTEND_RUN_CACHE.get(provider_name),
+            "error": FRONTEND_PROVIDER_ERRORS.get(provider_name),
+            "updated_at": sync_state.get("updated_at", datetime.now(timezone.utc).isoformat()),
+        }
     return {
         "provider": provider_name,
+        "mode": "scan",
         "status": "idle",
         "stage": "idle",
         "target_count": 0,
@@ -800,7 +970,14 @@ def frontend_ops_progress(provider: str = ""):
         "action_item_count": 0,
         "recommendation_count": 0,
         "batch_count": 0,
+        "cached_count": 0,
+        "hydrated_count": 0,
+        "oldest_cached_at": None,
+        "newest_cached_at": None,
         "latest_subject": None,
+        "resume_offset": 0,
+        "remaining_count": 0,
+        "completed": False,
         "run_id": FRONTEND_RUN_CACHE.get(provider_name),
         "error": FRONTEND_PROVIDER_ERRORS.get(provider_name),
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -822,6 +999,252 @@ def frontend_ops_scan(payload: FrontendProviderWorkflowRequest):
         }
     )
     return overview
+
+
+@router.post("/ops/backfill")
+def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
+    provider_name = _get_provider_name(payload.provider)
+    service = _service_for_provider(provider_name)
+    start_offset = 0
+    processed_total = 0
+    processed_this_run = 0
+    hydrated_total = 0
+    batch_count = 0
+    latest_subject: Optional[str] = None
+
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        if payload.force_refresh:
+            repository.clear_provider_sync_state(provider_name, MAILBOX_BACKFILL_SYNC_KIND)
+        sync_state = repository.get_provider_sync_state(provider_name, MAILBOX_BACKFILL_SYNC_KIND)
+        cache_stats = repository.get_mailbox_cache_stats(provider_name)
+
+    if (
+        sync_state
+        and not payload.force_refresh
+        and bool(sync_state.get("include_body")) == payload.include_body
+        and bool(sync_state.get("unread_only")) == payload.unread_only
+    ):
+        start_offset = min(
+            int(sync_state.get("next_offset") or sync_state.get("processed_count") or 0),
+            payload.limit,
+        )
+        processed_total = int(sync_state.get("processed_count") or start_offset)
+        hydrated_total = max(
+            int(sync_state.get("hydrated_count") or 0),
+            cache_stats["hydrated_count"],
+        )
+        batch_count = int(sync_state.get("batch_count") or 0)
+        latest_subject = sync_state.get("latest_subject")
+        if bool(sync_state.get("completed")) and start_offset >= payload.limit:
+            run_id = _get_cached_or_latest_run_id(provider_name)
+            if run_id is None:
+                run_id, _ = _ensure_frontend_run(provider=provider_name)
+            overview = _build_ops_overview(provider_name, run_id)
+            _update_frontend_progress(
+                provider_name,
+                {
+                    "mode": "backfill",
+                    "status": "complete",
+                    "stage": "backfill_ready",
+                    "limit": payload.limit,
+                    "processed_emails": processed_total,
+                    "read_count": processed_total,
+                    "batch_count": batch_count,
+                    "cached_count": cache_stats["cached_count"],
+                    "hydrated_count": cache_stats["hydrated_count"],
+                    "oldest_cached_at": cache_stats["oldest_cached_at"],
+                    "newest_cached_at": cache_stats["newest_cached_at"],
+                    "latest_subject": latest_subject,
+                    "resume_offset": start_offset,
+                    "remaining_count": 0,
+                    "completed": True,
+                    "error": None,
+                },
+            )
+            return {
+                "count": 0,
+                "processedTotal": processed_total,
+                "cachedCount": cache_stats["cached_count"],
+                "hydratedCount": cache_stats["hydrated_count"],
+                "resumeOffset": start_offset,
+                "remainingCount": 0,
+                "completed": True,
+                "overview": overview,
+            }
+
+    _update_frontend_progress(
+        provider_name,
+        {
+            "mode": "backfill",
+            "status": "running",
+            "stage": "backfill_resume" if start_offset else "backfill_index",
+            "limit": payload.limit,
+            "processed_emails": processed_total,
+            "read_count": processed_total,
+            "action_item_count": 0,
+            "recommendation_count": 0,
+            "batch_count": batch_count,
+            "cached_count": cache_stats["cached_count"],
+            "hydrated_count": cache_stats["hydrated_count"],
+            "oldest_cached_at": cache_stats["oldest_cached_at"],
+            "newest_cached_at": cache_stats["newest_cached_at"],
+            "latest_subject": latest_subject,
+            "resume_offset": start_offset,
+            "remaining_count": max(payload.limit - start_offset, 0),
+            "completed": False,
+            "error": None,
+        },
+    )
+
+    try:
+        for batch in service.provider.iter_mailbox_batches(
+            limit=max(payload.limit - start_offset, 0),
+            batch_size=payload.batch_size,
+            include_body=payload.include_body,
+            unread_only=payload.unread_only,
+            offset=start_offset,
+        ):
+            batch_count += 1
+            with session_scope() as session:
+                repository = InboxRepository(session)
+                for email in batch:
+                    repository.upsert_mailbox_email(provider_name, email)
+                    processed_this_run += 1
+                    processed_total += 1
+                    if (email.body_full or "").strip():
+                        hydrated_total += 1
+                cache_stats = repository.get_mailbox_cache_stats(provider_name)
+                repository.save_provider_sync_state(
+                    provider_name,
+                    MAILBOX_BACKFILL_SYNC_KIND,
+                    {
+                        "target_count": payload.limit,
+                        "processed_count": processed_total,
+                        "next_offset": processed_total,
+                        "batch_count": batch_count,
+                        "hydrated_count": max(hydrated_total, cache_stats["hydrated_count"]),
+                        "cached_count": cache_stats["cached_count"],
+                        "include_body": payload.include_body,
+                        "unread_only": payload.unread_only,
+                        "completed": False,
+                        "latest_subject": batch[0].subject if batch else latest_subject,
+                    },
+                )
+            latest_subject = batch[0].subject if batch else latest_subject
+            _update_frontend_progress(
+                provider_name,
+                {
+                    "mode": "backfill",
+                    "status": "running",
+                    "stage": "backfill_resume" if start_offset else "backfill_index",
+                    "limit": payload.limit,
+                    "processed_emails": processed_total,
+                    "read_count": processed_total,
+                    "batch_count": batch_count,
+                    "cached_count": cache_stats["cached_count"],
+                    "hydrated_count": max(hydrated_total, cache_stats["hydrated_count"]),
+                    "oldest_cached_at": cache_stats["oldest_cached_at"],
+                    "newest_cached_at": cache_stats["newest_cached_at"],
+                    "latest_subject": latest_subject,
+                    "resume_offset": processed_total,
+                    "remaining_count": max(payload.limit - processed_total, 0),
+                    "completed": False,
+                },
+            )
+    except NotImplementedError as exc:
+        message = str(exc)
+        _update_frontend_progress(
+            provider_name,
+            {
+                "mode": "backfill",
+                "status": "error",
+                "stage": "unsupported",
+                "error": message,
+            },
+        )
+        raise HTTPException(status_code=400, detail=message) from exc
+    except Exception as exc:
+        message = _provider_runtime_error_message(provider_name, exc)
+        FRONTEND_PROVIDER_ERRORS[provider_name] = message
+        _update_frontend_progress(
+            provider_name,
+            {
+                "mode": "backfill",
+                "status": "error",
+                "stage": "failed",
+                "error": message,
+            },
+        )
+        raise HTTPException(status_code=502, detail=message) from exc
+
+    cache_stats = _load_mailbox_cache_stats(provider_name)
+    completed = processed_total >= payload.limit or processed_this_run == 0
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        repository.save_provider_sync_state(
+            provider_name,
+            MAILBOX_BACKFILL_SYNC_KIND,
+            {
+                "target_count": payload.limit,
+                "processed_count": processed_total,
+                "next_offset": min(processed_total, payload.limit),
+                "batch_count": batch_count,
+                "hydrated_count": max(hydrated_total, cache_stats["hydrated_count"]),
+                "cached_count": cache_stats["cached_count"],
+                "include_body": payload.include_body,
+                "unread_only": payload.unread_only,
+                "completed": completed,
+                "latest_subject": latest_subject,
+            },
+        )
+    _update_frontend_progress(
+        provider_name,
+        {
+            "mode": "backfill",
+            "status": "complete",
+            "stage": "backfill_ready",
+            "limit": payload.limit,
+            "processed_emails": processed_total,
+            "read_count": processed_total,
+            "batch_count": batch_count,
+            "cached_count": cache_stats["cached_count"],
+            "hydrated_count": cache_stats["hydrated_count"],
+            "oldest_cached_at": cache_stats["oldest_cached_at"],
+            "newest_cached_at": cache_stats["newest_cached_at"],
+            "latest_subject": latest_subject,
+            "resume_offset": min(processed_total, payload.limit),
+            "remaining_count": max(payload.limit - processed_total, 0),
+            "completed": completed,
+            "error": None,
+        },
+    )
+
+    run_id = _get_cached_or_latest_run_id(provider_name)
+    if run_id is None:
+        run_id, _ = _ensure_frontend_run(provider=provider_name)
+    elif payload.force_refresh:
+        run_id, _ = _ensure_frontend_run(provider=provider_name, force=True)
+
+    overview = _build_ops_overview(provider_name, run_id)
+    STREAM_HUB.emit(
+        {
+            "type": "mailbox_backfill_completed",
+            "provider": provider_name,
+            "count": processed_this_run,
+            "cached_count": cache_stats["cached_count"],
+        }
+    )
+    return {
+        "count": processed_this_run,
+        "processedTotal": processed_total,
+        "cachedCount": cache_stats["cached_count"],
+        "hydratedCount": cache_stats["hydrated_count"],
+        "resumeOffset": min(processed_total, payload.limit),
+        "remainingCount": max(payload.limit - processed_total, 0),
+        "completed": completed,
+        "overview": overview,
+    }
 
 
 @router.post("/ops/auto-label")

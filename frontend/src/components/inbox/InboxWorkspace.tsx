@@ -132,12 +132,19 @@ export function InboxWorkspace() {
   const showWorkspaceLoader =
     emailsLoading || digestLoading || recsLoading || progress?.status === "running";
   const progressStats = progress
-    ? [
-        { label: "Emails read", value: progress.read_count },
-        { label: "Processed", value: progress.processed_count },
-        { label: "Actions", value: progress.action_item_count },
-        { label: "Suggestions", value: progress.recommendation_count },
-      ]
+    ? progress.mode === "backfill"
+      ? [
+          { label: "Fetched", value: progress.processed_count },
+          { label: "Cached", value: progress.cached_count },
+          { label: "Hydrated", value: progress.hydrated_count },
+          { label: "Batches", value: progress.batch_count },
+        ]
+      : [
+          { label: "Emails read", value: progress.read_count },
+          { label: "Processed", value: progress.processed_count },
+          { label: "Actions", value: progress.action_item_count },
+          { label: "Suggestions", value: progress.recommendation_count },
+        ]
     : [];
   const workspaceError =
     (emailsQueryError instanceof Error && emailsQueryError.message) ||
@@ -385,11 +392,13 @@ export function InboxWorkspace() {
                     stage={progress?.stage ? `Stage: ${progress.stage}` : undefined}
                     stats={progressStats}
                     message={
-                      progress?.target_count
-                        ? `Syncing unread mail. ${progress.read_count} emails read and ${progress.processed_count} processed out of ${progress.target_count} in this live batch.`
+                      progress?.mode === "backfill"
+                        ? `Building mailbox memory. ${progress.cached_count} emails are cached so far, and ${progress.hydrated_count} already have full bodies ready.`
+                        : progress?.target_count
+                          ? `Syncing unread mail. ${progress.read_count} emails read and ${progress.processed_count} processed out of ${progress.target_count} in this live batch.`
                         : progress?.status === "running"
-                          ? "Connecting the live mailbox and preparing the unread working set."
-                        : "Syncing unread mail. Use W, S, the arrow keys, or space while InboxAnchor caches the batch."
+                            ? "Connecting the live mailbox and preparing the unread working set."
+                          : "Syncing unread mail. Use W, S, the arrow keys, or space while InboxAnchor caches the batch."
                     }
                   />
                 </div>

@@ -13,6 +13,7 @@ import inboxanchor.api.v1.routers.auth as auth_router
 import inboxanchor.api.v1.routers.frontend as frontend_router
 import inboxanchor.api.v1.routers.oauth as oauth_router
 from inboxanchor.api.main import app
+from inboxanchor.bootstrap import build_demo_emails
 
 client = TestClient(app)
 
@@ -585,6 +586,111 @@ def test_frontend_ops_workflows_expose_mailbox_upgrade_features():
     assert payload["labelsApplied"] >= 0
     assert payload["cleanupApplied"] >= 0
     assert payload["overview"]["provider"] == overview["provider"]
+
+
+def test_frontend_ops_backfill_builds_mailbox_memory_cache():
+    response = client.post(
+        "/ops/backfill",
+        json={
+            "limit": 50,
+            "batch_size": 10,
+            "include_body": False,
+            "unread_only": False,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["count"] >= 1
+    assert payload["cachedCount"] >= payload["count"]
+    assert payload["processedTotal"] >= payload["count"]
+    assert payload["overview"]["cachedEmailsCount"] >= payload["count"]
+    assert "mailboxMemory" in payload["overview"]
+
+
+def test_frontend_ops_backfill_can_resume_from_saved_offset(monkeypatch):
+    seed = build_demo_emails()
+    emails = [
+        seed[index % len(seed)].model_copy(
+            update={
+                "id": f"resume-{index}",
+                "thread_id": f"thread-resume-{index}",
+                "subject": f"Resume subject {index}",
+            }
+        )
+        for index in range(40)
+    ]
+    calls: list[dict] = []
+
+    class ResumeProvider:
+        def iter_mailbox_batches(
+            self,
+            *,
+            limit: int = 500,
+            batch_size: int = 100,
+            include_body: bool = False,
+            unread_only: bool = False,
+            offset: int = 0,
+        ):
+            calls.append(
+                {
+                    "limit": limit,
+                    "batch_size": batch_size,
+                    "include_body": include_body,
+                    "unread_only": unread_only,
+                    "offset": offset,
+                }
+            )
+            selected = emails[offset : offset + limit]
+            for start in range(0, len(selected), batch_size):
+                yield [item.model_copy(deep=True) for item in selected[start : start + batch_size]]
+
+    monkeypatch.setattr(
+        frontend_router,
+        "_service_for_provider",
+        lambda provider_name: SimpleNamespace(provider=ResumeProvider()),
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_get_cached_or_latest_run_id",
+        lambda provider_name: "resume-run",
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_build_ops_overview",
+        lambda provider_name, run_id: {
+            "provider": provider_name,
+            "runId": run_id,
+            "cachedEmailsCount": 6,
+            "mailboxMemory": {
+                "resumeOffset": 6,
+                "processedTotal": 6,
+                "remainingCount": 0,
+            },
+        },
+    )
+
+    first = client.post(
+        "/ops/backfill",
+        json={"provider": "gmail", "limit": 25, "batch_size": 10},
+    )
+    second = client.post(
+        "/ops/backfill",
+        json={"provider": "gmail", "limit": 40, "batch_size": 10},
+    )
+    progress = client.get("/ops/progress", params={"provider": "gmail"})
+
+    assert first.status_code == 200
+    assert first.json()["processedTotal"] == 25
+    assert second.status_code == 200
+    assert second.json()["count"] == 15
+    assert second.json()["processedTotal"] == 40
+    assert second.json()["resumeOffset"] == 40
+    assert calls[0]["offset"] == 0
+    assert calls[1]["offset"] == 25
+    assert progress.status_code == 200
+    assert progress.json()["resume_offset"] == 40
+    assert progress.json()["completed"] is True
 
 
 def test_frontend_ops_overview_surfaces_live_provider_fetch_failure(monkeypatch):

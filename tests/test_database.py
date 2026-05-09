@@ -1,6 +1,8 @@
 from pathlib import Path
 
-from inboxanchor.infra.database import _resolve_database_url
+from inboxanchor.bootstrap import build_demo_emails
+from inboxanchor.infra.database import _resolve_database_url, session_scope
+from inboxanchor.infra.repository import InboxRepository
 
 
 def test_relative_sqlite_url_resolves_to_app_data_directory():
@@ -17,3 +19,96 @@ def test_absolute_sqlite_url_is_preserved_when_parent_is_writable(tmp_path):
 
     assert resolved == f"sqlite:///{candidate}"
     assert Path(candidate.parent).exists()
+
+
+def test_mailbox_cache_preserves_existing_full_body_on_metadata_refresh():
+    seed = build_demo_emails()[0].model_copy(
+        update={
+            "id": "cache-preserve-1",
+            "body_preview": "Preview snippet",
+            "body_full": "The original full body should stay available.",
+        }
+    )
+    metadata_only = seed.model_copy(
+        update={
+            "snippet": "Updated preview snippet",
+            "body_preview": "Updated preview snippet",
+            "body_full": "",
+        }
+    )
+
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        repository.upsert_mailbox_email("cache-preserve", seed)
+
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        repository.upsert_mailbox_email("cache-preserve", metadata_only)
+        cached = repository.get_mailbox_email("cache-preserve", "cache-preserve-1")
+
+    assert cached is not None
+    assert cached["body_preview"] == "Updated preview snippet"
+    assert cached["body_full"] == "The original full body should stay available."
+
+
+def test_mailbox_cache_can_hydrate_full_body_after_lightweight_sync():
+    seed = build_demo_emails()[1].model_copy(
+        update={
+            "id": "cache-hydrate-1",
+            "body_preview": "Short preview only",
+            "body_full": "",
+        }
+    )
+
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        repository.upsert_mailbox_email("cache-hydrate", seed)
+
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        hydrated = repository.save_mailbox_email_body(
+            "cache-hydrate",
+            "cache-hydrate-1",
+            body_full="This is the hydrated full body for the cached email.",
+        )
+
+    assert hydrated is not None
+    assert hydrated["body_full"] == "This is the hydrated full body for the cached email."
+    assert hydrated["body_preview"] == "This is the hydrated full body for the cached email."[:500]
+
+
+def test_provider_sync_state_roundtrip_and_clear():
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        stored = repository.save_provider_sync_state(
+            "gmail",
+            "mailbox_backfill",
+            {
+                "target_count": 20000,
+                "processed_count": 2500,
+                "next_offset": 2500,
+                "completed": False,
+            },
+        )
+
+    assert stored["processed_count"] == 2500
+    assert stored["sync_kind"] == "mailbox_backfill"
+
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        loaded = repository.get_provider_sync_state("gmail", "mailbox_backfill")
+
+    assert loaded is not None
+    assert loaded["target_count"] == 20000
+    assert loaded["next_offset"] == 2500
+    assert loaded["completed"] is False
+
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        repository.clear_provider_sync_state("gmail", "mailbox_backfill")
+
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        cleared = repository.get_provider_sync_state("gmail", "mailbox_backfill")
+
+    assert cleared is None

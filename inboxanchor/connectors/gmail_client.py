@@ -9,8 +9,17 @@ from inboxanchor.models import EmailMessage
 class GmailTransport(Protocol):
     def list_unread(self, limit: int) -> list[EmailMessage]: ...
     def list_unread_page(self, limit: int, offset: int) -> list[EmailMessage]: ...
-    def get_message(self, email_id: str) -> EmailMessage: ...
+    def get_message(self, email_id: str, include_body: bool = True) -> EmailMessage: ...
     def get_body(self, email_id: str) -> str: ...
+    def iter_mailbox_batches(
+        self,
+        *,
+        limit: int = 500,
+        batch_size: int = 100,
+        include_body: bool = False,
+        unread_only: bool = False,
+        offset: int = 0,
+    ): ...
     def mark_read(self, email_ids: list[str]) -> None: ...
     def archive(self, email_ids: list[str]) -> None: ...
     def trash(self, email_ids: list[str]) -> None: ...
@@ -65,6 +74,35 @@ class GmailClient(EmailProvider):
         for start in range(0, len(emails), batch_size):
             yield emails[start : start + batch_size]
 
+    def iter_mailbox_batches(
+        self,
+        *,
+        limit: int = 500,
+        batch_size: int = 100,
+        include_body: bool = False,
+        unread_only: bool = False,
+        offset: int = 0,
+    ):
+        transport = self._require_transport()
+        if callable(getattr(transport, "iter_mailbox_batches", None)):
+            yield from transport.iter_mailbox_batches(
+                limit=limit,
+                batch_size=batch_size,
+                include_body=include_body,
+                unread_only=unread_only,
+                offset=offset,
+            )
+            return
+
+        if unread_only:
+            emails = transport.list_unread(limit + offset)
+            emails = emails[offset : offset + limit]
+            for start in range(0, len(emails), batch_size):
+                yield emails[start : start + batch_size]
+            return
+
+        raise NotImplementedError("The current Gmail transport cannot iterate the mailbox yet.")
+
     def supports_incremental_sync(self) -> bool:
         transport = self._require_transport()
         return callable(getattr(transport, "iter_unread_batches_since", None)) and callable(
@@ -101,7 +139,7 @@ class GmailClient(EmailProvider):
         return None
 
     def fetch_email_metadata(self, email_id: str) -> EmailMessage:
-        return self._require_transport().get_message(email_id)
+        return self._require_transport().get_message(email_id, include_body=False)
 
     def fetch_email_body(self, email_id: str) -> str:
         return self._require_transport().get_body(email_id)

@@ -31,6 +31,25 @@ class EmailProvider(ABC):
         for start in range(0, len(emails), batch_size):
             yield emails[start : start + batch_size]
 
+    def iter_mailbox_batches(
+        self,
+        *,
+        limit: int = 500,
+        batch_size: int = 100,
+        include_body: bool = False,
+        unread_only: bool = False,
+        offset: int = 0,
+    ):
+        if unread_only:
+            emails = self.list_unread(limit=limit + offset, include_body=include_body)
+            emails = emails[offset : offset + limit]
+            for start in range(0, len(emails), batch_size):
+                yield emails[start : start + batch_size]
+            return
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support historical mailbox iteration."
+        )
+
     def supports_incremental_sync(self) -> bool:
         return False
 

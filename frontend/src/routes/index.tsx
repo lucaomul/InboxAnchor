@@ -9,6 +9,7 @@ import {
   useOpsOverview,
   useOpsProgress,
   useRunAutoLabel,
+  useRunMailboxBackfill,
   useRunFullAnchorWorkflow,
   useRunOpsScan,
   useRunSafeCleanupWorkflow,
@@ -64,6 +65,7 @@ function CommandCenter() {
   const { theme, setTheme, themes } = useTheme();
   const { data: overview, isLoading, isError, error } = useOpsOverview();
   const scanMutation = useRunOpsScan();
+  const backfillMutation = useRunMailboxBackfill();
   const autoLabelMutation = useRunAutoLabel();
   const cleanupMutation = useRunSafeCleanupWorkflow();
   const fullAnchorMutation = useRunFullAnchorWorkflow();
@@ -71,6 +73,7 @@ function CommandCenter() {
 
   const busy =
     scanMutation.isPending ||
+    backfillMutation.isPending ||
     autoLabelMutation.isPending ||
     cleanupMutation.isPending ||
     fullAnchorMutation.isPending;
@@ -81,12 +84,19 @@ function CommandCenter() {
     progress?.status === "running" ||
     overview?.providerStatus === "checking";
   const progressStats = progress
-    ? [
-        { label: "Emails read", value: progress.read_count },
-        { label: "Processed", value: progress.processed_count },
-        { label: "Actions", value: progress.action_item_count },
-        { label: "Suggestions", value: progress.recommendation_count },
-      ]
+    ? progress.mode === "backfill"
+      ? [
+          { label: "Fetched", value: progress.processed_count },
+          { label: "Cached", value: progress.cached_count },
+          { label: "Hydrated", value: progress.hydrated_count },
+          { label: "Batches", value: progress.batch_count },
+        ]
+      : [
+          { label: "Emails read", value: progress.read_count },
+          { label: "Processed", value: progress.processed_count },
+          { label: "Actions", value: progress.action_item_count },
+          { label: "Suggestions", value: progress.recommendation_count },
+        ]
     : [];
 
   const metricCards = overview
@@ -94,7 +104,7 @@ function CommandCenter() {
         { label: "Unread mapped", value: overview.unreadCount, note: "live unread inventory" },
         { label: "High priority", value: overview.highPriorityCount, note: "threads needing attention" },
         { label: "Safe cleanups", value: overview.safeCleanupCount, note: "low-risk actions ready" },
-        { label: "Label candidates", value: overview.autoLabelCandidates, note: "emails we can organize now" },
+        { label: "Mailbox memory", value: overview.cachedEmailsCount, note: "cached historical emails" },
       ]
     : [];
 
@@ -227,11 +237,13 @@ function CommandCenter() {
                       stage={progress?.stage ? `Stage: ${progress.stage}` : undefined}
                       stats={progressStats}
                       message={
-                        progress?.target_count
-                          ? `Mapping the unread working set. ${progress.processed_count} of ${progress.target_count} emails have been processed so far.`
+                        progress?.mode === "backfill"
+                          ? `Building mailbox memory. ${progress.cached_count} emails are cached so far, and ${progress.hydrated_count} already have full bodies ready.`
+                          : progress?.target_count
+                            ? `Mapping the unread working set. ${progress.processed_count} of ${progress.target_count} emails have been processed so far.`
                           : overview?.providerStatus === "checking"
                             ? "Connecting the live mailbox and preparing the unread scan."
-                          : "Mapping your mailbox. Use W, S, the arrow keys, or space while the unread cache settles."
+                            : "Mapping your mailbox. Use W, S, the arrow keys, or space while the unread cache settles."
                       }
                     />
                   </div>
@@ -312,7 +324,18 @@ function CommandCenter() {
                   <li>Labels are generated from classification, urgency, attachments, and action pressure.</li>
                   <li>Cleanup is executed only for low-risk items, not via reckless auto-delete behavior.</li>
                   <li>Unread scans and label sweeps work as an operational layer for Gmail and IMAP-family inboxes.</li>
+                  <li>Mailbox memory caches older history locally so the product gets smarter without re-reading everything live.</li>
                 </ul>
+              </div>
+              <div className="grid grid-cols-2 gap-3 rounded-xl border border-border bg-background p-4 text-xs text-muted-foreground">
+                <div>
+                  <p className="font-medium text-foreground">{overview?.cachedEmailsCount || 0}</p>
+                  <p>historical emails cached</p>
+                </div>
+                <div>
+                  <p className="font-medium text-foreground">{overview?.hydratedEmailsCount || 0}</p>
+                  <p>full bodies ready instantly</p>
+                </div>
               </div>
             </div>
           </div>
@@ -330,6 +353,15 @@ function CommandCenter() {
             </p>
 
             <div className="mt-5 grid gap-4 md:grid-cols-2">
+              <WorkflowCard
+                title="Build mailbox memory"
+                icon={<Activity className="h-4 w-4" />}
+                description="Backfill historical mailbox metadata into the local cache so years of email can be searched and hydrated without forcing a giant live triage run."
+                impact={overview?.workflows.find((item) => item.slug === "backfill")?.impact}
+                cta="Cache history"
+                loading={backfillMutation.isPending}
+                onClick={() => backfillMutation.mutate()}
+              />
               <WorkflowCard
                 title="Auto-label unread mail"
                 icon={<Tags className="h-4 w-4" />}
@@ -386,7 +418,11 @@ function CommandCenter() {
                         playful
                         stage={progress?.stage ? `Stage: ${progress.stage}` : undefined}
                         stats={progressStats}
-                        message="Jump over email piles while InboxAnchor prepares the mailbox map."
+                        message={
+                          progress?.mode === "backfill"
+                            ? "Jump over old email piles while InboxAnchor builds mailbox memory."
+                            : "Jump over email piles while InboxAnchor prepares the mailbox map."
+                        }
                       />
                     </div>
                   )

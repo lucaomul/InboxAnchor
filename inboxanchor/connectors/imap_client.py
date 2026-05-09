@@ -45,6 +45,28 @@ class IMAPEmailClient(EmailProvider):
         for start in range(0, len(emails), batch_size):
             yield emails[start : start + batch_size]
 
+    def iter_mailbox_batches(
+        self,
+        *,
+        limit: int = 500,
+        batch_size: int = 100,
+        include_body: bool = False,
+        unread_only: bool = False,
+        offset: int = 0,
+    ):
+        emails = [item.model_copy(deep=True) for item in self._messages.values()]
+        if unread_only:
+            emails = [item for item in emails if item.unread]
+        emails.sort(key=lambda item: item.received_at, reverse=True)
+        emails = emails[offset : offset + limit]
+        if not include_body:
+            emails = [
+                email.model_copy(update={"body_full": "", "body_preview": email.snippet})
+                for email in emails
+            ]
+        for start in range(0, len(emails), batch_size):
+            yield emails[start : start + batch_size]
+
     def fetch_email_metadata(self, email_id: str) -> EmailMessage:
         return self._messages[email_id].model_copy(deep=True)
 

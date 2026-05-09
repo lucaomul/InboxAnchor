@@ -4,6 +4,7 @@ import {
   fetchOpsOverview,
   fetchOpsProgress,
   getApiUrl,
+  runMailboxBackfill,
   runAutoLabel,
   runFullAnchorWorkflow,
   runOpsScan,
@@ -82,6 +83,20 @@ export function useRunAutoLabel() {
       });
     },
     onError: (err) => toast.error(`Failed to apply labels: ${err.message}`),
+  });
+}
+
+export function useRunMailboxBackfill() {
+  const invalidate = useInvalidateWorkspace();
+  return useMutation({
+    mutationFn: runMailboxBackfill,
+    onSuccess: (result) => {
+      invalidate();
+      toast.success("Mailbox memory sync complete", {
+        description: `${result.cachedCount || 0} emails are now cached locally, with ${result.hydratedCount || 0} full bodies ready instantly.`,
+      });
+    },
+    onError: (err) => toast.error(`Failed to build mailbox memory: ${err.message}`),
   });
 }
 
