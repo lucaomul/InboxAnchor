@@ -75,7 +75,7 @@ class FakeEmailProvider(EmailProvider):
     def iter_mailbox_batches(
         self,
         *,
-        limit: int = 500,
+        limit: Optional[int] = 500,
         batch_size: int = 100,
         include_body: bool = False,
         unread_only: bool = False,
@@ -88,7 +88,7 @@ class FakeEmailProvider(EmailProvider):
         if time_range:
             emails = [email for email in emails if in_time_window(email.received_at, time_range)]
         emails.sort(key=lambda item: item.received_at, reverse=True)
-        emails = emails[offset : offset + limit]
+        emails = emails[offset:] if limit is None else emails[offset : offset + limit]
         if not include_body:
             emails = [
                 email.model_copy(

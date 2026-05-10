@@ -513,6 +513,17 @@ export interface OpsOverview {
   hydratedEmailsCount: number;
   oldestCachedAt: string | null;
   newestCachedAt: string | null;
+  mailboxMemory?: {
+    targetCount: number;
+    processedTotal: number;
+    resumeOffset: number;
+    remainingCount: number;
+    completed: boolean;
+    fullMailboxMode?: boolean;
+    includeBody: boolean;
+    unreadOnly: boolean;
+    lastBackfillAt: string | null;
+  };
   categoryCounts: Record<string, number>;
   summary: string;
   liveConnected: boolean;
@@ -527,6 +538,10 @@ export interface WorkflowMutationResult {
   cleanupApplied?: number;
   cachedCount?: number;
   hydratedCount?: number;
+  processedTotal?: number;
+  resumeOffset?: number;
+  remainingCount?: number;
+  completed?: boolean;
   deletedLabelCount?: number;
   deletedLabels?: string[];
   overview: OpsOverview;
@@ -588,7 +603,7 @@ export async function runMailboxBackfill(timeRange?: MailboxTimeRange): Promise<
     method: "POST",
     body: JSON.stringify({
       force_refresh: false,
-      limit: 20000,
+      limit: null,
       batch_size: 250,
       include_body: false,
       unread_only: false,
@@ -629,6 +644,15 @@ export async function runSafeCleanupWorkflow(
   });
 }
 
+export async function runIndustrialReadWorkflow(
+  timeRange?: MailboxTimeRange,
+): Promise<WorkflowMutationResult> {
+  return apiFetch<WorkflowMutationResult>("/ops/industrial-read", {
+    method: "POST",
+    body: JSON.stringify({ force_refresh: false, time_range: timeRange }),
+  });
+}
+
 export async function runFullAnchorWorkflow(
   timeRange?: MailboxTimeRange,
 ): Promise<WorkflowMutationResult> {
@@ -659,6 +683,10 @@ export interface EmailAliasListResponse {
   mode?: "plus" | "managed";
   domain?: string | null;
   managed_enabled?: boolean;
+  managed_ready?: boolean;
+  managed_resolver_configured?: boolean;
+  managed_inbound_ready?: boolean;
+  managed_blockers?: string[];
   plus_fallback_enabled?: boolean;
 }
 

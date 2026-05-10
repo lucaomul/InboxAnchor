@@ -53,8 +53,8 @@ class Settings:
     )
     gmail_pubsub_topic: str = os.getenv("GMAIL_PUBSUB_TOPIC", "")
     gmail_watch_label_ids: str = os.getenv("GMAIL_WATCH_LABEL_IDS", "INBOX")
-    gmail_fetch_workers: int = int(os.getenv("INBOXANCHOR_GMAIL_FETCH_WORKERS", "10"))
-    gmail_batch_size: int = int(os.getenv("INBOXANCHOR_GMAIL_BATCH_SIZE", "500"))
+    gmail_fetch_workers: int = int(os.getenv("INBOXANCHOR_GMAIL_FETCH_WORKERS", "4"))
+    gmail_batch_size: int = int(os.getenv("INBOXANCHOR_GMAIL_BATCH_SIZE", "100"))
     gmail_body_max_chars: int = int(os.getenv("INBOXANCHOR_GMAIL_BODY_MAX_CHARS", "50000"))
     gmail_industrial_mode: bool = _as_bool(
         os.getenv("INBOXANCHOR_GMAIL_INDUSTRIAL_MODE"),
@@ -83,6 +83,10 @@ class Settings:
         False,
     )
     alias_resolver_secret: str = os.getenv("INBOXANCHOR_ALIAS_RESOLVER_SECRET", "")
+    alias_inbound_ready: bool = _as_bool(
+        os.getenv("INBOXANCHOR_ALIAS_INBOUND_READY"),
+        False,
+    )
     imap_host: str = os.getenv("IMAP_HOST", "")
     imap_port: int = int(os.getenv("IMAP_PORT", "993"))
     imap_username: str = os.getenv("IMAP_USERNAME", "")

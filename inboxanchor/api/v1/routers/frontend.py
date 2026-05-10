@@ -72,6 +72,7 @@ MAILBOX_SAFETY_VERIFIER = SafetyVerifierAgent()
 @dataclass
 class FrontendRunJob:
     provider_name: str
+    mode: str = "scan"
     event: threading.Event = field(default_factory=threading.Event)
     run_id: Optional[str] = None
     error: Optional[str] = None
@@ -122,7 +123,7 @@ class FrontendProviderWorkflowRequest(BaseModel):
 class FrontendMailboxBackfillRequest(BaseModel):
     provider: Optional[str] = None
     force_refresh: bool = False
-    limit: int = Field(default=5000, ge=25, le=20000)
+    limit: Optional[int] = Field(default=None, ge=25)
     batch_size: int = Field(default=250, ge=10, le=1000)
     include_body: bool = False
     unread_only: bool = False
@@ -152,6 +153,34 @@ def _scope_sync_kind(time_range: Optional[str]) -> str:
     return f"{MAILBOX_BACKFILL_SYNC_KIND}:{normalized}"
 
 
+def _mailbox_limit_remaining(limit: Optional[int], processed: int) -> int:
+    if limit is None:
+        return 0
+    return max(limit - processed, 0)
+
+
+def _mailbox_limit_reached(limit: Optional[int], processed: int) -> bool:
+    return limit is not None and processed >= limit
+
+
+def _mailbox_progress_target(
+    limit: Optional[int],
+    processed: int,
+    *,
+    full_mailbox_mode: bool = False,
+    completed: bool = False,
+) -> int:
+    if limit is not None:
+        return limit
+    return processed if full_mailbox_mode and completed else 0
+
+
+def _use_industrial_unread_sync(provider: object, *, time_range: Optional[str] = None) -> bool:
+    if normalize_time_range(time_range) != ALL_TIME_RANGE:
+        return False
+    return callable(getattr(provider, "iter_all_unread_batches", None))
+
+
 def _extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
     if not authorization:
         return None
@@ -174,6 +203,10 @@ def _require_alias_resolver_secret(secret: Optional[str]) -> None:
         )
     if not secret or secret.strip() != expected:
         raise HTTPException(status_code=401, detail="Alias resolver authentication failed.")
+
+
+def _alias_resolver_secret_configured() -> bool:
+    return bool(SETTINGS.alias_resolver_secret.strip())
 
 
 def _current_actor_email(authorization: Optional[str]) -> str:
@@ -339,7 +372,7 @@ def _update_frontend_progress(
     if "stage" in payload:
         progress["stage"] = payload["stage"]
     if "limit" in payload:
-        progress["target_count"] = payload["limit"]
+        progress["target_count"] = int(payload["limit"] or 0)
     if "processed_emails" in payload:
         progress["processed_count"] = payload["processed_emails"]
     if "read_count" in payload:
@@ -522,16 +555,15 @@ def _ensure_frontend_run(
         scan_batch_size = min(scan_batch_size, 250)
 
     wait_job: Optional[FrontendRunJob] = None
-    with FRONTEND_ACTIVE_RUNS_LOCK:
-        active_job = FRONTEND_ACTIVE_RUNS.get(scope_key)
-        if active_job is not None:
-            wait_job = active_job
-        else:
-            job = FrontendRunJob(provider_name=provider_name)
-            FRONTEND_ACTIVE_RUNS[scope_key] = job
+    job, wait_job = _claim_frontend_job(
+        scope_key,
+        provider_name=provider_name,
+        mode="scan",
+    )
 
     if wait_job is not None:
         return _wait_for_frontend_job(wait_job, provider_name, time_range=normalized_time_range)
+    assert job is not None
 
     _update_frontend_progress(
         provider_name,
@@ -748,6 +780,32 @@ def _managed_alias_domain() -> str:
 
 def _managed_aliases_enabled() -> bool:
     return SETTINGS.alias_managed_enabled and bool(_managed_alias_domain())
+
+
+def _managed_alias_inbound_ready() -> bool:
+    return SETTINGS.alias_inbound_ready
+
+
+def _managed_alias_blockers() -> list[str]:
+    blockers: list[str] = []
+    if not _managed_aliases_enabled():
+        blockers.append(
+            "Set INBOXANCHOR_ALIAS_MANAGED_ENABLED=true and "
+            "INBOXANCHOR_ALIAS_DOMAIN to your alias domain."
+        )
+        return blockers
+    if not _alias_resolver_secret_configured():
+        blockers.append("Set INBOXANCHOR_ALIAS_RESOLVER_SECRET on the backend.")
+    if not _managed_alias_inbound_ready():
+        blockers.append(
+            "Deploy the Cloudflare Email Routing worker, then set "
+            "INBOXANCHOR_ALIAS_INBOUND_READY=true."
+        )
+    return blockers
+
+
+def _managed_aliases_ready() -> bool:
+    return _managed_aliases_enabled() and not _managed_alias_blockers()
 
 
 def _plus_alias_fallback_enabled() -> bool:
@@ -1118,6 +1176,8 @@ def _sync_unread_working_set(
     time_range: Optional[str] = None,
     limit_override: Optional[int] = None,
     batch_size_override: Optional[int] = None,
+    manage_active_job: bool = True,
+    pre_registered_job: Optional[FrontendRunJob] = None,
 ) -> dict:
     del force_refresh
     normalized_time_range = normalize_time_range(time_range)
@@ -1125,16 +1185,29 @@ def _sync_unread_working_set(
     service = _service_for_provider(provider_name)
     provider = getattr(service, "provider", None)
     settings = _get_workspace_settings()
-    scan_limit = limit_override or settings.default_scan_limit
-    scan_batch_size = min(batch_size_override or settings.default_batch_size, 250)
+    industrial_unread_mode = provider is not None and _use_industrial_unread_sync(
+        provider,
+        time_range=normalized_time_range,
+    )
+    scan_limit = None if industrial_unread_mode else (limit_override or settings.default_scan_limit)
+    scan_batch_size = min(
+        batch_size_override or settings.default_batch_size,
+        100 if industrial_unread_mode else 250,
+    )
     wait_job: Optional[FrontendRunJob] = None
+    job = pre_registered_job
+    owns_active_slot = manage_active_job or pre_registered_job is not None
 
-    with FRONTEND_ACTIVE_RUNS_LOCK:
-        active_job = FRONTEND_ACTIVE_RUNS.get(scope_key)
-        if active_job is not None:
-            wait_job = active_job
-        else:
-            FRONTEND_ACTIVE_RUNS[scope_key] = FrontendRunJob(provider_name=provider_name)
+    if manage_active_job:
+        with FRONTEND_ACTIVE_RUNS_LOCK:
+            active_job = FRONTEND_ACTIVE_RUNS.get(scope_key)
+            if active_job is not None:
+                wait_job = active_job
+            else:
+                job = FrontendRunJob(provider_name=provider_name)
+                FRONTEND_ACTIVE_RUNS[scope_key] = job
+    elif job is None:
+        job = FrontendRunJob(provider_name=provider_name)
 
     if wait_job is not None:
         run_id, _ = _wait_for_frontend_job(
@@ -1152,6 +1225,7 @@ def _sync_unread_working_set(
                 time_range=normalized_time_range,
             )["cached_count"],
         }
+    assert job is not None
 
     seen_email_ids: list[str] = []
     processed_total = 0
@@ -1164,15 +1238,18 @@ def _sync_unread_working_set(
         unread_only=True,
         time_range=normalized_time_range,
     )
-    job = FRONTEND_ACTIVE_RUNS[scope_key]
-
     _update_frontend_progress(
         provider_name,
         {
             "mode": "scan",
             "status": "running",
             "stage": "syncing_unread",
-            "limit": scan_limit,
+            "limit": _mailbox_progress_target(
+                scan_limit,
+                0,
+                full_mailbox_mode=industrial_unread_mode,
+                completed=False,
+            ),
             "processed_emails": 0,
             "read_count": 0,
             "action_item_count": workflow_counts["action_item_count"],
@@ -1222,12 +1299,21 @@ def _sync_unread_working_set(
             FRONTEND_RUN_CACHE[scope_key] = result.run_id
             cache_stats = _load_mailbox_cache_stats(provider_name, time_range=normalized_time_range)
         else:
-            for batch in provider.iter_unread_batches(
-                limit=scan_limit,
-                batch_size=scan_batch_size,
-                include_body=False,
-                time_range=normalized_time_range,
-            ):
+            batch_iterator = (
+                provider.iter_all_unread_batches(
+                    batch_size=scan_batch_size,
+                    include_body=False,
+                    time_range=normalized_time_range,
+                )
+                if industrial_unread_mode
+                else provider.iter_unread_batches(
+                    limit=scan_limit,
+                    batch_size=scan_batch_size,
+                    include_body=False,
+                    time_range=normalized_time_range,
+                )
+            )
+            for batch in batch_iterator:
                 batch_count += 1
                 with session_scope() as session:
                     repository = InboxRepository(session)
@@ -1250,7 +1336,12 @@ def _sync_unread_working_set(
                         "mode": "scan",
                         "status": "running",
                         "stage": "syncing_unread",
-                        "limit": scan_limit,
+                        "limit": _mailbox_progress_target(
+                            scan_limit,
+                            processed_total,
+                            full_mailbox_mode=industrial_unread_mode,
+                            completed=False,
+                        ),
                         "processed_emails": processed_total,
                         "read_count": processed_total,
                         "action_item_count": workflow_counts["action_item_count"],
@@ -1268,8 +1359,9 @@ def _sync_unread_working_set(
     except HTTPException:
         job.error = "InboxAnchor could not refresh the unread working set."
         job.event.set()
-        with FRONTEND_ACTIVE_RUNS_LOCK:
-            FRONTEND_ACTIVE_RUNS.pop(scope_key, None)
+        if owns_active_slot:
+            with FRONTEND_ACTIVE_RUNS_LOCK:
+                FRONTEND_ACTIVE_RUNS.pop(scope_key, None)
         raise
     except Exception as exc:
         message = _provider_runtime_error_message(provider_name, exc)
@@ -1285,11 +1377,14 @@ def _sync_unread_working_set(
             time_range=normalized_time_range,
         )
         job.event.set()
-        with FRONTEND_ACTIVE_RUNS_LOCK:
-            FRONTEND_ACTIVE_RUNS.pop(scope_key, None)
+        if owns_active_slot:
+            with FRONTEND_ACTIVE_RUNS_LOCK:
+                FRONTEND_ACTIVE_RUNS.pop(scope_key, None)
         raise HTTPException(status_code=502, detail=message) from exc
 
-    fully_reconciled = provider is not None and processed_total < scan_limit
+    fully_reconciled = provider is not None and (
+        industrial_unread_mode or (scan_limit is not None and processed_total < scan_limit)
+    )
     if fully_reconciled:
         with session_scope() as session:
             repository = InboxRepository(session)
@@ -1317,7 +1412,12 @@ def _sync_unread_working_set(
             "mode": "scan",
             "status": "complete",
             "stage": "cache_ready",
-            "limit": scan_limit,
+            "limit": _mailbox_progress_target(
+                scan_limit,
+                processed_total,
+                full_mailbox_mode=industrial_unread_mode,
+                completed=True,
+            ),
             "processed_emails": processed_total,
             "read_count": processed_total,
             "action_item_count": workflow_counts["action_item_count"],
@@ -1335,8 +1435,9 @@ def _sync_unread_working_set(
     )
     job.run_id = latest_run_id
     job.event.set()
-    with FRONTEND_ACTIVE_RUNS_LOCK:
-        FRONTEND_ACTIVE_RUNS.pop(scope_key, None)
+    if owns_active_slot:
+        with FRONTEND_ACTIVE_RUNS_LOCK:
+            FRONTEND_ACTIVE_RUNS.pop(scope_key, None)
     STREAM_HUB.emit(
         {
             "type": "scan_completed",
@@ -1363,17 +1464,34 @@ def _start_unread_sync_job(
 ) -> bool:
     normalized_time_range = normalize_time_range(time_range)
     scope_key = _scope_key(provider_name, normalized_time_range)
-    if _has_active_frontend_job(scope_key):
+    job, wait_job = _claim_frontend_job(
+        scope_key,
+        provider_name=provider_name,
+        mode="scan",
+    )
+    if wait_job is not None:
         return False
+    assert job is not None
 
     settings = _get_workspace_settings()
+    service = _service_for_provider(provider_name)
+    provider = getattr(service, "provider", None)
+    industrial_unread_mode = provider is not None and _use_industrial_unread_sync(
+        provider,
+        time_range=normalized_time_range,
+    )
     _update_frontend_progress(
         provider_name,
         {
             "mode": "scan",
             "status": "running",
             "stage": "queued",
-            "limit": settings.default_scan_limit,
+            "limit": _mailbox_progress_target(
+                None if industrial_unread_mode else settings.default_scan_limit,
+                0,
+                full_mailbox_mode=industrial_unread_mode,
+                completed=False,
+            ),
             "processed_emails": 0,
             "read_count": 0,
             "action_item_count": 0,
@@ -1394,6 +1512,8 @@ def _start_unread_sync_job(
                 provider_name,
                 force_refresh=force_refresh,
                 time_range=normalized_time_range,
+                manage_active_job=False,
+                pre_registered_job=job,
             )
         except HTTPException:
             return
@@ -1507,6 +1627,41 @@ def _has_active_frontend_job(scope_key: str) -> bool:
     with FRONTEND_ACTIVE_RUNS_LOCK:
         job = FRONTEND_ACTIVE_RUNS.get(scope_key)
     return job is not None and not job.event.is_set()
+
+
+def _active_frontend_job_is_stale(scope_key: str, job: FrontendRunJob) -> bool:
+    if job.event.is_set():
+        return True
+    progress = FRONTEND_PROGRESS.get(scope_key)
+    if not progress:
+        return True
+    if progress.get("status") != "running":
+        return True
+    updated_at = progress.get("updated_at")
+    if not updated_at:
+        return False
+    try:
+        updated = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return (datetime.now(timezone.utc) - updated).total_seconds() > 300
+
+
+def _claim_frontend_job(
+    scope_key: str,
+    *,
+    provider_name: str,
+    mode: str,
+) -> tuple[Optional[FrontendRunJob], Optional[FrontendRunJob]]:
+    with FRONTEND_ACTIVE_RUNS_LOCK:
+        active_job = FRONTEND_ACTIVE_RUNS.get(scope_key)
+        if active_job is not None:
+            if not _active_frontend_job_is_stale(scope_key, active_job):
+                return None, active_job
+            FRONTEND_ACTIVE_RUNS.pop(scope_key, None)
+        job = FrontendRunJob(provider_name=provider_name, mode=mode)
+        FRONTEND_ACTIVE_RUNS[scope_key] = job
+        return job, None
 
 
 def _get_cached_or_latest_run_id(
@@ -2318,16 +2473,20 @@ def _build_ops_overview(
     connection = InboxAnchorService().load_provider_connection(provider_name)
     cache_stats = _load_mailbox_cache_stats(provider_name, time_range=normalized_time_range)
     sync_state = _load_mailbox_sync_state(provider_name, time_range=normalized_time_range)
-    historical_target = min(max(settings.default_scan_limit * 4, 5000), 20000)
-    mailbox_target = (
-        max(historical_target, int(sync_state.get("target_count") or 0))
-        if sync_state
-        else historical_target
-    )
     processed_total = max(
         cache_stats["cached_count"],
         int(sync_state.get("processed_count") or 0) if sync_state else 0,
     )
+    historical_target = max(settings.default_scan_limit * 4, 5000)
+    full_mailbox_mode = bool(sync_state.get("full_mailbox")) if sync_state else False
+    if full_mailbox_mode:
+        mailbox_target = processed_total if sync_state and sync_state.get("completed") else 0
+    else:
+        mailbox_target = (
+            max(historical_target, int(sync_state.get("target_count") or 0))
+            if sync_state
+            else historical_target
+        )
     resume_offset = min(
         max(
             int(sync_state.get("next_offset") or 0),
@@ -2335,14 +2494,18 @@ def _build_ops_overview(
         )
         if sync_state
         else processed_total,
-        mailbox_target,
+        mailbox_target or processed_total,
     )
     mailbox_memory = {
         "targetCount": mailbox_target,
         "processedTotal": processed_total,
         "resumeOffset": resume_offset,
-        "remainingCount": max(mailbox_target - resume_offset, 0),
+        "remainingCount": _mailbox_limit_remaining(
+            None if full_mailbox_mode and mailbox_target == 0 else mailbox_target,
+            resume_offset,
+        ),
         "completed": bool(sync_state.get("completed")) if sync_state else False,
+        "fullMailboxMode": full_mailbox_mode,
         "includeBody": bool(sync_state.get("include_body")) if sync_state else False,
         "unreadOnly": bool(sync_state.get("unread_only")) if sync_state else False,
         "lastBackfillAt": sync_state.get("updated_at") if sync_state else None,
@@ -2401,8 +2564,15 @@ def _build_ops_overview(
                 "label": "Fresh unread scan",
                 "description": "Rebuild the unread inventory before taking action.",
                 "impact": (
-                    f"Scans up to {settings.default_scan_limit} unread emails in "
-                    f"{time_range_label(normalized_time_range).lower()}."
+                    (
+                        f"Scans the full unread working set in "
+                        f"{time_range_label(normalized_time_range).lower()}."
+                    )
+                    if normalized_time_range == ALL_TIME_RANGE and provider_name == "gmail"
+                    else (
+                        f"Scans up to {settings.default_scan_limit} unread emails in "
+                        f"{time_range_label(normalized_time_range).lower()}."
+                    )
                 ),
             },
             {
@@ -2413,9 +2583,17 @@ def _build_ops_overview(
                     "a huge live triage run."
                 ),
                 "impact": (
-                    f"Cache up to {mailbox_target} historical emails for "
-                    f"{time_range_label(normalized_time_range).lower()} so search, "
-                    "hydration, and future syncs have more context."
+                    (
+                        f"Cache the full mailbox history for "
+                        f"{time_range_label(normalized_time_range).lower()} so search, "
+                        "hydration, and future syncs have more context."
+                    )
+                    if full_mailbox_mode
+                    else (
+                        f"Cache up to {mailbox_target} historical emails for "
+                        f"{time_range_label(normalized_time_range).lower()} so search, "
+                        "hydration, and future syncs have more context."
+                    )
                 ),
             },
             {
@@ -2456,6 +2634,18 @@ def _build_ops_overview(
                 "impact": (
                     f"Useful when {time_range_label(normalized_time_range).lower()} needs a clean "
                     "label reset without touching the underlying emails."
+                ),
+            },
+            {
+                "slug": "industrial-read",
+                "label": "Industrial mark as read",
+                "description": (
+                    "Mark the full cached unread working set as read in provider-sized "
+                    "batches without waiting on recommendations or labels."
+                ),
+                "impact": (
+                    f"Marks {cache_stats['cached_unread_count']} unread emails as read in "
+                    f"{time_range_label(normalized_time_range).lower()}."
                 ),
             },
             {
@@ -2764,6 +2954,10 @@ def frontend_list_aliases(
         "mode": "managed" if _managed_aliases_enabled() else "plus",
         "domain": _managed_alias_domain() or None,
         "managed_enabled": _managed_aliases_enabled(),
+        "managed_ready": _managed_aliases_ready(),
+        "managed_resolver_configured": _alias_resolver_secret_configured(),
+        "managed_inbound_ready": _managed_alias_inbound_ready(),
+        "managed_blockers": _managed_alias_blockers(),
         "plus_fallback_enabled": _plus_alias_fallback_enabled(),
     }
 
@@ -2782,7 +2976,7 @@ def frontend_generate_alias(
             detail="InboxAnchor could not determine the target inbox for this alias.",
         )
 
-    if _managed_aliases_enabled():
+    if _managed_aliases_ready():
         alias_domain = _managed_alias_domain()
         alias = _generate_managed_alias(
             alias_domain,
@@ -2793,11 +2987,19 @@ def frontend_generate_alias(
         provider = "inboxanchor"
         note = (
             f"InboxAnchor-managed privacy alias on {alias_domain}. "
-            f"It should forward into {target_email} once that domain's "
-            "inbound routing is configured. "
+            f"It routes into {target_email} through InboxAnchor's managed "
+            "inbound worker. "
             "Revoking it in InboxAnchor blocks future reuse here."
         )
     else:
+        if _managed_aliases_enabled():
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "InboxAnchor managed aliases are configured but not live yet. "
+                    + " ".join(_managed_alias_blockers())
+                ),
+            )
         if not _plus_alias_fallback_enabled():
             raise HTTPException(
                 status_code=400,
@@ -2938,6 +3140,11 @@ def frontend_ops_progress(provider: str = "", time_range: str = ""):
     normalized_time_range = normalize_time_range(time_range or None)
     scope_key = _scope_key(provider_name, normalized_time_range)
     progress = FRONTEND_PROGRESS.get(scope_key)
+    active_job = None
+    with FRONTEND_ACTIVE_RUNS_LOCK:
+        candidate = FRONTEND_ACTIVE_RUNS.get(scope_key)
+        if candidate is not None and not candidate.event.is_set():
+            active_job = candidate
     if progress:
         if _should_reconcile_stale_scan_progress(progress, scope_key):
             run_id = _get_cached_or_latest_run_id(
@@ -2958,7 +3165,49 @@ def frontend_ops_progress(provider: str = "", time_range: str = ""):
                     FRONTEND_PROGRESS[scope_key] = synthesized
                     FRONTEND_PROVIDER_ERRORS.pop(scope_key, None)
                     return synthesized
+        if active_job is not None and progress.get("mode") != active_job.mode:
+            progress = dict(progress)
+            progress["mode"] = active_job.mode
+            progress["status"] = "running"
+            progress["stage"] = "queued"
+            progress["updated_at"] = datetime.now(timezone.utc).isoformat()
+            FRONTEND_PROGRESS[scope_key] = progress
         return progress
+    if active_job is not None:
+        queued = {
+            "provider": provider_name,
+            "time_range": normalized_time_range,
+            "time_range_label": time_range_label(normalized_time_range),
+            "mode": active_job.mode,
+            "status": "running",
+            "stage": "queued",
+            "target_count": 0,
+            "processed_count": 0,
+            "read_count": 0,
+            "action_item_count": 0,
+            "recommendation_count": 0,
+            "batch_count": 0,
+            "cached_count": 0,
+            "hydrated_count": 0,
+            "labeled_count": 0,
+            "labels_removed_count": 0,
+            "archived_count": 0,
+            "marked_read_count": 0,
+            "trashed_count": 0,
+            "reply_sent_count": 0,
+            "oldest_cached_at": None,
+            "newest_cached_at": None,
+            "latest_subject": None,
+            "latest_action": None,
+            "resume_offset": 0,
+            "remaining_count": 0,
+            "completed": False,
+            "run_id": active_job.run_id,
+            "error": active_job.error,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        FRONTEND_PROGRESS[scope_key] = queued
+        return queued
     cache_stats = _load_mailbox_cache_stats(provider_name, time_range=normalized_time_range)
     sync_state = _load_mailbox_sync_state(provider_name, time_range=normalized_time_range)
     if sync_state:
@@ -2968,7 +3217,7 @@ def frontend_ops_progress(provider: str = "", time_range: str = ""):
             unread_only=sync_unread_only,
             time_range=normalized_time_range,
         )
-        target_count = int(sync_state.get("target_count") or 0)
+        full_mailbox_mode = bool(sync_state.get("full_mailbox"))
         processed_count = max(
             int(sync_state.get("processed_count") or 0),
             cache_stats["cached_count"],
@@ -2978,6 +3227,12 @@ def frontend_ops_progress(provider: str = "", time_range: str = ""):
             processed_count,
         )
         completed = bool(sync_state.get("completed"))
+        if full_mailbox_mode:
+            target_count = processed_count if completed else 0
+            remaining_count = 0
+        else:
+            target_count = int(sync_state.get("target_count") or 0)
+            remaining_count = max(target_count - resume_offset, 0)
         return {
             "provider": provider_name,
             "time_range": normalized_time_range,
@@ -3004,7 +3259,7 @@ def frontend_ops_progress(provider: str = "", time_range: str = ""):
             "latest_subject": sync_state.get("latest_subject"),
             "latest_action": sync_state.get("latest_action"),
             "resume_offset": resume_offset,
-            "remaining_count": max(target_count - resume_offset, 0),
+            "remaining_count": remaining_count,
             "completed": completed,
             "run_id": FRONTEND_RUN_CACHE.get(scope_key),
             "error": FRONTEND_PROVIDER_ERRORS.get(scope_key),
@@ -3131,13 +3386,14 @@ def _start_mailbox_backfill_job(
 ) -> bool:
     normalized_time_range = normalize_time_range(payload.time_range)
     scope_key = _scope_key(provider_name, normalized_time_range)
-    if _has_active_frontend_job(scope_key):
+    job, wait_job = _claim_frontend_job(
+        scope_key,
+        provider_name=provider_name,
+        mode="backfill",
+    )
+    if wait_job is not None:
         return False
-
-    with FRONTEND_ACTIVE_RUNS_LOCK:
-        if scope_key in FRONTEND_ACTIVE_RUNS:
-            return False
-        FRONTEND_ACTIVE_RUNS[scope_key] = FrontendRunJob(provider_name=provider_name)
+    assert job is not None
 
     cache_stats = _load_mailbox_cache_stats(provider_name, time_range=normalized_time_range)
     workflow_counts = _load_mailbox_workflow_counts(
@@ -3172,7 +3428,7 @@ def _start_mailbox_backfill_job(
             "newest_cached_at": cache_stats["newest_cached_at"],
             "latest_subject": sync_state.get("latest_subject"),
             "resume_offset": resume_offset,
-            "remaining_count": max(payload.limit - resume_offset, 0),
+            "remaining_count": _mailbox_limit_remaining(payload.limit, resume_offset),
             "completed": False,
             "run_id": _get_cached_or_latest_run_id(
                 provider_name,
@@ -3202,9 +3458,9 @@ def _start_mailbox_backfill_job(
             )
         finally:
             with FRONTEND_ACTIVE_RUNS_LOCK:
-                job = FRONTEND_ACTIVE_RUNS.pop(scope_key, None)
-            if job is not None:
-                job.event.set()
+                finished_job = FRONTEND_ACTIVE_RUNS.pop(scope_key, None)
+            if finished_job is not None:
+                finished_job.event.set()
 
     threading.Thread(
         target=_runner,
@@ -3217,7 +3473,10 @@ def _start_mailbox_backfill_job(
 @router.post("/ops/backfill")
 def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
     provider_name = _get_provider_name(payload.provider)
-    if payload.background and payload.limit > MAILBOX_BACKFILL_BACKGROUND_THRESHOLD:
+    full_mailbox_mode = payload.limit is None
+    if payload.background and (
+        full_mailbox_mode or payload.limit > MAILBOX_BACKFILL_BACKGROUND_THRESHOLD
+    ):
         normalized_time_range = normalize_time_range(payload.time_range)
         _start_mailbox_backfill_job(provider_name, payload)
         cache_stats = _load_mailbox_cache_stats(
@@ -3242,7 +3501,7 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
             "cachedCount": cache_stats["cached_count"],
             "hydratedCount": cache_stats["hydrated_count"],
             "resumeOffset": resume_offset,
-            "remainingCount": max(payload.limit - resume_offset, 0),
+            "remainingCount": _mailbox_limit_remaining(payload.limit, resume_offset),
             "completed": False,
             "overview": _build_ops_overview(
                 provider_name,
@@ -3284,15 +3543,15 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
         and bool(sync_state.get("include_body")) == payload.include_body
         and bool(sync_state.get("unread_only")) == payload.unread_only
         and normalize_time_range(sync_state.get("time_range")) == normalized_time_range
+        and bool(sync_state.get("full_mailbox")) == full_mailbox_mode
     ):
-        start_offset = min(
-            max(
-                int(sync_state.get("next_offset") or 0),
-                int(sync_state.get("processed_count") or 0),
-                cache_stats["cached_count"],
-            ),
-            payload.limit,
+        start_offset = max(
+            int(sync_state.get("next_offset") or 0),
+            int(sync_state.get("processed_count") or 0),
+            cache_stats["cached_count"],
         )
+        if payload.limit is not None:
+            start_offset = min(start_offset, payload.limit)
         processed_total = max(
             int(sync_state.get("processed_count") or 0),
             cache_stats["cached_count"],
@@ -3304,7 +3563,9 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
         )
         batch_count = int(sync_state.get("batch_count") or 0)
         latest_subject = sync_state.get("latest_subject")
-        if bool(sync_state.get("completed")) and start_offset >= payload.limit:
+        if bool(sync_state.get("completed")) and (
+            full_mailbox_mode or _mailbox_limit_reached(payload.limit, start_offset)
+        ):
             run_id = _get_cached_or_latest_run_id(
                 provider_name,
                 time_range=normalized_time_range,
@@ -3320,7 +3581,12 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
                     "mode": "backfill",
                     "status": "complete",
                     "stage": "backfill_ready",
-                    "limit": payload.limit,
+                    "limit": _mailbox_progress_target(
+                        payload.limit,
+                        processed_total,
+                        full_mailbox_mode=full_mailbox_mode,
+                        completed=True,
+                    ),
                     "processed_emails": processed_total,
                     "read_count": processed_total,
                     "action_item_count": workflow_counts["action_item_count"],
@@ -3355,7 +3621,7 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
             "mode": "backfill",
             "status": "running",
             "stage": "backfill_resume" if start_offset else "backfill_index",
-            "limit": payload.limit,
+            "limit": payload.limit or 0,
             "processed_emails": processed_total,
             "read_count": processed_total,
             "action_item_count": workflow_counts["action_item_count"],
@@ -3367,7 +3633,7 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
             "newest_cached_at": cache_stats["newest_cached_at"],
             "latest_subject": latest_subject,
             "resume_offset": start_offset,
-            "remaining_count": max(payload.limit - start_offset, 0),
+            "remaining_count": _mailbox_limit_remaining(payload.limit, start_offset),
             "completed": False,
             "error": None,
         },
@@ -3376,7 +3642,7 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
 
     try:
         for batch in service.provider.iter_mailbox_batches(
-            limit=max(payload.limit - start_offset, 0),
+            limit=None if payload.limit is None else max(payload.limit - start_offset, 0),
             batch_size=payload.batch_size,
             include_body=payload.include_body,
             unread_only=payload.unread_only,
@@ -3406,6 +3672,7 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
                     sync_kind,
                     {
                         "target_count": payload.limit,
+                        "full_mailbox": full_mailbox_mode,
                         "processed_count": processed_total,
                         "next_offset": processed_total,
                         "batch_count": batch_count,
@@ -3427,7 +3694,7 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
                     "mode": "backfill",
                     "status": "running",
                     "stage": "backfill_resume" if start_offset else "backfill_index",
-                    "limit": payload.limit,
+                    "limit": payload.limit or 0,
                     "processed_emails": processed_total,
                     "read_count": processed_total,
                     "action_item_count": workflow_counts["action_item_count"],
@@ -3439,7 +3706,7 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
                     "newest_cached_at": cache_stats["newest_cached_at"],
                     "latest_subject": latest_subject,
                     "resume_offset": processed_total,
-                    "remaining_count": max(payload.limit - processed_total, 0),
+                    "remaining_count": _mailbox_limit_remaining(payload.limit, processed_total),
                     "completed": False,
                 },
                 time_range=normalized_time_range,
@@ -3472,7 +3739,9 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
         raise HTTPException(status_code=502, detail=message) from exc
 
     cache_stats = _load_mailbox_cache_stats(provider_name, time_range=normalized_time_range)
-    completed = processed_total >= payload.limit or processed_this_run == 0
+    completed = True if full_mailbox_mode else (
+        _mailbox_limit_reached(payload.limit, processed_total) or processed_this_run == 0
+    )
     with session_scope() as session:
         repository = InboxRepository(session)
         recommendation_stats = repository.get_mailbox_recommendation_stats(
@@ -3497,8 +3766,13 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
             sync_kind,
             {
                 "target_count": payload.limit,
+                "full_mailbox": full_mailbox_mode,
                 "processed_count": processed_total,
-                "next_offset": min(processed_total, payload.limit),
+                "next_offset": (
+                    processed_total
+                    if payload.limit is None
+                    else min(processed_total, payload.limit)
+                ),
                 "batch_count": batch_count,
                 "hydrated_count": max(hydrated_total, cache_stats["hydrated_count"]),
                 "cached_count": cache_stats["cached_count"],
@@ -3517,7 +3791,12 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
             "mode": "backfill",
             "status": "complete",
             "stage": "backfill_ready",
-            "limit": payload.limit,
+            "limit": _mailbox_progress_target(
+                payload.limit,
+                processed_total,
+                full_mailbox_mode=full_mailbox_mode,
+                completed=completed,
+            ),
             "processed_emails": processed_total,
             "read_count": processed_total,
             "action_item_count": workflow_counts["action_item_count"],
@@ -3528,8 +3807,12 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
             "oldest_cached_at": cache_stats["oldest_cached_at"],
             "newest_cached_at": cache_stats["newest_cached_at"],
             "latest_subject": latest_subject,
-            "resume_offset": min(processed_total, payload.limit),
-            "remaining_count": max(payload.limit - processed_total, 0),
+            "resume_offset": (
+                processed_total
+                if payload.limit is None
+                else min(processed_total, payload.limit)
+            ),
+            "remaining_count": _mailbox_limit_remaining(payload.limit, processed_total),
             "completed": completed,
             "error": None,
         },
@@ -3551,8 +3834,12 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
         "processedTotal": processed_total,
         "cachedCount": cache_stats["cached_count"],
         "hydratedCount": cache_stats["hydrated_count"],
-        "resumeOffset": min(processed_total, payload.limit),
-        "remainingCount": max(payload.limit - processed_total, 0),
+        "resumeOffset": (
+            processed_total
+            if payload.limit is None
+            else min(processed_total, payload.limit)
+        ),
+        "remainingCount": _mailbox_limit_remaining(payload.limit, processed_total),
         "completed": completed,
         "overview": overview,
     }
@@ -4021,6 +4308,124 @@ def frontend_ops_safe_cleanup(payload: FrontendProviderWorkflowRequest):
         }
     )
     return {"applied": [], "count": applied_count, "overview": overview}
+
+
+@router.post("/ops/industrial-read")
+def frontend_ops_industrial_read(payload: FrontendProviderWorkflowRequest):
+    provider_name = payload.provider or _get_provider_name()
+    _maybe_seed_mailbox_cache(provider_name, time_range=payload.time_range)
+    cache_stats = _load_mailbox_cache_stats(provider_name, time_range=payload.time_range)
+    unread_target_count = cache_stats["cached_unread_count"]
+    processed_count = 0
+    marked_read_count = 0
+    batch_count = 0
+    batch_size = 500
+    latest_subject: Optional[str] = None
+
+    _update_frontend_progress(
+        provider_name,
+        {
+            "mode": "workflow",
+            "status": "running",
+            "stage": "industrial_read",
+            "limit": unread_target_count,
+            "processed_emails": 0,
+            "read_count": unread_target_count,
+            "action_item_count": 0,
+            "recommendation_count": 0,
+            "batch_count": 0,
+            "marked_read_count": 0,
+            "latest_action": "mark_read",
+            "error": None,
+        },
+        time_range=payload.time_range,
+    )
+
+    while True:
+        with session_scope() as session:
+            repository = InboxRepository(session)
+            batch = repository.list_mailbox_emails(
+                provider_name,
+                limit=batch_size,
+                offset=0,
+                unread_only=True,
+                time_range=normalize_time_range(payload.time_range),
+            )
+        if not batch:
+            break
+
+        email_ids = [str(item["email_id"]) for item in batch]
+        try:
+            _service_for_provider(provider_name).provider.batch_mark_as_read(
+                email_ids,
+                dry_run=False,
+            )
+        except Exception as exc:
+            _raise_provider_runtime_error(provider_name, exc)
+
+        with session_scope() as session:
+            repository = InboxRepository(session)
+            repository.mark_mailbox_emails_read(provider_name, email_ids)
+            run_id = repository.get_latest_run_id(provider_name)
+            if run_id:
+                repository.mark_run_emails_read(run_id, email_ids)
+
+        processed_count += len(email_ids)
+        marked_read_count += len(email_ids)
+        batch_count += 1
+        latest_subject = batch[0].get("subject") or latest_subject
+        _update_frontend_progress(
+            provider_name,
+            {
+                "mode": "workflow",
+                "status": "running",
+                "stage": "industrial_read",
+                "limit": unread_target_count,
+                "processed_emails": processed_count,
+                "read_count": unread_target_count,
+                "batch_count": batch_count,
+                "marked_read_count": marked_read_count,
+                "latest_subject": latest_subject,
+                "latest_action": "mark_read",
+                "error": None,
+            },
+            time_range=payload.time_range,
+        )
+
+    refreshed_run_id = _get_cached_or_latest_run_id(
+        provider_name,
+        time_range=payload.time_range,
+    )
+    overview = _build_ops_overview(
+        provider_name,
+        refreshed_run_id,
+        time_range=payload.time_range,
+    )
+    _update_frontend_progress(
+        provider_name,
+        {
+            "mode": "workflow",
+            "status": "complete",
+            "stage": "industrial_read_complete",
+            "limit": unread_target_count,
+            "processed_emails": processed_count,
+            "read_count": unread_target_count,
+            "batch_count": batch_count,
+            "marked_read_count": marked_read_count,
+            "latest_action": "mark_read",
+            "error": None,
+        },
+        time_range=payload.time_range,
+    )
+    STREAM_HUB.emit(
+        {
+            "type": "industrial_read_completed",
+            "provider": provider_name,
+            "run_id": refreshed_run_id,
+            "count": marked_read_count,
+        }
+    )
+    return {"applied": [], "count": marked_read_count, "overview": overview}
 
 
 @router.post("/ops/full-anchor")

@@ -7,6 +7,7 @@ import {
   runMailboxClassification,
   runMailboxBackfill,
   runAutoLabel,
+  runIndustrialReadWorkflow,
   runLabelCleanup,
   runFullAnchorWorkflow,
   runOpsScan,
@@ -147,6 +148,20 @@ export function useRunSafeCleanupWorkflow() {
       });
     },
     onError: (err) => toast.error(`Failed to run safe cleanup: ${err.message}`),
+  });
+}
+
+export function useRunIndustrialReadWorkflow() {
+  const invalidate = useInvalidateWorkspace();
+  return useMutation({
+    mutationFn: (timeRange: MailboxTimeRange) => runIndustrialReadWorkflow(timeRange),
+    onSuccess: (result) => {
+      invalidate();
+      toast.success("Unread mail marked as read", {
+        description: `${result.count || 0} cached unread emails were marked as read in the live inbox.`,
+      });
+    },
+    onError: (err) => toast.error(`Failed to mark unread mail as read: ${err.message}`),
   });
 }
 

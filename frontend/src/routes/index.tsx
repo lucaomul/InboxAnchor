@@ -13,6 +13,7 @@ import {
   useRunLabelCleanup,
   useRunMailboxBackfill,
   useRunFullAnchorWorkflow,
+  useRunIndustrialReadWorkflow,
   useRunOpsScan,
   useRunSafeCleanupWorkflow,
 } from "@/hooks/use-ops";
@@ -27,6 +28,7 @@ import {
   Inbox,
   Layers3,
   LogOut,
+  MailOpen,
   Palette,
   Settings,
   ShieldCheck,
@@ -77,6 +79,7 @@ function CommandCenter() {
   const autoLabelMutation = useRunAutoLabel();
   const cleanLabelsMutation = useRunLabelCleanup();
   const cleanupMutation = useRunSafeCleanupWorkflow();
+  const industrialReadMutation = useRunIndustrialReadWorkflow();
   const fullAnchorMutation = useRunFullAnchorWorkflow();
   const overviewError = error instanceof Error ? error.message : "InboxAnchor could not load the live mailbox overview yet.";
 
@@ -87,6 +90,7 @@ function CommandCenter() {
     autoLabelMutation.isPending ||
     cleanLabelsMutation.isPending ||
     cleanupMutation.isPending ||
+    industrialReadMutation.isPending ||
     fullAnchorMutation.isPending;
   const shouldPollProgress =
     isLoading ||
@@ -329,7 +333,9 @@ function CommandCenter() {
                       </div>
                       <div className="flex flex-wrap gap-2">
                         <Badge variant="outline">
-                          {progress.processed_count} / {progress.target_count} cached
+                          {progress.target_count > 0
+                            ? `${progress.processed_count} / ${progress.target_count} cached`
+                            : `${progress.processed_count} cached`}
                         </Badge>
                         <Button
                           variant="outline"
@@ -482,6 +488,15 @@ function CommandCenter() {
                 cta="Clean labels"
                 loading={cleanLabelsMutation.isPending}
                 onClick={() => cleanLabelsMutation.mutate(timeRange)}
+              />
+              <WorkflowCard
+                title="Industrial mark as read"
+                icon={<MailOpen className="h-4 w-4" />}
+                description="Mark the full cached unread working set as read in batched provider calls, no matter what category the emails fall into."
+                impact={overview?.workflows.find((item) => item.slug === "industrial-read")?.impact}
+                cta="Mark all read"
+                loading={industrialReadMutation.isPending}
+                onClick={() => industrialReadMutation.mutate(timeRange)}
               />
               <WorkflowCard
                 title="Safe cleanup"

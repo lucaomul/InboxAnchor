@@ -49,6 +49,10 @@ function SettingsPage() {
   const [aliasMode, setAliasMode] = useState<"plus" | "managed">("plus");
   const [aliasDomain, setAliasDomain] = useState("");
   const [managedAliasEnabled, setManagedAliasEnabled] = useState(false);
+  const [managedAliasReady, setManagedAliasReady] = useState(false);
+  const [managedAliasResolverConfigured, setManagedAliasResolverConfigured] = useState(false);
+  const [managedAliasInboundReady, setManagedAliasInboundReady] = useState(false);
+  const [managedAliasBlockers, setManagedAliasBlockers] = useState<string[]>([]);
   const [plusFallbackEnabled, setPlusFallbackEnabled] = useState(false);
   const [aliasItems, setAliasItems] = useState<Array<{
     id: number;
@@ -122,6 +126,10 @@ function SettingsPage() {
       setAliasMode(response.mode === "managed" ? "managed" : "plus");
       setAliasDomain(response.domain || "");
       setManagedAliasEnabled(Boolean(response.managed_enabled));
+      setManagedAliasReady(Boolean(response.managed_ready));
+      setManagedAliasResolverConfigured(Boolean(response.managed_resolver_configured));
+      setManagedAliasInboundReady(Boolean(response.managed_inbound_ready));
+      setManagedAliasBlockers(response.managed_blockers || []);
       setPlusFallbackEnabled(Boolean(response.plus_fallback_enabled));
       setAliasError("");
     } catch (err) {
@@ -440,7 +448,7 @@ function SettingsPage() {
               InboxAnchor can also auto-label alias mail and keep it out of the primary inbox.
             </p>
             <div className="rounded-md border border-border bg-secondary/30 p-3 text-xs leading-5 text-muted-foreground">
-              {managedAliasEnabled ? (
+              {managedAliasEnabled && managedAliasReady ? (
                 <>
                   InboxAnchor is using its managed alias domain
                   {" "}
@@ -451,6 +459,20 @@ function SettingsPage() {
                   <span className="font-medium text-foreground">
                     travel1234567@{aliasDomain}
                   </span>.
+                </>
+              ) : managedAliasEnabled ? (
+                <>
+                  InboxAnchor sees the managed alias domain
+                  {" "}
+                  <span className="font-medium text-foreground">{aliasDomain}</span>
+                  {" "}
+                  but the inbound path is not fully live yet, so product-owned aliases like
+                  {" "}
+                  <span className="font-medium text-foreground">
+                    travel1234567@{aliasDomain}
+                  </span>
+                  {" "}
+                  will not forward until the remaining setup is finished.
                 </>
               ) : (
                 <>
@@ -476,6 +498,21 @@ function SettingsPage() {
                 </>
               )}
             </div>
+            {managedAliasEnabled && !managedAliasReady ? (
+              <div className="rounded-md border border-warning/30 bg-warning/5 p-3 text-[11px] leading-5 text-warning space-y-2">
+                <p>
+                  Managed aliases are not live yet.
+                  {" "}
+                  {!managedAliasResolverConfigured ? "The backend resolver secret is missing. " : ""}
+                  {!managedAliasInboundReady ? "Cloudflare inbound routing still needs to be marked ready. " : ""}
+                </p>
+                {managedAliasBlockers.map((item) => (
+                  <p key={item}>
+                    {item}
+                  </p>
+                ))}
+              </div>
+            ) : null}
             {!managedAliasEnabled ? (
               <div className="rounded-md border border-warning/30 bg-warning/5 p-3 text-[11px] leading-5 text-warning">
                 To get product-owned aliases like
@@ -513,12 +550,18 @@ function SettingsPage() {
                 </div>
                 <Button
                   onClick={handleGenerateAlias}
-                  disabled={aliasLoading || (!managedAliasEnabled && !plusFallbackEnabled)}
+                  disabled={
+                    aliasLoading ||
+                    (managedAliasEnabled && !managedAliasReady) ||
+                    (!managedAliasEnabled && !plusFallbackEnabled)
+                  }
                 >
                   {aliasLoading
                     ? "Generating..."
-                    : managedAliasEnabled
+                    : managedAliasEnabled && managedAliasReady
                       ? "Generate InboxAnchor alias"
+                      : managedAliasEnabled
+                        ? "Managed alias setup incomplete"
                       : plusFallbackEnabled
                         ? "Generate Gmail fallback alias"
                         : "Managed alias domain required"}

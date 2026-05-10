@@ -296,7 +296,7 @@ class ImaplibTransport(EmailProvider):
     def iter_mailbox_batches(
         self,
         *,
-        limit: int = 500,
+        limit: Optional[int] = 500,
         batch_size: int = 100,
         include_body: bool = False,
         unread_only: bool = False,
@@ -305,12 +305,12 @@ class ImaplibTransport(EmailProvider):
     ):
         since, before = imap_since_before_for_time_range(time_range)
         uids = self._search_uids(
-            limit=limit + offset,
+            limit=(limit + offset) if limit is not None else 999_999_999,
             since=since,
             before=before,
             unread_only=unread_only,
         )
-        uids = uids[offset : offset + limit]
+        uids = uids[offset:] if limit is None else uids[offset : offset + limit]
         for start in range(0, len(uids), batch_size):
             yield self._build_messages(
                 uids[start : start + batch_size],

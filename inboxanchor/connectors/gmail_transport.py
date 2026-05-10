@@ -2,8 +2,10 @@ from __future__ import annotations
 
 # NOTE: This transport requires OAuth credentials. See docs/gmail_setup.md for setup instructions.
 import base64
+import json
 import logging
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -28,6 +30,14 @@ GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 GMAIL_SETTINGS_BASIC_SCOPE = "https://www.googleapis.com/auth/gmail.settings.basic"
 GMAIL_API_BASE_URL = "https://gmail.googleapis.com/gmail/v1"
+RETRYABLE_GMAIL_403_REASONS = {
+    "backendError",
+    "internalError",
+    "quotaExceeded",
+    "rateLimitExceeded",
+    "userRateLimitExceeded",
+}
+RETRYABLE_FETCH_STATUS_CODES = {403, 429, 500, 502, 503, 504}
 
 
 class GoogleAPITransport(GmailTransport):
@@ -52,11 +62,18 @@ class GoogleAPITransport(GmailTransport):
         self._page_tokens: dict[int, Optional[str]] = {0: None}
         self._label_cache: dict[str, str] = {}
         self._last_history_id: Optional[str] = None
-        self._fetch_workers = max(1, SETTINGS.gmail_fetch_workers)
+        self._configured_fetch_workers = max(1, SETTINGS.gmail_fetch_workers)
+        self._fetch_workers = self._configured_fetch_workers
+        self._min_fetch_workers = 2 if self._configured_fetch_workers > 2 else 1
+        self._fetch_workers_lock = threading.Lock()
+        self._thread_local = threading.local()
 
     def _build_session(self):
         if self._session is not None:
             return self._session
+        thread_session = getattr(self._thread_local, "session", None)
+        if thread_session is not None:
+            return thread_session
 
         try:
             from google.auth.transport.requests import AuthorizedSession
@@ -68,12 +85,16 @@ class GoogleAPITransport(GmailTransport):
             ) from error
 
         creds = get_credentials(self.credentials_path, self.token_path, self.scopes)
-        self._session = AuthorizedSession(creds)
-        return self._session
+        thread_session = AuthorizedSession(creds)
+        self._thread_local.session = thread_session
+        return thread_session
 
     def _build_service(self):
         if self._service is not None:
             return self._service
+        thread_service = getattr(self._thread_local, "service", None)
+        if thread_service is not None:
+            return thread_service
 
         try:
             from googleapiclient.discovery import build
@@ -85,8 +106,51 @@ class GoogleAPITransport(GmailTransport):
             ) from error
 
         creds = get_credentials(self.credentials_path, self.token_path, self.scopes)
-        self._service = build("gmail", "v1", credentials=creds, cache_discovery=False)
-        return self._service
+        thread_service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        self._thread_local.service = thread_service
+        return thread_service
+
+    @staticmethod
+    def _error_status_code(exc: Exception) -> Optional[int]:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if status_code is not None:
+            return int(status_code)
+        legacy_status = getattr(getattr(exc, "resp", None), "status", None)
+        if legacy_status is not None:
+            return int(legacy_status)
+        return None
+
+    @staticmethod
+    def _extract_error_reasons(payload: object) -> set[str]:
+        if not isinstance(payload, dict):
+            return set()
+        error = payload.get("error")
+        if not isinstance(error, dict):
+            return set()
+        return {
+            str(item.get("reason"))
+            for item in error.get("errors", []) or []
+            if isinstance(item, dict) and item.get("reason")
+        }
+
+    def _legacy_error_has_retryable_reason(self, error: Exception) -> bool:
+        content = getattr(error, "content", None)
+        if not content:
+            return False
+        try:
+            payload = json.loads(content.decode("utf-8", errors="replace"))
+        except Exception:
+            return False
+        reasons = self._extract_error_reasons(payload)
+        return any(reason in RETRYABLE_GMAIL_403_REASONS for reason in reasons)
+
+    def _response_has_retryable_403(self, response) -> bool:
+        try:
+            payload = response.json()
+        except Exception:
+            return False
+        reasons = self._extract_error_reasons(payload)
+        return any(reason in RETRYABLE_GMAIL_403_REASONS for reason in reasons)
 
     def _execute_legacy(self, request):
         delay = 1.0
@@ -95,7 +159,9 @@ class GoogleAPITransport(GmailTransport):
                 return request.execute()
             except Exception as error:
                 status_code = getattr(getattr(error, "resp", None), "status", None)
-                retryable = status_code in {429, 500, 502, 503, 504}
+                retryable = status_code in {429, 500, 502, 503, 504} or (
+                    status_code == 403 and self._legacy_error_has_retryable_reason(error)
+                )
                 if not retryable or attempt >= 5:
                     raise
                 logger.warning(
@@ -123,9 +189,12 @@ class GoogleAPITransport(GmailTransport):
     ) -> dict:
         session = self._build_session()
         url = self._gmail_resource_url(resource)
+        message_fetch_resource = method.upper() == "GET" and resource.startswith("messages/")
+        max_attempts = 3 if message_fetch_resource else 5
+        max_delay = 4.0 if message_fetch_resource else 16.0
         delay = 1.0
 
-        for attempt in range(1, 6):
+        for attempt in range(1, max_attempts + 1):
             try:
                 response = session.request(
                     method,
@@ -135,7 +204,7 @@ class GoogleAPITransport(GmailTransport):
                     timeout=30,
                 )
             except Exception:
-                if attempt >= 5:
+                if attempt >= max_attempts:
                     raise
                 logger.warning(
                     "Retrying Gmail API call after transport failure",
@@ -146,10 +215,18 @@ class GoogleAPITransport(GmailTransport):
                     },
                 )
                 time.sleep(delay)
-                delay = min(delay * 2, 16.0)
+                delay = min(delay * 2, max_delay)
                 continue
 
-            if response.status_code in {429, 500, 502, 503, 504} and attempt < 5:
+            retryable_http = response.status_code in {429, 500, 502, 503, 504} or (
+                response.status_code == 403 and self._response_has_retryable_403(response)
+            )
+            if retryable_http and attempt < max_attempts:
+                if message_fetch_resource:
+                    self._reduce_fetch_workers(
+                        status_code=response.status_code,
+                        reason="transient Gmail message fetch pressure",
+                    )
                 logger.warning(
                     "Retrying Gmail API call after transient HTTP failure",
                     extra={
@@ -160,7 +237,7 @@ class GoogleAPITransport(GmailTransport):
                     },
                 )
                 time.sleep(delay)
-                delay = min(delay * 2, 16.0)
+                delay = min(delay * 2, max_delay)
                 continue
 
             response.raise_for_status()
@@ -324,6 +401,95 @@ class GoogleAPITransport(GmailTransport):
             unread="UNREAD" in labels,
         )
 
+    @staticmethod
+    def _is_retryable_fetch_status(status_code: Optional[int]) -> bool:
+        return status_code in RETRYABLE_FETCH_STATUS_CODES
+
+    def _reduce_fetch_workers(self, *, status_code: Optional[int], reason: str) -> None:
+        with self._fetch_workers_lock:
+            if self._fetch_workers <= self._min_fetch_workers:
+                return
+            if status_code in {403, 429}:
+                reduced_workers = max(self._min_fetch_workers, self._fetch_workers - 1)
+            else:
+                reduced_workers = max(self._min_fetch_workers, self._fetch_workers // 2)
+            if reduced_workers >= self._fetch_workers:
+                return
+            logger.warning(
+                "Reducing Gmail fetch worker count from %s to %s after %s (status=%s).",
+                self._fetch_workers,
+                reduced_workers,
+                reason,
+                status_code,
+            )
+            self._fetch_workers = reduced_workers
+
+    def _restore_fetch_workers(self) -> None:
+        with self._fetch_workers_lock:
+            if self._fetch_workers < self._configured_fetch_workers:
+                self._fetch_workers = min(self._configured_fetch_workers, self._fetch_workers + 1)
+
+    def _recover_failed_parallel_fetches(
+        self,
+        failures: list[tuple[str, Exception]],
+        *,
+        include_body: bool,
+    ) -> dict[str, EmailMessage]:
+        recovered: dict[str, EmailMessage] = {}
+        retryable_failures = 0
+
+        for email_id, original_exc in failures:
+            retry_exc: Exception = original_exc
+            status_code = self._error_status_code(original_exc)
+            retryable = self._is_retryable_fetch_status(status_code)
+            if retryable:
+                retryable_failures += 1
+
+            max_attempts = 3 if retryable else 1
+            for attempt in range(1, max_attempts + 1):
+                if attempt > 1:
+                    time.sleep(min(0.5 * attempt, 2.0))
+                try:
+                    resource = self._fetch_message_resource(
+                        email_id,
+                        include_body=include_body,
+                    )
+                    recovered[email_id] = self._message_to_email(
+                        resource,
+                        include_body=include_body,
+                    )
+                    break
+                except Exception as exc:
+                    retry_exc = exc
+                    status_code = self._error_status_code(exc)
+                    retryable = self._is_retryable_fetch_status(status_code)
+                    if not retryable or status_code == 404:
+                        break
+            else:
+                status_code = self._error_status_code(retry_exc)
+
+            if email_id in recovered:
+                continue
+
+            logger.warning(
+                "Failed to fetch Gmail message %s after serial recovery "
+                "(status=%s, type=%s): %s",
+                email_id,
+                status_code,
+                type(retry_exc).__name__,
+                retry_exc,
+            )
+
+        if retryable_failures:
+            self._reduce_fetch_workers(
+                status_code=429,
+                reason=f"{retryable_failures} retryable message fetch failures",
+            )
+        else:
+            self._restore_fetch_workers()
+
+        return recovered
+
     def _fetch_messages_parallel(
         self,
         refs: list[dict],
@@ -338,6 +504,7 @@ class GoogleAPITransport(GmailTransport):
         if not refs:
             return []
         results: dict[str, EmailMessage] = {}
+        failures: list[tuple[str, Exception]] = []
         worker_count = max(1, min(max_workers, len(refs)))
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = {
@@ -357,10 +524,16 @@ class GoogleAPITransport(GmailTransport):
                         include_body=include_body,
                     )
                 except Exception as exc:
-                    logger.warning(
-                        "Failed to fetch message; skipping unread item.",
-                        extra={"email_id": email_id, "error": str(exc)},
-                    )
+                    failures.append((email_id, exc))
+        if failures:
+            results.update(
+                self._recover_failed_parallel_fetches(
+                    failures,
+                    include_body=include_body,
+                )
+            )
+        else:
+            self._restore_fetch_workers()
         return [results[item["id"]] for item in refs if item["id"] in results]
 
     def _prime_page_token(
@@ -454,7 +627,7 @@ class GoogleAPITransport(GmailTransport):
     def iter_mailbox_batches(
         self,
         *,
-        limit: int = 500,
+        limit: Optional[int] = 500,
         batch_size: int = 100,
         include_body: bool = False,
         unread_only: bool = False,
@@ -481,8 +654,8 @@ class GoogleAPITransport(GmailTransport):
             if not page_token and skipped < offset:
                 return
 
-        while remaining > 0:
-            page_limit = min(page_size, remaining)
+        while remaining is None or remaining > 0:
+            page_limit = page_size if remaining is None else min(page_size, remaining)
             response = self._list_message_refs(limit=page_limit, page_token=page_token, q=query)
             refs = response.get("messages", []) or []
             if not refs:
@@ -494,7 +667,8 @@ class GoogleAPITransport(GmailTransport):
             )
             if batch:
                 yield batch
-            remaining -= len(refs)
+            if remaining is not None:
+                remaining -= len(refs)
             page_token = response.get("nextPageToken")
             if not page_token:
                 break

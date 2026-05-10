@@ -42,6 +42,12 @@ class StubSession:
             return self.responses.pop(0)
 
 
+class RetryableFetchError(RuntimeError):
+    def __init__(self, message: str, status_code: int):
+        super().__init__(message)
+        self.response = type("Response", (), {"status_code": status_code})()
+
+
 def _message_resource(
     email_id: str,
     *,
@@ -127,6 +133,32 @@ def test_google_api_transport_reads_profile_history_id_via_authorized_session():
     assert session.calls[0][1].endswith("/users/me/profile")
 
 
+def test_google_api_transport_retries_retryable_403_from_authorized_session():
+    session = StubSession(
+        [
+            StubResponse(
+                {
+                    "error": {
+                        "errors": [{"reason": "rateLimitExceeded"}],
+                    }
+                },
+                status_code=403,
+            ),
+            StubResponse({"messages": []}),
+        ]
+    )
+    transport = GoogleAPITransport(
+        credentials_path="~/credentials.json",
+        token_path="~/token.json",
+        session=session,
+    )
+
+    payload = transport._request_json("GET", "messages", params={"q": "is:unread"})
+
+    assert payload == {"messages": []}
+    assert len(session.calls) == 2
+
+
 def test_fetch_messages_parallel_preserves_order():
     transport = GoogleAPITransport(
         credentials_path="~/credentials.json",
@@ -173,6 +205,91 @@ def test_fetch_messages_parallel_partial_failure():
     )
 
     assert [email.id for email in emails] == ["msg-1", "msg-3"]
+
+
+def test_fetch_messages_parallel_retries_serially_before_skipping():
+    transport = GoogleAPITransport(
+        credentials_path="~/credentials.json",
+        token_path="~/token.json",
+        session=StubSession([]),
+    )
+    attempts = {"msg-2": 0}
+
+    def fake_fetch(email_id: str, *, include_body: bool = True):
+        del include_body
+        if email_id == "msg-2":
+            attempts["msg-2"] += 1
+            if attempts["msg-2"] == 1:
+                raise RuntimeError("transient worker failure")
+        return _message_resource(email_id, subject=f"Parallel {email_id}", snippet=email_id)
+
+    transport._fetch_message_resource = fake_fetch  # type: ignore[method-assign]
+
+    emails = transport._fetch_messages_parallel(
+        [{"id": "msg-1"}, {"id": "msg-2"}, {"id": "msg-3"}],
+        include_body=False,
+        max_workers=3,
+    )
+
+    assert [email.id for email in emails] == ["msg-1", "msg-2", "msg-3"]
+    assert attempts["msg-2"] == 2
+
+
+def test_fetch_messages_parallel_reduces_worker_count_after_retryable_failures():
+    transport = GoogleAPITransport(
+        credentials_path="~/credentials.json",
+        token_path="~/token.json",
+        session=StubSession([]),
+    )
+    transport._fetch_workers = 8
+    transport._configured_fetch_workers = 8
+    transport._min_fetch_workers = 2
+    attempts = {"msg-2": 0}
+
+    def fake_fetch(email_id: str, *, include_body: bool = True):
+        del include_body
+        if email_id == "msg-2":
+            attempts["msg-2"] += 1
+            raise RetryableFetchError("rate limited", 429)
+        return _message_resource(email_id, subject=f"Parallel {email_id}", snippet=email_id)
+
+    transport._fetch_message_resource = fake_fetch  # type: ignore[method-assign]
+
+    emails = transport._fetch_messages_parallel(
+        [{"id": "msg-1"}, {"id": "msg-2"}, {"id": "msg-3"}],
+        include_body=False,
+        max_workers=8,
+    )
+
+    assert [email.id for email in emails] == ["msg-1", "msg-3"]
+    assert attempts["msg-2"] == 4
+    assert transport._fetch_workers == 7
+
+
+def test_fetch_messages_parallel_restores_worker_count_after_clean_batch():
+    transport = GoogleAPITransport(
+        credentials_path="~/credentials.json",
+        token_path="~/token.json",
+        session=StubSession([]),
+    )
+    transport._fetch_workers = 4
+    transport._configured_fetch_workers = 6
+    transport._min_fetch_workers = 2
+
+    def fake_fetch(email_id: str, *, include_body: bool = True):
+        del include_body
+        return _message_resource(email_id, subject=f"Parallel {email_id}", snippet=email_id)
+
+    transport._fetch_message_resource = fake_fetch  # type: ignore[method-assign]
+
+    emails = transport._fetch_messages_parallel(
+        [{"id": "msg-1"}, {"id": "msg-2"}],
+        include_body=False,
+        max_workers=4,
+    )
+
+    assert [email.id for email in emails] == ["msg-1", "msg-2"]
+    assert transport._fetch_workers == 5
 
 
 def test_google_api_transport_backfills_mailbox_metadata_without_full_bodies():
@@ -316,6 +433,115 @@ def test_google_api_transport_mailbox_backfill_can_resume_from_offset():
     assert [email.id for email in batches[0]] == ["msg-3", "msg-4"]
     assert session.calls[0][2]["pageToken"] is None
     assert session.calls[1][2]["pageToken"] == "page-2"
+
+
+def test_google_api_transport_mailbox_backfill_without_limit_streams_everything():
+    session = StubSession(
+        [
+            StubResponse(
+                {
+                    "messages": [
+                        {"id": "msg-1", "threadId": "thread-1"},
+                        {"id": "msg-2", "threadId": "thread-2"},
+                    ],
+                    "nextPageToken": "page-2",
+                }
+            ),
+            StubResponse(
+                {
+                    "id": "msg-1",
+                    "threadId": "thread-1",
+                    "snippet": "First message",
+                    "labelIds": ["INBOX"],
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "ops@example.com"},
+                            {"name": "Subject", "value": "Message one"},
+                            {"name": "Date", "value": "Fri, 08 May 2026 12:00:00 +0000"},
+                        ],
+                    },
+                }
+            ),
+            StubResponse(
+                {
+                    "id": "msg-2",
+                    "threadId": "thread-2",
+                    "snippet": "Second message",
+                    "labelIds": ["INBOX"],
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "ops@example.com"},
+                            {"name": "Subject", "value": "Message two"},
+                            {"name": "Date", "value": "Thu, 07 May 2026 12:00:00 +0000"},
+                        ],
+                    },
+                }
+            ),
+            StubResponse(
+                {
+                    "messages": [
+                        {"id": "msg-3", "threadId": "thread-3"},
+                        {"id": "msg-4", "threadId": "thread-4"},
+                    ]
+                }
+            ),
+            StubResponse(
+                {
+                    "id": "msg-3",
+                    "threadId": "thread-3",
+                    "snippet": "Third message",
+                    "labelIds": ["INBOX"],
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "ops@example.com"},
+                            {"name": "Subject", "value": "Message three"},
+                            {"name": "Date", "value": "Wed, 06 May 2026 12:00:00 +0000"},
+                        ],
+                    },
+                }
+            ),
+            StubResponse(
+                {
+                    "id": "msg-4",
+                    "threadId": "thread-4",
+                    "snippet": "Fourth message",
+                    "labelIds": ["INBOX"],
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "ops@example.com"},
+                            {"name": "Subject", "value": "Message four"},
+                            {"name": "Date", "value": "Tue, 05 May 2026 12:00:00 +0000"},
+                        ],
+                    },
+                }
+            ),
+        ]
+    )
+
+    transport = GoogleAPITransport(
+        credentials_path="~/credentials.json",
+        token_path="~/token.json",
+        session=session,
+    )
+
+    batches = list(
+        transport.iter_mailbox_batches(
+            limit=None,
+            batch_size=2,
+            include_body=False,
+            unread_only=False,
+        )
+    )
+
+    assert len(batches) == 2
+    assert [email.id for batch in batches for email in batch] == [
+        "msg-1",
+        "msg-2",
+        "msg-3",
+        "msg-4",
+    ]
+    assert session.calls[0][2]["pageToken"] is None
+    assert session.calls[3][2]["pageToken"] == "page-2"
 
 
 def test_iter_all_unread_streams_multiple_pages():

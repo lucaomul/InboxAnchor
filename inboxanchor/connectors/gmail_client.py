@@ -29,7 +29,7 @@ class GmailTransport(Protocol):
     def iter_mailbox_batches(
         self,
         *,
-        limit: int = 500,
+        limit: Optional[int] = 500,
         batch_size: int = 100,
         include_body: bool = False,
         unread_only: bool = False,
@@ -191,7 +191,7 @@ class GmailClient(EmailProvider):
     def iter_mailbox_batches(
         self,
         *,
-        limit: int = 500,
+        limit: Optional[int] = 500,
         batch_size: int = 100,
         include_body: bool = False,
         unread_only: bool = False,
@@ -212,11 +212,14 @@ class GmailClient(EmailProvider):
 
         if unread_only:
             emails = (
-                transport.list_unread(limit + offset, time_range=time_range)
+                transport.list_unread(
+                    (limit + offset) if limit is not None else 999_999_999,
+                    time_range=time_range,
+                )
                 if time_range
-                else transport.list_unread(limit + offset)
+                else transport.list_unread((limit + offset) if limit is not None else 999_999_999)
             )
-            emails = emails[offset : offset + limit]
+            emails = emails[offset:] if limit is None else emails[offset : offset + limit]
             for start in range(0, len(emails), batch_size):
                 yield emails[start : start + batch_size]
             return

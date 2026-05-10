@@ -157,3 +157,33 @@ def test_provider_sync_state_roundtrip_and_clear():
         cleared = repository.get_provider_sync_state("gmail", "mailbox_backfill")
 
     assert cleared is None
+
+
+def test_provider_sync_state_preserves_full_mailbox_without_target_count():
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        stored = repository.save_provider_sync_state(
+            "gmail",
+            "mailbox_backfill",
+            {
+                "target_count": None,
+                "full_mailbox": True,
+                "processed_count": 42000,
+                "next_offset": 42000,
+                "completed": True,
+            },
+        )
+
+    assert stored["processed_count"] == 42000
+    assert stored["full_mailbox"] is True
+    assert "target_count" not in stored or stored["target_count"] in (None, 0)
+
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        loaded = repository.get_provider_sync_state("gmail", "mailbox_backfill")
+
+    assert loaded is not None
+    assert loaded["full_mailbox"] is True
+    assert loaded["processed_count"] == 42000
+    assert loaded["next_offset"] == 42000
+    assert "target_count" not in loaded or loaded["target_count"] in (None, 0)

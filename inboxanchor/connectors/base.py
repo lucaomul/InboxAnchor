@@ -42,7 +42,7 @@ class EmailProvider(ABC):
     def iter_mailbox_batches(
         self,
         *,
-        limit: int = 500,
+        limit: Optional[int] = 500,
         batch_size: int = 100,
         include_body: bool = False,
         unread_only: bool = False,
@@ -51,11 +51,11 @@ class EmailProvider(ABC):
     ):
         if unread_only:
             emails = self.list_unread(
-                limit=limit + offset,
+                limit=(limit + offset) if limit is not None else 999_999_999,
                 include_body=include_body,
                 time_range=time_range,
             )
-            emails = emails[offset : offset + limit]
+            emails = emails[offset:] if limit is None else emails[offset : offset + limit]
             for start in range(0, len(emails), batch_size):
                 yield emails[start : start + batch_size]
             return

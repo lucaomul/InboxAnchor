@@ -914,6 +914,251 @@ def test_frontend_ops_scan_starts_background_job(monkeypatch):
     assert response.json()["runId"] == "cached-run-123"
 
 
+def test_frontend_ops_scan_keeps_queued_progress_visible_while_active(monkeypatch):
+    frontend_router.FRONTEND_PROGRESS.clear()
+    frontend_router.FRONTEND_ACTIVE_RUNS.clear()
+    frontend_router.FRONTEND_RUN_CACHE.clear()
+
+    release = threading.Event()
+
+    def fake_sync(provider_name, **kwargs):
+        assert kwargs["manage_active_job"] is False
+        assert kwargs["pre_registered_job"] is not None
+        release.wait(timeout=1.0)
+        return {
+            "provider": provider_name,
+            "run_id": None,
+            "count": 0,
+            "processed_total": 0,
+            "cached_count": 0,
+        }
+
+    monkeypatch.setattr(frontend_router, "_sync_unread_working_set", fake_sync)
+    monkeypatch.setattr(
+        frontend_router,
+        "_get_cached_or_latest_run_id",
+        lambda provider_name, time_range=None: None,
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_service_for_provider",
+        lambda provider_name: SimpleNamespace(provider=SimpleNamespace()),
+    )
+
+    started = frontend_router._start_unread_sync_job(
+        "gmail",
+        force_refresh=True,
+        time_range="all_time",
+    )
+    try:
+        progress = client.get(
+            "/ops/progress",
+            params={"provider": "gmail", "time_range": "all_time"},
+        )
+        assert started is True
+        assert progress.status_code == 200
+        payload = progress.json()
+        assert payload["mode"] == "scan"
+        assert payload["status"] == "running"
+        assert payload["stage"] == "queued"
+    finally:
+        release.set()
+
+
+def test_frontend_ops_scan_reclaims_stale_completed_job(monkeypatch):
+    frontend_router.FRONTEND_PROGRESS.clear()
+    frontend_router.FRONTEND_ACTIVE_RUNS.clear()
+
+    stale = frontend_router.FrontendRunJob(provider_name="gmail")
+    stale.event.set()
+    frontend_router.FRONTEND_ACTIVE_RUNS["gmail::all_time"] = stale
+
+    release = threading.Event()
+
+    def fake_sync(provider_name, **kwargs):
+        release.wait(timeout=1.0)
+        return {
+            "provider": provider_name,
+            "run_id": None,
+            "count": 0,
+            "processed_total": 0,
+            "cached_count": 0,
+        }
+
+    monkeypatch.setattr(frontend_router, "_sync_unread_working_set", fake_sync)
+    monkeypatch.setattr(
+        frontend_router,
+        "_get_cached_or_latest_run_id",
+        lambda provider_name, time_range=None: None,
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_service_for_provider",
+        lambda provider_name: SimpleNamespace(provider=SimpleNamespace()),
+    )
+
+    try:
+        started = frontend_router._start_unread_sync_job(
+            "gmail",
+            force_refresh=True,
+            time_range="all_time",
+        )
+        assert started is True
+    finally:
+        release.set()
+
+
+def test_frontend_ops_scan_reclaims_stale_nonrunning_active_job(monkeypatch):
+    frontend_router.FRONTEND_PROGRESS.clear()
+    frontend_router.FRONTEND_ACTIVE_RUNS.clear()
+
+    stale = frontend_router.FrontendRunJob(provider_name="gmail", mode="backfill")
+    frontend_router.FRONTEND_ACTIVE_RUNS["gmail::all_time"] = stale
+    frontend_router.FRONTEND_PROGRESS["gmail::all_time"] = {
+        "provider": "gmail",
+        "time_range": "all_time",
+        "time_range_label": "All time",
+        "mode": "backfill",
+        "status": "paused",
+        "stage": "backfill_resume",
+        "target_count": 0,
+        "processed_count": 25933,
+        "read_count": 25933,
+        "action_item_count": 0,
+        "recommendation_count": 0,
+        "batch_count": 37,
+        "cached_count": 21777,
+        "hydrated_count": 7432,
+        "labeled_count": 0,
+        "labels_removed_count": 0,
+        "archived_count": 0,
+        "marked_read_count": 0,
+        "trashed_count": 0,
+        "reply_sent_count": 0,
+        "latest_subject": None,
+        "latest_action": None,
+        "run_id": None,
+        "error": None,
+        "updated_at": "2026-05-10T11:13:15.551384+00:00",
+    }
+
+    release = threading.Event()
+
+    def fake_sync(provider_name, **kwargs):
+        release.wait(timeout=1.0)
+        return {
+            "provider": provider_name,
+            "run_id": None,
+            "count": 0,
+            "processed_total": 0,
+            "cached_count": 0,
+        }
+
+    monkeypatch.setattr(frontend_router, "_sync_unread_working_set", fake_sync)
+    monkeypatch.setattr(
+        frontend_router,
+        "_get_cached_or_latest_run_id",
+        lambda provider_name, time_range=None: None,
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_service_for_provider",
+        lambda provider_name: SimpleNamespace(provider=SimpleNamespace()),
+    )
+
+    try:
+        started = frontend_router._start_unread_sync_job(
+            "gmail",
+            force_refresh=True,
+            time_range="all_time",
+        )
+        assert started is True
+    finally:
+        release.set()
+
+
+def test_frontend_unread_sync_uses_industrial_stream_for_gmail_all_time(monkeypatch):
+    frontend_router.FRONTEND_PROGRESS.clear()
+    frontend_router.FRONTEND_PROVIDER_ERRORS.clear()
+    frontend_router.FRONTEND_RUN_CACHE.clear()
+    frontend_router.FRONTEND_ACTIVE_RUNS.clear()
+
+    seed = build_demo_emails()
+    emails = [
+        seed[index % len(seed)].model_copy(
+            update={
+                "id": f"industrial-unread-{index}",
+                "thread_id": f"thread-industrial-unread-{index}",
+                "subject": f"Industrial unread {index}",
+            }
+        )
+        for index in range(13)
+    ]
+    calls: list[dict] = []
+
+    class IndustrialProvider:
+        provider_name = "gmail"
+
+        def iter_all_unread_batches(
+            self,
+            *,
+            batch_size: int = 500,
+            include_body: bool = True,
+            time_range: Optional[str] = None,
+        ):
+            calls.append(
+                {
+                    "kind": "iter_all_unread_batches",
+                    "batch_size": batch_size,
+                    "include_body": include_body,
+                    "time_range": time_range,
+                }
+            )
+            for start in range(0, len(emails), batch_size):
+                yield [item.model_copy(deep=True) for item in emails[start : start + batch_size]]
+
+        def iter_unread_batches(self, **kwargs):
+            raise AssertionError(
+                "Industrial unread sync should bypass bounded iter_unread_batches."
+            )
+
+    monkeypatch.setattr(
+        frontend_router,
+        "_service_for_provider",
+        lambda provider_name: SimpleNamespace(provider=IndustrialProvider()),
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_get_workspace_settings",
+        lambda: WorkspaceSettings(
+            preferred_provider="gmail",
+            default_scan_limit=10000,
+            default_batch_size=250,
+        ),
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_get_cached_or_latest_run_id",
+        lambda provider_name, time_range=None: None,
+    )
+
+    result = frontend_router._sync_unread_working_set("gmail", time_range="all_time")
+
+    assert result["count"] == 13
+    assert calls == [
+        {
+            "kind": "iter_all_unread_batches",
+            "batch_size": 100,
+            "include_body": False,
+            "time_range": "all_time",
+        }
+    ]
+    progress = frontend_router.FRONTEND_PROGRESS["gmail::all_time"]
+    assert progress["target_count"] == 13
+    assert progress["processed_count"] == 13
+    assert progress["status"] == "complete"
+
+
 def test_frontend_ops_workflows_expose_mailbox_upgrade_features():
     overview_response = client.get("/ops/overview")
     assert overview_response.status_code == 200
@@ -921,6 +1166,7 @@ def test_frontend_ops_workflows_expose_mailbox_upgrade_features():
     assert overview["workflows"]
     workflow_slugs = {item["slug"] for item in overview["workflows"]}
     assert "classify-cache" in workflow_slugs
+    assert "industrial-read" in workflow_slugs
     assert overview["unreadCount"] >= 1
 
     scan_response = client.post("/ops/scan", json={"force_refresh": True})
@@ -953,6 +1199,36 @@ def test_frontend_ops_workflows_expose_mailbox_upgrade_features():
     assert {"labeled_count", "archived_count", "marked_read_count", "reply_sent_count"} <= set(
         progress_payload.keys()
     )
+
+
+def test_frontend_industrial_read_marks_cached_unread_mail_as_read():
+    before = client.get("/ops/overview")
+    assert before.status_code == 200
+    before_payload = before.json()
+    assert before_payload["cachedUnreadCount"] >= 1
+
+    response = client.post("/ops/industrial-read", json={"force_refresh": False})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["count"] >= 1
+    assert payload["overview"]["cachedUnreadCount"] == 0
+
+    progress_response = client.get("/ops/progress")
+    assert progress_response.status_code == 200
+    progress_payload = progress_response.json()
+    assert progress_payload["mode"] == "workflow"
+    assert progress_payload["marked_read_count"] >= 1
+
+
+def test_frontend_ops_overview_scan_workflow_mentions_full_unread_for_gmail_all_time(monkeypatch):
+    monkeypatch.setattr(frontend_router, "_get_provider_name", lambda provider=None: "gmail")
+
+    response = client.get("/ops/overview", params={"provider": "gmail", "time_range": "all_time"})
+
+    assert response.status_code == 200
+    workflow = next(item for item in response.json()["workflows"] if item["slug"] == "scan")
+    assert workflow["impact"] == "Scans the full unread working set in all time."
 
 
 def test_frontend_clean_labels_removes_inboxanchor_labels_only():
@@ -1248,6 +1524,8 @@ def test_frontend_managed_aliases_use_clean_domain(monkeypatch):
 
     monkeypatch.setattr(frontend_router.SETTINGS, "alias_managed_enabled", True)
     monkeypatch.setattr(frontend_router.SETTINGS, "alias_domain", "inboxanchor.com")
+    monkeypatch.setattr(frontend_router.SETTINGS, "alias_resolver_secret", "resolver-secret")
+    monkeypatch.setattr(frontend_router.SETTINGS, "alias_inbound_ready", True)
 
     signup = client.post(
         "/auth/signup",
@@ -1277,7 +1555,48 @@ def test_frontend_managed_aliases_use_clean_domain(monkeypatch):
     listed_payload = listed.json()
     assert listed_payload["mode"] == "managed"
     assert listed_payload["managed_enabled"] is True
+    assert listed_payload["managed_ready"] is True
+    assert listed_payload["managed_resolver_configured"] is True
+    assert listed_payload["managed_inbound_ready"] is True
+    assert listed_payload["managed_blockers"] == []
     assert listed_payload["domain"] == "inboxanchor.com"
+
+
+def test_frontend_managed_alias_generation_requires_live_inbound(monkeypatch):
+    from inboxanchor.api.v1.routers import frontend as frontend_router
+
+    monkeypatch.setattr(frontend_router.SETTINGS, "alias_managed_enabled", True)
+    monkeypatch.setattr(frontend_router.SETTINGS, "alias_domain", "inboxanchor.com")
+    monkeypatch.setattr(frontend_router.SETTINGS, "alias_resolver_secret", "")
+    monkeypatch.setattr(frontend_router.SETTINGS, "alias_inbound_ready", False)
+
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "full_name": "Blocked Managed Alias Operator",
+            "email": "blocked-managed-owner@example.com",
+            "password": "blocked-managed-pass",
+        },
+    )
+    token = signup.json()["token"]
+
+    listed = client.get("/aliases", headers={"Authorization": f"Bearer {token}"})
+    assert listed.status_code == 200
+    listed_payload = listed.json()
+    assert listed_payload["managed_enabled"] is True
+    assert listed_payload["managed_ready"] is False
+    assert listed_payload["managed_resolver_configured"] is False
+    assert listed_payload["managed_inbound_ready"] is False
+    assert listed_payload["managed_blockers"]
+
+    generated = client.post(
+        "/aliases/generate",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"label": "travel", "purpose": "airlines"},
+    )
+
+    assert generated.status_code == 503
+    assert "managed aliases are configured but not live yet" in generated.json()["detail"].lower()
 
 
 def test_frontend_alias_resolve_returns_forwarding_payload(monkeypatch):
@@ -1290,6 +1609,7 @@ def test_frontend_alias_resolve_returns_forwarding_payload(monkeypatch):
         "alias_resolver_secret",
         "resolver-secret",
     )
+    monkeypatch.setattr(frontend_router.SETTINGS, "alias_inbound_ready", True)
 
     signup = client.post(
         "/auth/signup",
@@ -1368,7 +1688,7 @@ def test_frontend_ops_backfill_can_resume_from_saved_offset(monkeypatch):
         def iter_mailbox_batches(
             self,
             *,
-            limit: int = 500,
+            limit: Optional[int] = 500,
             batch_size: int = 100,
             include_body: bool = False,
             unread_only: bool = False,
@@ -1385,7 +1705,7 @@ def test_frontend_ops_backfill_can_resume_from_saved_offset(monkeypatch):
                     "time_range": time_range,
                 }
             )
-            selected = emails[offset : offset + limit]
+            selected = emails[offset:] if limit is None else emails[offset : offset + limit]
             for start in range(0, len(selected), batch_size):
                 yield [item.model_copy(deep=True) for item in selected[start : start + batch_size]]
 
@@ -1446,6 +1766,85 @@ def test_frontend_ops_backfill_can_resume_from_saved_offset(monkeypatch):
     assert calls[2]["time_range"] == "last_month"
     assert progress.status_code == 200
     assert progress.json()["resume_offset"] == 40
+    assert progress.json()["completed"] is True
+
+
+def test_frontend_ops_backfill_can_stream_full_mailbox(monkeypatch):
+    seed = build_demo_emails()
+    emails = [
+        seed[index % len(seed)].model_copy(
+            update={
+                "id": f"full-mailbox-{index}",
+                "thread_id": f"thread-full-mailbox-{index}",
+                "subject": f"Full mailbox subject {index}",
+            }
+        )
+        for index in range(23)
+    ]
+    calls: list[dict] = []
+
+    class FullMailboxProvider:
+        def iter_mailbox_batches(
+            self,
+            *,
+            limit: Optional[int] = 500,
+            batch_size: int = 100,
+            include_body: bool = False,
+            unread_only: bool = False,
+            offset: int = 0,
+            time_range: Optional[str] = None,
+        ):
+            calls.append(
+                {
+                    "limit": limit,
+                    "batch_size": batch_size,
+                    "include_body": include_body,
+                    "unread_only": unread_only,
+                    "offset": offset,
+                    "time_range": time_range,
+                }
+            )
+            selected = emails[offset:] if limit is None else emails[offset : offset + limit]
+            for start in range(0, len(selected), batch_size):
+                yield [item.model_copy(deep=True) for item in selected[start : start + batch_size]]
+
+    monkeypatch.setattr(
+        frontend_router,
+        "_service_for_provider",
+        lambda provider_name: SimpleNamespace(provider=FullMailboxProvider()),
+    )
+
+    response = client.post(
+        "/ops/backfill",
+        json={
+            "provider": "gmail",
+            "force_refresh": True,
+            "limit": None,
+            "batch_size": 10,
+            "include_body": False,
+            "unread_only": False,
+            "background": False,
+            "time_range": "last_6_months",
+        },
+    )
+    progress = client.get(
+        "/ops/progress",
+        params={"provider": "gmail", "time_range": "last_6_months"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert calls[0]["limit"] is None
+    assert payload["count"] == 23
+    assert payload["processedTotal"] == 23
+    assert payload["resumeOffset"] == 23
+    assert payload["remainingCount"] == 0
+    assert payload["completed"] is True
+    assert payload["overview"]["mailboxMemory"]["fullMailboxMode"] is True
+    assert payload["overview"]["mailboxMemory"]["targetCount"] == 23
+    assert progress.status_code == 200
+    assert progress.json()["target_count"] == 23
+    assert progress.json()["processed_count"] == 23
     assert progress.json()["completed"] is True
 
 
@@ -1605,6 +2004,50 @@ def test_frontend_ops_progress_reflects_registry_state():
     assert payload["processed_count"] == 12
     assert payload["read_count"] == 16
     assert payload["latest_subject"] == "Quarterly budget review"
+
+
+def test_frontend_ops_progress_prefers_active_scan_over_paused_backfill(monkeypatch):
+    frontend_router.FRONTEND_PROGRESS.clear()
+    frontend_router.FRONTEND_ACTIVE_RUNS.clear()
+
+    frontend_router.FRONTEND_ACTIVE_RUNS["gmail::all_time"] = frontend_router.FrontendRunJob(
+        provider_name="gmail",
+        mode="scan",
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_load_mailbox_cache_stats",
+        lambda provider_name, time_range=None: {
+            "cached_count": 4100,
+            "hydrated_count": 900,
+            "cached_unread_count": 275,
+            "oldest_cached_at": "2024-01-01T10:00:00Z",
+            "newest_cached_at": "2026-05-09T10:00:00Z",
+        },
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_load_mailbox_sync_state",
+        lambda provider_name, time_range=None: {
+            "target_count": None,
+            "full_mailbox": True,
+            "processed_count": 4100,
+            "next_offset": 4100,
+            "batch_count": 41,
+            "unread_only": False,
+            "completed": False,
+            "latest_subject": "Older archive sync",
+            "updated_at": "2026-05-09T10:00:00Z",
+        },
+    )
+
+    response = client.get("/ops/progress", params={"provider": "gmail", "time_range": "all_time"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["mode"] == "scan"
+    assert payload["status"] == "running"
+    assert payload["stage"] == "queued"
 
 
 def test_frontend_ops_progress_reconciles_empty_stale_scan(monkeypatch):

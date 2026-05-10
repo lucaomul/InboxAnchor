@@ -1055,6 +1055,50 @@ class InboxRepository:
         self.session.flush()
         return self._mailbox_email_payload(row)
 
+    def mark_mailbox_emails_read(self, provider: str, email_ids: list[str]) -> int:
+        normalized_ids = [str(email_id) for email_id in email_ids if str(email_id).strip()]
+        if not normalized_ids:
+            return 0
+        now = datetime.now(timezone.utc)
+        rows = (
+            self.session.query(MailboxEmailORM)
+            .filter(
+                MailboxEmailORM.provider == provider,
+                MailboxEmailORM.email_id.in_(normalized_ids),
+            )
+            .all()
+        )
+        updated = 0
+        for row in rows:
+            if not row.unread:
+                continue
+            row.unread = False
+            row.last_synced_at = now
+            updated += 1
+        self.session.flush()
+        return updated
+
+    def mark_run_emails_read(self, run_id: str, email_ids: list[str]) -> int:
+        normalized_ids = [str(email_id) for email_id in email_ids if str(email_id).strip()]
+        if not normalized_ids:
+            return 0
+        rows = (
+            self.session.query(EmailRecordORM)
+            .filter(
+                EmailRecordORM.run_id == run_id,
+                EmailRecordORM.email_id.in_(normalized_ids),
+            )
+            .all()
+        )
+        updated = 0
+        for row in rows:
+            if not row.unread:
+                continue
+            row.unread = False
+            updated += 1
+        self.session.flush()
+        return updated
+
     def reconcile_unread_working_set(
         self,
         provider: str,
