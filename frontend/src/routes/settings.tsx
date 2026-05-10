@@ -51,6 +51,8 @@ function SettingsPage() {
   const [managedAliasEnabled, setManagedAliasEnabled] = useState(false);
   const [managedAliasReady, setManagedAliasReady] = useState(false);
   const [managedAliasResolverConfigured, setManagedAliasResolverConfigured] = useState(false);
+  const [managedAliasResolverBaseUrl, setManagedAliasResolverBaseUrl] = useState("");
+  const [managedAliasPublicBackendReady, setManagedAliasPublicBackendReady] = useState(false);
   const [managedAliasInboundReady, setManagedAliasInboundReady] = useState(false);
   const [managedAliasBlockers, setManagedAliasBlockers] = useState<string[]>([]);
   const [plusFallbackEnabled, setPlusFallbackEnabled] = useState(false);
@@ -68,6 +70,8 @@ function SettingsPage() {
   const frontendLoginRedirect =
     typeof window === "undefined" ? "http://127.0.0.1:4173/login" : `${window.location.origin}/login`;
   const authEmail = getAuthEmail();
+  const canGenerateFallbackAlias =
+    plusFallbackEnabled && gmailConnected && (!managedAliasEnabled || !managedAliasReady);
 
   useEffect(() => {
     const currentApiUrl = getApiUrl();
@@ -128,6 +132,8 @@ function SettingsPage() {
       setManagedAliasEnabled(Boolean(response.managed_enabled));
       setManagedAliasReady(Boolean(response.managed_ready));
       setManagedAliasResolverConfigured(Boolean(response.managed_resolver_configured));
+      setManagedAliasResolverBaseUrl(response.managed_resolver_base_url || "");
+      setManagedAliasPublicBackendReady(Boolean(response.managed_public_backend_ready));
       setManagedAliasInboundReady(Boolean(response.managed_inbound_ready));
       setManagedAliasBlockers(response.managed_blockers || []);
       setPlusFallbackEnabled(Boolean(response.plus_fallback_enabled));
@@ -504,13 +510,27 @@ function SettingsPage() {
                   Managed aliases are not live yet.
                   {" "}
                   {!managedAliasResolverConfigured ? "The backend resolver secret is missing. " : ""}
+                  {!managedAliasPublicBackendReady ? "The Cloudflare worker has no public backend URL it can reach. " : ""}
                   {!managedAliasInboundReady ? "Cloudflare inbound routing still needs to be marked ready. " : ""}
                 </p>
+                {managedAliasResolverBaseUrl ? (
+                  <p>
+                    Current resolver base URL:
+                    {" "}
+                    <span className="font-medium text-foreground">{managedAliasResolverBaseUrl}</span>
+                  </p>
+                ) : null}
                 {managedAliasBlockers.map((item) => (
                   <p key={item}>
                     {item}
                   </p>
                 ))}
+                {plusFallbackEnabled ? (
+                  <p>
+                    InboxAnchor can still generate a working Gmail fallback alias while the managed
+                    path is offline.
+                  </p>
+                ) : null}
               </div>
             ) : null}
             {!managedAliasEnabled ? (
@@ -552,7 +572,7 @@ function SettingsPage() {
                   onClick={handleGenerateAlias}
                   disabled={
                     aliasLoading ||
-                    (managedAliasEnabled && !managedAliasReady) ||
+                    (managedAliasEnabled && !managedAliasReady && !canGenerateFallbackAlias) ||
                     (!managedAliasEnabled && !plusFallbackEnabled)
                   }
                 >
@@ -560,6 +580,8 @@ function SettingsPage() {
                     ? "Generating..."
                     : managedAliasEnabled && managedAliasReady
                       ? "Generate InboxAnchor alias"
+                      : managedAliasEnabled && canGenerateFallbackAlias
+                        ? "Generate Gmail fallback alias"
                       : managedAliasEnabled
                         ? "Managed alias setup incomplete"
                       : plusFallbackEnabled

@@ -685,6 +685,8 @@ export interface EmailAliasListResponse {
   managed_enabled?: boolean;
   managed_ready?: boolean;
   managed_resolver_configured?: boolean;
+  managed_resolver_base_url?: string | null;
+  managed_public_backend_ready?: boolean;
   managed_inbound_ready?: boolean;
   managed_blockers?: string[];
   plus_fallback_enabled?: boolean;

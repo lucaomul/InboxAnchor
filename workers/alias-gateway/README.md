@@ -25,6 +25,8 @@ Set this on the InboxAnchor API:
 INBOXANCHOR_ALIAS_MANAGED_ENABLED=true
 INBOXANCHOR_ALIAS_DOMAIN=inboxanchor.com
 INBOXANCHOR_ALIAS_RESOLVER_SECRET=replace-with-a-long-random-secret
+INBOXANCHOR_ALIAS_RESOLVER_BASE_URL=https://your-public-inboxanchor-api.example.com
+INBOXANCHOR_ALIAS_INBOUND_READY=true
 ```
 
 ## Required Worker vars
@@ -46,5 +48,7 @@ INBOXANCHOR_ALIAS_RESOLVER_SECRET=replace-with-the-same-random-secret
 ## Notes
 
 - This is the app-side and Worker-side scaffold.
+- The Worker must call a public HTTPS InboxAnchor API. A backend running only on
+  `127.0.0.1` or `localhost` cannot resolve aliases for Cloudflare.
 - Real `@inboxanchor.com` delivery still requires domain ownership, MX setup, and live Cloudflare
   Email Routing configuration.

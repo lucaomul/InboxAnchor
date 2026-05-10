@@ -83,6 +83,7 @@ class Settings:
         False,
     )
     alias_resolver_secret: str = os.getenv("INBOXANCHOR_ALIAS_RESOLVER_SECRET", "")
+    alias_resolver_base_url: str = os.getenv("INBOXANCHOR_ALIAS_RESOLVER_BASE_URL", "")
     alias_inbound_ready: bool = _as_bool(
         os.getenv("INBOXANCHOR_ALIAS_INBOUND_READY"),
         False,

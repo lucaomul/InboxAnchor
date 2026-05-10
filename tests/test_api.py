@@ -1525,6 +1525,11 @@ def test_frontend_managed_aliases_use_clean_domain(monkeypatch):
     monkeypatch.setattr(frontend_router.SETTINGS, "alias_managed_enabled", True)
     monkeypatch.setattr(frontend_router.SETTINGS, "alias_domain", "inboxanchor.com")
     monkeypatch.setattr(frontend_router.SETTINGS, "alias_resolver_secret", "resolver-secret")
+    monkeypatch.setattr(
+        frontend_router.SETTINGS,
+        "alias_resolver_base_url",
+        "https://api.inboxanchor.com",
+    )
     monkeypatch.setattr(frontend_router.SETTINGS, "alias_inbound_ready", True)
 
     signup = client.post(
@@ -1557,6 +1562,8 @@ def test_frontend_managed_aliases_use_clean_domain(monkeypatch):
     assert listed_payload["managed_enabled"] is True
     assert listed_payload["managed_ready"] is True
     assert listed_payload["managed_resolver_configured"] is True
+    assert listed_payload["managed_resolver_base_url"] == "https://api.inboxanchor.com"
+    assert listed_payload["managed_public_backend_ready"] is True
     assert listed_payload["managed_inbound_ready"] is True
     assert listed_payload["managed_blockers"] == []
     assert listed_payload["domain"] == "inboxanchor.com"
@@ -1568,6 +1575,7 @@ def test_frontend_managed_alias_generation_requires_live_inbound(monkeypatch):
     monkeypatch.setattr(frontend_router.SETTINGS, "alias_managed_enabled", True)
     monkeypatch.setattr(frontend_router.SETTINGS, "alias_domain", "inboxanchor.com")
     monkeypatch.setattr(frontend_router.SETTINGS, "alias_resolver_secret", "")
+    monkeypatch.setattr(frontend_router.SETTINGS, "alias_resolver_base_url", "http://127.0.0.1:8010")
     monkeypatch.setattr(frontend_router.SETTINGS, "alias_inbound_ready", False)
 
     signup = client.post(
@@ -1586,6 +1594,8 @@ def test_frontend_managed_alias_generation_requires_live_inbound(monkeypatch):
     assert listed_payload["managed_enabled"] is True
     assert listed_payload["managed_ready"] is False
     assert listed_payload["managed_resolver_configured"] is False
+    assert listed_payload["managed_resolver_base_url"] == "http://127.0.0.1:8010"
+    assert listed_payload["managed_public_backend_ready"] is False
     assert listed_payload["managed_inbound_ready"] is False
     assert listed_payload["managed_blockers"]
 
@@ -1599,6 +1609,49 @@ def test_frontend_managed_alias_generation_requires_live_inbound(monkeypatch):
     assert "managed aliases are configured but not live yet" in generated.json()["detail"].lower()
 
 
+def test_frontend_alias_generation_falls_back_to_plus_when_managed_path_is_not_live(monkeypatch):
+    from inboxanchor.api.v1.routers import frontend as frontend_router
+
+    monkeypatch.setattr(frontend_router.SETTINGS, "alias_managed_enabled", True)
+    monkeypatch.setattr(frontend_router.SETTINGS, "alias_domain", "inboxanchor.com")
+    monkeypatch.setattr(frontend_router.SETTINGS, "alias_resolver_secret", "")
+    monkeypatch.setattr(frontend_router.SETTINGS, "alias_resolver_base_url", "http://127.0.0.1:8010")
+    monkeypatch.setattr(frontend_router.SETTINGS, "alias_inbound_ready", False)
+    monkeypatch.setattr(frontend_router.SETTINGS, "alias_allow_plus_fallback", True)
+
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "full_name": "Fallback Alias Operator",
+            "email": "fallback-managed-owner@example.com",
+            "password": "fallback-managed-pass",
+        },
+    )
+    token = signup.json()["token"]
+    client.put(
+        "/providers/gmail/connection",
+        json={
+            "status": "connected",
+            "account_hint": "fallback-owner@gmail.com",
+            "sync_enabled": True,
+            "dry_run_only": False,
+            "notes": "Connected for alias fallback tests.",
+        },
+    )
+
+    generated = client.post(
+        "/aliases/generate",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"label": "travel", "purpose": "airlines"},
+    )
+
+    assert generated.status_code == 200
+    payload = generated.json()
+    assert payload["alias_type"] == "plus"
+    assert "+ia-travel" in payload["alias_address"]
+    assert "Managed InboxAnchor aliases are not live yet" in payload["note"]
+
+
 def test_frontend_alias_resolve_returns_forwarding_payload(monkeypatch):
     from inboxanchor.api.v1.routers import frontend as frontend_router
 
@@ -1608,6 +1661,11 @@ def test_frontend_alias_resolve_returns_forwarding_payload(monkeypatch):
         frontend_router.SETTINGS,
         "alias_resolver_secret",
         "resolver-secret",
+    )
+    monkeypatch.setattr(
+        frontend_router.SETTINGS,
+        "alias_resolver_base_url",
+        "https://api.inboxanchor.com",
     )
     monkeypatch.setattr(frontend_router.SETTINGS, "alias_inbound_ready", True)
 

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import secrets
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -207,6 +209,29 @@ def _require_alias_resolver_secret(secret: Optional[str]) -> None:
 
 def _alias_resolver_secret_configured() -> bool:
     return bool(SETTINGS.alias_resolver_secret.strip())
+
+
+def _managed_alias_resolver_base_url() -> str:
+    return SETTINGS.alias_resolver_base_url.strip().rstrip("/")
+
+
+def _managed_alias_public_backend_ready() -> bool:
+    base_url = _managed_alias_resolver_base_url()
+    if not base_url:
+        return False
+    parsed = urlparse(base_url)
+    if parsed.scheme != "https":
+        return False
+    hostname = (parsed.hostname or "").strip().lower()
+    if not hostname or hostname in {"localhost", "127.0.0.1", "::1"}:
+        return False
+    if hostname.endswith(".local"):
+        return False
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return True
+    return not (address.is_private or address.is_loopback or address.is_link_local)
 
 
 def _current_actor_email(authorization: Optional[str]) -> str:
@@ -796,6 +821,15 @@ def _managed_alias_blockers() -> list[str]:
         return blockers
     if not _alias_resolver_secret_configured():
         blockers.append("Set INBOXANCHOR_ALIAS_RESOLVER_SECRET on the backend.")
+    if not _managed_alias_resolver_base_url():
+        blockers.append(
+            "Set INBOXANCHOR_ALIAS_RESOLVER_BASE_URL to a public HTTPS URL for the InboxAnchor API."
+        )
+    elif not _managed_alias_public_backend_ready():
+        blockers.append(
+            "INBOXANCHOR_ALIAS_RESOLVER_BASE_URL must be a public HTTPS URL, "
+            "not localhost or a private IP."
+        )
     if not _managed_alias_inbound_ready():
         blockers.append(
             "Deploy the Cloudflare Email Routing worker, then set "
@@ -2956,6 +2990,8 @@ def frontend_list_aliases(
         "managed_enabled": _managed_aliases_enabled(),
         "managed_ready": _managed_aliases_ready(),
         "managed_resolver_configured": _alias_resolver_secret_configured(),
+        "managed_resolver_base_url": _managed_alias_resolver_base_url() or None,
+        "managed_public_backend_ready": _managed_alias_public_backend_ready(),
         "managed_inbound_ready": _managed_alias_inbound_ready(),
         "managed_blockers": _managed_alias_blockers(),
         "plus_fallback_enabled": _plus_alias_fallback_enabled(),
@@ -2992,7 +3028,8 @@ def frontend_generate_alias(
             "Revoking it in InboxAnchor blocks future reuse here."
         )
     else:
-        if _managed_aliases_enabled():
+        managed_configured_but_not_ready = _managed_aliases_enabled()
+        if managed_configured_but_not_ready and not _plus_alias_fallback_enabled():
             raise HTTPException(
                 status_code=503,
                 detail=(
@@ -3027,11 +3064,21 @@ def frontend_generate_alias(
         )
         alias_type = "plus"
         provider = "gmail"
-        note = (
-            "Fallback Gmail alias. It still lands in your mailbox automatically, but it exposes "
-            "part of the underlying inbox address because Gmail requires the original local-part "
-            "before the + tag."
-        )
+        if managed_configured_but_not_ready:
+            note = (
+                "Managed InboxAnchor aliases are not live yet, so InboxAnchor generated a "
+                "working Gmail fallback alias instead. "
+                + " ".join(_managed_alias_blockers())
+                + " This fallback still lands in your mailbox automatically, but it exposes "
+                "part of the underlying inbox address because Gmail requires the original "
+                "local-part before the + tag."
+            )
+        else:
+            note = (
+                "Fallback Gmail alias. It still lands in your mailbox automatically, but it "
+                "exposes part of the underlying inbox address because Gmail requires the "
+                "original local-part before the + tag."
+            )
     routing_label = _configure_alias_inbox_routing(
         alias_address=alias,
         label=payload.label,
