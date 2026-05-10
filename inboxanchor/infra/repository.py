@@ -1555,21 +1555,29 @@ class InboxRepository:
         if row is not None:
             self.session.delete(row)
 
+    def list_aliases(
+        self,
+        *,
+        owner_email: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> list[EmailAlias]:
+        query = self.session.query(EmailAliasORM)
+        if owner_email:
+            query = query.filter(EmailAliasORM.owner_email == owner_email)
+        if status:
+            query = query.filter(EmailAliasORM.status == status)
+        rows = query.order_by(EmailAliasORM.created_at.desc()).all()
+        return [self._alias_model(row) for row in rows]
+
     def list_email_aliases(
         self,
         *,
         owner_email: str,
         status: Optional[str] = None,
     ) -> list[EmailAlias]:
-        query = self.session.query(EmailAliasORM).filter(
-            EmailAliasORM.owner_email == owner_email
-        )
-        if status:
-            query = query.filter(EmailAliasORM.status == status)
-        rows = query.order_by(EmailAliasORM.created_at.desc()).all()
-        return [self._alias_model(row) for row in rows]
+        return self.list_aliases(owner_email=owner_email, status=status)
 
-    def create_email_alias(self, alias: EmailAlias) -> EmailAlias:
+    def create_alias(self, alias: EmailAlias) -> EmailAlias:
         row = EmailAliasORM(
             owner_email=alias.owner_email,
             provider=alias.provider,
@@ -1587,13 +1595,16 @@ class InboxRepository:
         self.session.flush()
         return self._alias_model(row)
 
+    def create_email_alias(self, alias: EmailAlias) -> EmailAlias:
+        return self.create_alias(alias)
+
     def get_email_alias(self, alias_id: int) -> Optional[EmailAlias]:
         row = self.session.get(EmailAliasORM, alias_id)
         if row is None:
             return None
         return self._alias_model(row)
 
-    def get_email_alias_by_address(self, alias_address: str) -> Optional[EmailAlias]:
+    def get_alias_by_address(self, alias_address: str) -> Optional[EmailAlias]:
         row = (
             self.session.query(EmailAliasORM)
             .filter(EmailAliasORM.alias_address == alias_address.strip().lower())
@@ -1604,8 +1615,25 @@ class InboxRepository:
             return None
         return self._alias_model(row)
 
+    def get_email_alias_by_address(self, alias_address: str) -> Optional[EmailAlias]:
+        return self.get_alias_by_address(alias_address)
+
     def revoke_email_alias(self, alias_id: int) -> Optional[EmailAlias]:
         row = self.session.get(EmailAliasORM, alias_id)
+        if row is None:
+            return None
+        row.status = EmailAliasStatus.revoked
+        row.revoked_at = datetime.now(timezone.utc)
+        self.session.flush()
+        return self._alias_model(row)
+
+    def revoke_alias(self, alias_address: str) -> Optional[EmailAlias]:
+        row = (
+            self.session.query(EmailAliasORM)
+            .filter(EmailAliasORM.alias_address == alias_address.strip().lower())
+            .order_by(EmailAliasORM.created_at.desc())
+            .first()
+        )
         if row is None:
             return None
         row.status = EmailAliasStatus.revoked

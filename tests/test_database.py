@@ -1,9 +1,11 @@
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from inboxanchor.bootstrap import build_demo_emails
 from inboxanchor.infra.database import _resolve_database_url, _sqlite_connect_args, session_scope
 from inboxanchor.infra.repository import InboxRepository
+from inboxanchor.models import EmailAlias, EmailAliasStatus
 
 
 def test_relative_sqlite_url_resolves_to_app_data_directory():
@@ -157,6 +159,45 @@ def test_provider_sync_state_roundtrip_and_clear():
         cleared = repository.get_provider_sync_state("gmail", "mailbox_backfill")
 
     assert cleared is None
+
+
+def test_alias_repository_helpers_support_lookup_list_and_revoke():
+    alias = EmailAlias(
+        owner_email="alias-owner@example.com",
+        provider="gmail",
+        alias_address="travel@inboxanchor.com",
+        target_email="alias-owner@example.com",
+        alias_type="managed",
+        label="travel",
+        purpose="airlines",
+        note="Alias for travel bookings.",
+        status=EmailAliasStatus.active,
+        created_at=datetime.now(timezone.utc),
+    )
+
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        stored = repository.create_alias(alias)
+
+    assert stored.alias_address == "travel@inboxanchor.com"
+
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        looked_up = repository.get_alias_by_address("travel@inboxanchor.com")
+        listed = repository.list_aliases(owner_email="alias-owner@example.com")
+
+    assert looked_up is not None
+    assert looked_up.owner_email == "alias-owner@example.com"
+    assert len(listed) == 1
+    assert listed[0].alias_address == "travel@inboxanchor.com"
+
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        revoked = repository.revoke_alias("travel@inboxanchor.com")
+
+    assert revoked is not None
+    assert revoked.status == EmailAliasStatus.revoked
+    assert revoked.revoked_at is not None
 
 
 def test_provider_sync_state_preserves_full_mailbox_without_target_count():

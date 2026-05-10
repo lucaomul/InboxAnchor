@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import logging
 import secrets
 import threading
 from dataclasses import dataclass, field
@@ -53,6 +54,7 @@ from inboxanchor.models import (
 from inboxanchor.sender_intelligence import SenderIntelligenceResolver
 
 router = APIRouter(tags=["frontend-compat"])
+logger = logging.getLogger(__name__)
 
 FRONTEND_RUN_CACHE: dict[str, str] = {}
 FRONTEND_SERVICE_CACHE: dict[str, InboxAnchorService] = {}
@@ -136,6 +138,23 @@ class FrontendMailboxBackfillRequest(BaseModel):
 class FrontendAliasGenerateRequest(BaseModel):
     label: str = Field(default="", max_length=128)
     purpose: str = Field(default="", max_length=512)
+
+
+class FrontendAliasCreateRequest(BaseModel):
+    alias_address: str = Field(min_length=3, max_length=320)
+    target_email: str = Field(min_length=3, max_length=320)
+    label: str = Field(default="", max_length=128)
+    purpose: str = Field(default="", max_length=512)
+    note: str = Field(default="", max_length=1024)
+    alias_type: str = Field(default="plus", max_length=32)
+    provider: str = Field(default="gmail", max_length=32)
+
+
+class FrontendAliasStatusResponse(BaseModel):
+    active: bool
+    status: str
+    alias_address: str
+    forward_to: str
 
 
 class AliasResolveRequest(BaseModel):
@@ -965,6 +984,30 @@ def _alias_resolution_payload(alias: EmailAlias) -> dict:
         "provider": alias.provider,
         "skip_inbox": True,
     }
+
+
+def _emit_alias_event(event_type: str, alias: EmailAlias) -> None:
+    STREAM_HUB.emit(
+        {
+            "type": event_type,
+            "alias": alias.alias_address,
+            "status": alias.status,
+            "provider": alias.provider,
+            "alias_type": alias.alias_type,
+            "owner_email": alias.owner_email,
+        }
+    )
+
+
+def _generate_available_alias(repository: InboxRepository, builder, *, attempts: int = 12) -> str:
+    for _ in range(attempts):
+        alias_address = _normalize_alias_address(builder())
+        if repository.get_alias_by_address(alias_address) is None:
+            return alias_address
+    raise HTTPException(
+        status_code=503,
+        detail="InboxAnchor could not allocate a unique alias address right now. Try again.",
+    )
 
 
 def _frontend_email_payload(
@@ -2998,6 +3041,72 @@ def frontend_list_aliases(
     }
 
 
+@router.post("/aliases")
+def frontend_create_alias(
+    payload: FrontendAliasCreateRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    actor_email = _require_actor_email(authorization)
+    alias_address = _normalize_alias_address(payload.alias_address)
+    target_email = payload.target_email.strip().lower()
+    provider_name = (payload.provider or "gmail").strip().lower() or "gmail"
+    alias_type = (payload.alias_type or "plus").strip().lower() or "plus"
+
+    if "@" not in alias_address:
+        raise HTTPException(status_code=400, detail="Alias address must contain @.")
+    if "@" not in target_email:
+        raise HTTPException(status_code=400, detail="Target email must contain @.")
+
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        if repository.get_alias_by_address(alias_address) is not None:
+            raise HTTPException(status_code=409, detail="Alias address is already in use.")
+
+        routing_label = ""
+        if provider_name == "gmail":
+            try:
+                routing_label = _configure_alias_inbox_routing(
+                    alias_address=alias_address,
+                    label=payload.label,
+                    purpose=payload.purpose,
+                )
+            except HTTPException as exc:
+                logger.warning(
+                    "InboxAnchor could not install Gmail routing for manual alias",
+                    extra={"alias_address": alias_address, "error": str(exc.detail)},
+                )
+            except Exception as exc:
+                logger.warning(
+                    "InboxAnchor could not install Gmail routing for manual alias",
+                    extra={"alias_address": alias_address, "error": str(exc)},
+                )
+
+        note = payload.note.strip()
+        if routing_label:
+            suffix = (
+                f"New mail to this alias is auto-labeled into {routing_label} "
+                "and skipped from the main inbox."
+            )
+            note = f"{note} {suffix}".strip() if note else suffix
+
+        stored = repository.create_alias(
+            EmailAlias(
+                owner_email=actor_email,
+                provider=provider_name,
+                alias_address=alias_address,
+                target_email=target_email,
+                alias_type=alias_type,
+                label=payload.label.strip(),
+                purpose=payload.purpose.strip(),
+                note=note,
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+
+    _emit_alias_event("alias_created", stored)
+    return stored.model_dump(mode="json")
+
+
 @router.post("/aliases/generate")
 def frontend_generate_alias(
     payload: FrontendAliasGenerateRequest,
@@ -3012,13 +3121,11 @@ def frontend_generate_alias(
             detail="InboxAnchor could not determine the target inbox for this alias.",
         )
 
-    if _managed_aliases_ready():
+    managed_aliases_ready = _managed_aliases_ready()
+    managed_configured_but_not_ready = _managed_aliases_enabled()
+
+    if managed_aliases_ready:
         alias_domain = _managed_alias_domain()
-        alias = _generate_managed_alias(
-            alias_domain,
-            label=payload.label,
-            purpose=payload.purpose,
-        )
         alias_type = "managed"
         provider = "inboxanchor"
         note = (
@@ -3028,7 +3135,6 @@ def frontend_generate_alias(
             "Revoking it in InboxAnchor blocks future reuse here."
         )
     else:
-        managed_configured_but_not_ready = _managed_aliases_enabled()
         if managed_configured_but_not_ready and not _plus_alias_fallback_enabled():
             raise HTTPException(
                 status_code=503,
@@ -3057,11 +3163,6 @@ def frontend_generate_alias(
                     "uses Gmail plus-addressing."
                 ),
             )
-        alias = _generate_plus_alias(
-            target_email,
-            label=payload.label,
-            purpose=payload.purpose,
-        )
         alias_type = "plus"
         provider = "gmail"
         if managed_configured_but_not_ready:
@@ -3079,18 +3180,37 @@ def frontend_generate_alias(
                 "exposes part of the underlying inbox address because Gmail requires the "
                 "original local-part before the + tag."
             )
-    routing_label = _configure_alias_inbox_routing(
-        alias_address=alias,
-        label=payload.label,
-        purpose=payload.purpose,
-    )
-    if routing_label:
-        note = (
-            f"{note} New mail to this alias is auto-labeled into {routing_label} "
-            "and skipped from the main inbox."
-        )
     with session_scope() as session:
         repository = InboxRepository(session)
+        if managed_aliases_ready:
+            alias = _generate_available_alias(
+                repository,
+                lambda: _generate_managed_alias(
+                    alias_domain,
+                    label=payload.label,
+                    purpose=payload.purpose,
+                ),
+            )
+        else:
+            alias = _generate_available_alias(
+                repository,
+                lambda: _generate_plus_alias(
+                    target_email,
+                    label=payload.label,
+                    purpose=payload.purpose,
+                ),
+            )
+
+        routing_label = _configure_alias_inbox_routing(
+            alias_address=alias,
+            label=payload.label,
+            purpose=payload.purpose,
+        )
+        if routing_label:
+            note = (
+                f"{note} New mail to this alias is auto-labeled into {routing_label} "
+                "and skipped from the main inbox."
+            )
         stored = repository.create_email_alias(
             EmailAlias(
                 owner_email=actor_email,
@@ -3104,6 +3224,7 @@ def frontend_generate_alias(
                 created_at=datetime.now(timezone.utc),
             )
         )
+    _emit_alias_event("alias_created", stored)
     return stored.model_dump(mode="json")
 
 
@@ -3124,7 +3245,52 @@ def frontend_revoke_alias(
         revoked = repository.revoke_email_alias(alias_id)
     if revoked is None:
         raise HTTPException(status_code=404, detail="Alias not found.")
+    _emit_alias_event("alias_revoked", revoked)
     return revoked.model_dump(mode="json")
+
+
+@router.post("/aliases/by-address/{alias_address}/revoke")
+def frontend_revoke_alias_by_address(
+    alias_address: str,
+    authorization: Optional[str] = Header(default=None),
+):
+    actor_email = _require_actor_email(authorization)
+    normalized_alias = _normalize_alias_address(alias_address)
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        alias = repository.get_alias_by_address(normalized_alias)
+        if alias is None:
+            raise HTTPException(status_code=404, detail="Alias not found.")
+        if alias.owner_email != actor_email:
+            raise HTTPException(status_code=403, detail="You can only revoke your own aliases.")
+        _remove_alias_inbox_routing(alias.alias_address)
+        revoked = repository.revoke_alias(normalized_alias)
+    if revoked is None:
+        raise HTTPException(status_code=404, detail="Alias not found.")
+    _emit_alias_event("alias_revoked", revoked)
+    return revoked.model_dump(mode="json")
+
+
+@router.get("/aliases/{alias_address}/status")
+def frontend_alias_status(
+    alias_address: str,
+    authorization: Optional[str] = Header(default=None),
+) -> FrontendAliasStatusResponse:
+    actor_email = _require_actor_email(authorization)
+    normalized_alias = _normalize_alias_address(alias_address)
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        alias = repository.get_alias_by_address(normalized_alias)
+    if alias is None:
+        raise HTTPException(status_code=404, detail="Alias not found.")
+    if alias.owner_email != actor_email:
+        raise HTTPException(status_code=403, detail="You can only view your own aliases.")
+    return FrontendAliasStatusResponse(
+        active=alias.status == "active",
+        status=alias.status,
+        alias_address=alias.alias_address,
+        forward_to=alias.target_email,
+    )
 
 
 @router.post("/aliases/resolve")
@@ -3136,7 +3302,7 @@ def frontend_resolve_alias(
     alias_address = _normalize_alias_address(payload.alias_address)
     with session_scope() as session:
         repository = InboxRepository(session)
-        alias = repository.get_email_alias_by_address(alias_address)
+        alias = repository.get_alias_by_address(alias_address)
     if alias is None:
         return {
             "active": False,
@@ -3150,6 +3316,7 @@ def frontend_resolve_alias(
             "action": "reject",
             "reason": "Alias has been revoked.",
             "alias_address": alias.alias_address,
+            "owner_email": alias.owner_email,
         }
     resolved = _alias_resolution_payload(alias)
     return {

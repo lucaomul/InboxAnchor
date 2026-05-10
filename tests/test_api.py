@@ -1728,6 +1728,161 @@ def test_frontend_alias_resolve_rejects_unknown_alias(monkeypatch):
     assert payload["reason"] == "Alias not found."
 
 
+def test_frontend_alias_resolve_rejects_wrong_secret(monkeypatch):
+    from inboxanchor.api.v1.routers import frontend as frontend_router
+
+    monkeypatch.setattr(
+        frontend_router.SETTINGS,
+        "alias_resolver_secret",
+        "resolver-secret",
+    )
+
+    resolved = client.post(
+        "/aliases/resolve",
+        headers={"X-InboxAnchor-Alias-Secret": "wrong-secret"},
+        json={"alias_address": "missing@inboxanchor.com"},
+    )
+
+    assert resolved.status_code == 401
+    assert "authentication failed" in resolved.json()["detail"].lower()
+
+
+def test_frontend_manual_alias_create_emits_event_and_status(monkeypatch):
+    from inboxanchor.api.v1.routers import frontend as frontend_router
+
+    events = []
+    monkeypatch.setattr(
+        frontend_router,
+        "_configure_alias_inbox_routing",
+        lambda alias_address, *, label="", purpose="": "InboxAnchor/Aliases/Travel",
+    )
+    monkeypatch.setattr(frontend_router.STREAM_HUB, "emit", lambda payload: events.append(payload))
+
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "full_name": "Manual Alias Owner",
+            "email": "manual-owner@example.com",
+            "password": "manual-alias-pass",
+        },
+    )
+    token = signup.json()["token"]
+
+    created = client.post(
+        "/aliases",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "alias_address": "travel-demo@inboxanchor.com",
+            "target_email": "manual-owner@example.com",
+            "label": "travel",
+            "purpose": "airlines",
+            "provider": "gmail",
+            "alias_type": "managed",
+        },
+    )
+
+    assert created.status_code == 200
+    payload = created.json()
+    assert payload["alias_address"] == "travel-demo@inboxanchor.com"
+    assert payload["target_email"] == "manual-owner@example.com"
+    assert events[-1]["type"] == "alias_created"
+    assert events[-1]["alias"] == "travel-demo@inboxanchor.com"
+
+    status = client.get(
+        "/aliases/travel-demo@inboxanchor.com/status",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert status.status_code == 200
+    assert status.json() == {
+        "active": True,
+        "status": "active",
+        "alias_address": "travel-demo@inboxanchor.com",
+        "forward_to": "manual-owner@example.com",
+    }
+
+
+def test_frontend_manual_alias_create_rejects_duplicates(monkeypatch):
+    from inboxanchor.api.v1.routers import frontend as frontend_router
+
+    monkeypatch.setattr(
+        frontend_router,
+        "_configure_alias_inbox_routing",
+        lambda *args, **kwargs: "",
+    )
+
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "full_name": "Duplicate Alias Owner",
+            "email": "duplicate-owner@example.com",
+            "password": "duplicate-alias-pass",
+        },
+    )
+    token = signup.json()["token"]
+    payload = {
+        "alias_address": "dupe-demo@inboxanchor.com",
+        "target_email": "duplicate-owner@example.com",
+        "provider": "gmail",
+    }
+
+    first = client.post("/aliases", headers={"Authorization": f"Bearer {token}"}, json=payload)
+    duplicate = client.post("/aliases", headers={"Authorization": f"Bearer {token}"}, json=payload)
+
+    assert first.status_code == 200
+    assert duplicate.status_code == 409
+    assert "already in use" in duplicate.json()["detail"].lower()
+
+
+def test_frontend_manual_alias_can_be_revoked_by_address(monkeypatch):
+    from inboxanchor.api.v1.routers import frontend as frontend_router
+
+    events = []
+    removed = []
+    monkeypatch.setattr(
+        frontend_router,
+        "_configure_alias_inbox_routing",
+        lambda *args, **kwargs: "",
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_remove_alias_inbox_routing",
+        lambda alias_address: removed.append(alias_address),
+    )
+    monkeypatch.setattr(frontend_router.STREAM_HUB, "emit", lambda payload: events.append(payload))
+
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "full_name": "Revoke Alias Owner",
+            "email": "revoke-owner@example.com",
+            "password": "revoke-alias-pass",
+        },
+    )
+    token = signup.json()["token"]
+
+    created = client.post(
+        "/aliases",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "alias_address": "revoke-demo@inboxanchor.com",
+            "target_email": "revoke-owner@example.com",
+            "provider": "gmail",
+        },
+    )
+    assert created.status_code == 200
+
+    revoked = client.post(
+        "/aliases/by-address/revoke-demo@inboxanchor.com/revoke",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert revoked.status_code == 200
+    assert revoked.json()["status"] == "revoked"
+    assert removed == ["revoke-demo@inboxanchor.com"]
+    assert events[-1]["type"] == "alias_revoked"
+
+
 def test_frontend_ops_backfill_can_resume_from_saved_offset(monkeypatch):
     seed = build_demo_emails()
     emails = [
