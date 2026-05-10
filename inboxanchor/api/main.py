@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -19,11 +19,18 @@ from inboxanchor.api.v1.routers.frontend import (
 from inboxanchor.api.v1.routers.oauth import router as oauth_router
 from inboxanchor.api.v1.routers.webhooks import router as webhook_router
 from inboxanchor.bootstrap import InboxAnchorService, list_provider_profiles
+from inboxanchor.infra.auth import AuthService
 from inboxanchor.infra.database import session_scope
 from inboxanchor.infra.repository import InboxRepository
+from inboxanchor.infra.request_context import (
+    get_current_actor_email,
+    reset_current_actor_email,
+    set_current_actor_email,
+)
 from inboxanchor.models import (
     FollowUpReminder,
     FollowUpReminderStatus,
+    IMAPConnectionState,
     ProviderConnectionState,
     WorkspacePolicy,
     WorkspaceSettings,
@@ -69,12 +76,25 @@ class WorkspaceSettingsRequest(BaseModel):
     policy: WorkspacePolicy = Field(default_factory=WorkspacePolicy)
 
 
+class IMAPConnectionRequest(BaseModel):
+    host: str = ""
+    port: int = Field(default=993, ge=1, le=65535)
+    username: str = ""
+    password: str = ""
+    use_ssl: bool = True
+    mailbox: str = "INBOX"
+    archive_mailbox: str = ""
+    trash_mailbox: str = ""
+    clear_password: bool = False
+
+
 class ProviderConnectionRequest(BaseModel):
     status: str = "not_connected"
     account_hint: str = ""
     sync_enabled: bool = False
     dry_run_only: bool = True
     notes: str = ""
+    imap: Optional[IMAPConnectionRequest] = None
 
 
 class FollowUpReminderRequest(BaseModel):
@@ -97,6 +117,25 @@ class FollowUpReminderRequest(BaseModel):
 @lru_cache
 def get_service() -> InboxAnchorService:
     return InboxAnchorService()
+
+
+def _extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
+    if not authorization:
+        return None
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    return token.strip()
+
+
+def _service_for_request(provider_name: Optional[str] = None) -> InboxAnchorService:
+    owner_email = get_current_actor_email()
+    if owner_email:
+        return InboxAnchorService(
+            provider_name=provider_name,
+            owner_email=owner_email,
+        )
+    return InboxAnchorService(provider_name=provider_name)
 
 
 def _cors_origins() -> list[str]:
@@ -123,6 +162,27 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def inject_actor_context(request: Request, call_next):
+    actor_email: Optional[str] = None
+    token = _extract_bearer_token(request.headers.get("authorization"))
+    if token:
+        try:
+            with session_scope() as session:
+                auth_session = AuthService(session).get_session(token)
+            if auth_session is not None:
+                actor_email = auth_session.user.email
+        except Exception:
+            actor_email = None
+    context_token = set_current_actor_email(actor_email)
+    try:
+        return await call_next(request)
+    finally:
+        reset_current_actor_email(context_token)
+
+
 app.include_router(frontend_router)
 app.include_router(auth_router)
 app.include_router(oauth_router)
@@ -137,14 +197,14 @@ def health():
 
 @app.get("/emails/unread")
 def unread_emails(limit: int = 25):
-    service = get_service()
+    service = _service_for_request()
     emails = service.provider.list_unread(limit=limit, include_body=True)
     return {"count": len(emails), "items": [email.model_dump(mode="json") for email in emails]}
 
 
 @app.get("/providers")
 def list_providers():
-    service = get_service()
+    service = _service_for_request()
     items = []
     for profile in list_provider_profiles():
         connection = service.load_provider_connection(profile.slug)
@@ -173,19 +233,55 @@ def save_workspace_settings(payload: WorkspaceSettingsRequest):
 
 
 @app.get("/providers/{provider}/connection")
-def get_provider_connection(provider: str):
-    service = get_service()
+def get_provider_connection(provider: str, authorization: Optional[str] = Header(default=None)):
+    del authorization
+    service = _service_for_request()
     return service.load_provider_connection(provider).model_dump(mode="json")
 
 
 @app.put("/providers/{provider}/connection")
-def save_provider_connection(provider: str, payload: ProviderConnectionRequest):
-    service = get_service()
+def save_provider_connection(
+    provider: str,
+    payload: ProviderConnectionRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    del authorization
+    service = _service_for_request()
+    imap_state = None
+    if payload.imap is not None:
+        imap_state = IMAPConnectionState(
+            host=payload.imap.host.strip(),
+            port=payload.imap.port,
+            username=payload.imap.username.strip(),
+            use_ssl=payload.imap.use_ssl,
+            mailbox=payload.imap.mailbox.strip() or "INBOX",
+            archive_mailbox=payload.imap.archive_mailbox.strip(),
+            trash_mailbox=payload.imap.trash_mailbox.strip(),
+        )
+
     state = ProviderConnectionState(
         provider=provider,
         last_tested_at=datetime.now(timezone.utc),
-        **payload.model_dump(),
+        status=payload.status,
+        account_hint=payload.account_hint,
+        sync_enabled=payload.sync_enabled,
+        dry_run_only=payload.dry_run_only,
+        notes=payload.notes,
+        imap=imap_state,
     )
+    if provider in {"imap", "yahoo", "outlook"} and payload.imap is not None:
+        with session_scope() as session:
+            repository = InboxRepository(session)
+            existing_secret = repository.get_provider_secret(provider)
+            next_password = str(existing_secret.get("password") or "")
+            if payload.imap.clear_password:
+                next_password = ""
+            elif payload.imap.password.strip():
+                next_password = payload.imap.password.strip()
+            if next_password:
+                repository.save_provider_secret(provider, {"password": next_password})
+            else:
+                repository.clear_provider_secret(provider)
     saved = service.save_provider_connection(state)
     mark_frontend_provider_dirty(provider)
     return saved.model_dump(mode="json")
@@ -264,10 +360,10 @@ def dismiss_follow_up_reminder(reminder_id: int):
 
 @app.post("/triage/run")
 def run_triage(payload: TriageRunRequest):
-    default_service = get_service()
+    default_service = _service_for_request()
     settings = default_service.load_workspace_settings()
     provider_name = payload.provider or settings.preferred_provider
-    service = InboxAnchorService(provider_name=provider_name)
+    service = _service_for_request(provider_name=provider_name)
     result = service.engine.run(
         dry_run=settings.dry_run_default if payload.dry_run is None else payload.dry_run,
         limit=settings.default_scan_limit if payload.limit is None else payload.limit,
@@ -414,7 +510,7 @@ def execute_actions(payload: ExecuteRequest):
         if not stored:
             raise HTTPException(status_code=404, detail="Run not found")
         run_result = repository.build_execution_result(payload.run_id, approved_email_ids)
-    execution_service = InboxAnchorService(provider_name=stored.get("provider"))
+    execution_service = _service_for_request(stored.get("provider"))
     decisions = execution_service.engine.execute_actions(
         run_result,
         approved_email_ids=approved_email_ids,

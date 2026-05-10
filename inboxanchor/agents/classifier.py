@@ -85,6 +85,24 @@ class ClassifierAgent:
         except Exception:
             return heuristic
 
+    def classify_smart(
+        self,
+        email: EmailMessage,
+        *,
+        sender_profile: dict | None = None,
+        domain_profile: dict | None = None,
+    ) -> EmailClassification:
+        """
+        Tiered classification. Falls back to classify() for ambiguous emails.
+        """
+        from inboxanchor.core.tiered_classifier import TieredClassifier
+
+        return TieredClassifier().classify(
+            email,
+            sender_profile=sender_profile,
+            domain_profile=domain_profile,
+        )
+
     def _should_use_llm(
         self,
         email: EmailMessage,

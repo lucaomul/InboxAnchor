@@ -5,7 +5,8 @@ from pathlib import Path
 from inboxanchor.bootstrap import build_demo_emails
 from inboxanchor.infra.database import _resolve_database_url, _sqlite_connect_args, session_scope
 from inboxanchor.infra.repository import InboxRepository
-from inboxanchor.models import EmailAlias, EmailAliasStatus
+from inboxanchor.infra.request_context import reset_current_actor_email, set_current_actor_email
+from inboxanchor.models import EmailAlias, EmailAliasStatus, ProviderConnectionState
 
 
 def test_relative_sqlite_url_resolves_to_app_data_directory():
@@ -228,3 +229,145 @@ def test_provider_sync_state_preserves_full_mailbox_without_target_count():
     assert loaded["processed_count"] == 42000
     assert loaded["next_offset"] == 42000
     assert "target_count" not in loaded or loaded["target_count"] in (None, 0)
+
+
+def test_provider_connection_state_isolated_by_owner_email():
+    owner_state = ProviderConnectionState(
+        provider="gmail",
+        status="connected",
+        account_hint="owner.mailbox@gmail.com",
+        sync_enabled=True,
+        dry_run_only=False,
+        notes="Owner-specific Gmail connection.",
+    )
+
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        repository.save_provider_connection(
+            owner_state,
+            owner_email="owner@example.com",
+        )
+
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        owner_connection = repository.get_provider_connection(
+            "gmail",
+            owner_email="owner@example.com",
+        )
+        other_connection = repository.get_provider_connection(
+            "gmail",
+            owner_email="other@example.com",
+        )
+
+    assert owner_connection.status == "connected"
+    assert owner_connection.account_hint == "owner.mailbox@gmail.com"
+    assert other_connection.status == "not_connected"
+    assert other_connection.account_hint == ""
+
+
+def test_find_provider_connection_owner_matches_account_hint():
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        repository.save_provider_connection(
+            ProviderConnectionState(
+                provider="gmail",
+                status="connected",
+                account_hint="mapped.mailbox@gmail.com",
+                sync_enabled=True,
+                dry_run_only=False,
+            ),
+            owner_email="mapped-owner@example.com",
+        )
+
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        owner_email = repository.find_provider_connection_owner(
+            "gmail",
+            "mapped.mailbox@gmail.com",
+        )
+
+    assert owner_email == "mapped-owner@example.com"
+
+
+def test_provider_secret_is_isolated_by_owner_email():
+    first_token = set_current_actor_email("first-secret-owner@example.com")
+    try:
+        with session_scope() as session:
+            repository = InboxRepository(session)
+            repository.save_provider_secret(
+                "yahoo",
+                {"password": "first-owner-app-password"},
+            )
+    finally:
+        reset_current_actor_email(first_token)
+
+    second_token = set_current_actor_email("second-secret-owner@example.com")
+    try:
+        with session_scope() as session:
+            repository = InboxRepository(session)
+            second_secret = repository.get_provider_secret("yahoo")
+    finally:
+        reset_current_actor_email(second_token)
+
+    first_token = set_current_actor_email("first-secret-owner@example.com")
+    try:
+        with session_scope() as session:
+            repository = InboxRepository(session)
+            first_secret = repository.get_provider_secret("yahoo")
+    finally:
+        reset_current_actor_email(first_token)
+
+    assert first_secret["password"] == "first-owner-app-password"
+    assert second_secret == {}
+
+
+def test_mailbox_cache_isolated_by_actor_context():
+    first_token = set_current_actor_email("first-cache-owner@example.com")
+    try:
+        with session_scope() as session:
+            repository = InboxRepository(session)
+            repository.upsert_mailbox_email(
+                "gmail",
+                build_demo_emails()[0].model_copy(
+                    update={
+                        "id": "shared-email-id",
+                        "subject": "First owner's cached subject",
+                    }
+                ),
+            )
+    finally:
+        reset_current_actor_email(first_token)
+
+    second_token = set_current_actor_email("second-cache-owner@example.com")
+    try:
+        with session_scope() as session:
+            repository = InboxRepository(session)
+            repository.upsert_mailbox_email(
+                "gmail",
+                build_demo_emails()[0].model_copy(
+                    update={
+                        "id": "shared-email-id",
+                        "subject": "Second owner's cached subject",
+                    }
+                ),
+            )
+            second_cached = repository.get_mailbox_email("gmail", "shared-email-id")
+            second_count = repository.count_mailbox_emails("gmail")
+    finally:
+        reset_current_actor_email(second_token)
+
+    first_token = set_current_actor_email("first-cache-owner@example.com")
+    try:
+        with session_scope() as session:
+            repository = InboxRepository(session)
+            first_cached = repository.get_mailbox_email("gmail", "shared-email-id")
+            first_count = repository.count_mailbox_emails("gmail")
+    finally:
+        reset_current_actor_email(first_token)
+
+    assert first_cached is not None
+    assert second_cached is not None
+    assert first_cached["subject"] == "First owner's cached subject"
+    assert second_cached["subject"] == "Second owner's cached subject"
+    assert first_count == 1
+    assert second_count == 1

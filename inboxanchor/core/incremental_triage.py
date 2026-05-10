@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
+import threading
 from typing import Optional
 
 from inboxanchor.config.settings import SETTINGS
 from inboxanchor.core.triage_engine import TriageEngine
 from inboxanchor.infra.database import session_scope
 from inboxanchor.infra.repository import InboxRepository
+
+logger = logging.getLogger(__name__)
 
 
 class _IncrementalProviderProxy:
@@ -49,9 +53,16 @@ class _IncrementalProviderProxy:
 
 
 class IncrementalTriageEngine:
-    def __init__(self, engine: TriageEngine, *, provider_name: str):
+    def __init__(
+        self,
+        engine: TriageEngine,
+        *,
+        provider_name: str,
+        owner_email: Optional[str] = None,
+    ):
         self.engine = engine
         self.provider_name = provider_name
+        self.owner_email = (owner_email or "").strip().lower() or None
 
     @property
     def provider(self):
@@ -59,11 +70,63 @@ class IncrementalTriageEngine:
 
     def _get_checkpoint(self):
         with session_scope() as session:
-            return InboxRepository(session).get_sync_checkpoint(self.provider_name)
+            return InboxRepository(session).get_sync_checkpoint(
+                self.provider_name,
+                owner_email=self.owner_email,
+            )
 
     def _save_checkpoint(self, checkpoint_value: str) -> None:
         with session_scope() as session:
-            InboxRepository(session).save_sync_checkpoint(self.provider_name, checkpoint_value)
+            InboxRepository(session).save_sync_checkpoint(
+                self.provider_name,
+                checkpoint_value,
+                owner_email=self.owner_email,
+            )
+
+    def _count_sender_profiles(self) -> int:
+        with session_scope() as session:
+            return InboxRepository(session).count_sender_profiles(self.provider_name)
+
+    def _should_auto_warmup(self, provider, checkpoint: Optional[str], sync_type: str) -> bool:
+        if checkpoint:
+            return False
+        if sync_type != "full":
+            return False
+        if not SETTINGS.sender_warmup_auto_on_first_run:
+            return False
+        if self.provider_name not in {"gmail", "imap", "yahoo", "outlook"}:
+            return False
+        if provider.__class__.__name__ in {"FakeEmailProvider", "IMAPEmailClient"}:
+            return False
+        return self._count_sender_profiles() < 10
+
+    def _start_sender_warmup(self, provider) -> None:
+        from inboxanchor.core.sender_warmup import SenderWarmupJob
+
+        logger.info(
+            "Auto-starting sender warmup — first run detected",
+            extra={"provider": self.provider_name},
+        )
+
+        def _runner() -> None:
+            try:
+                SenderWarmupJob(provider, self.provider_name).run(
+                    months_back=SETTINGS.sender_warmup_months_back,
+                    batch_size=SETTINGS.sender_warmup_batch_size,
+                    max_emails=SETTINGS.sender_warmup_max_emails,
+                    include_body=False,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Sender warmup failed",
+                    extra={"provider": self.provider_name, "error": str(exc)},
+                )
+
+        threading.Thread(
+            target=_runner,
+            name=f"inboxanchor-sender-warmup-{self.provider_name}",
+            daemon=True,
+        ).start()
 
     @staticmethod
     def _is_expired_history_error(exc: Exception) -> bool:
@@ -108,6 +171,8 @@ class IncrementalTriageEngine:
         checkpoint_value = original_provider.get_incremental_checkpoint()
         if checkpoint_value:
             self._save_checkpoint(checkpoint_value)
+        if self._should_auto_warmup(original_provider, checkpoint, sync_type):
+            self._start_sender_warmup(original_provider)
         return result.model_copy(
             update={
                 "sync_type": sync_type,

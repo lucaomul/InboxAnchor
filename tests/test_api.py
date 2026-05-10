@@ -223,8 +223,19 @@ def test_destructive_action_blocked_without_confirmation():
 
 
 def test_provider_connection_roundtrip():
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "full_name": "Provider Owner",
+            "email": "provider-owner@example.com",
+            "password": "provider-pass",
+        },
+    )
+    token = signup.json()["token"]
+
     save_response = client.put(
         "/providers/gmail/connection",
+        headers={"Authorization": f"Bearer {token}"},
         json={
             "status": "configured",
             "account_hint": "ops@company.com",
@@ -233,7 +244,10 @@ def test_provider_connection_roundtrip():
             "notes": "OAuth callback staged for next pass.",
         },
     )
-    get_response = client.get("/providers/gmail/connection")
+    get_response = client.get(
+        "/providers/gmail/connection",
+        headers={"Authorization": f"Bearer {token}"},
+    )
 
     assert save_response.status_code == 200
     assert get_response.status_code == 200
@@ -241,6 +255,104 @@ def test_provider_connection_roundtrip():
     assert payload["provider"] == "gmail"
     assert payload["status"] == "configured"
     assert payload["sync_enabled"] is True
+
+
+def test_provider_connection_is_isolated_per_authenticated_user():
+    first_signup = client.post(
+        "/auth/signup",
+        json={
+            "full_name": "First Owner",
+            "email": "first-owner@example.com",
+            "password": "first-owner-pass",
+        },
+    )
+    second_signup = client.post(
+        "/auth/signup",
+        json={
+            "full_name": "Second Owner",
+            "email": "second-owner@example.com",
+            "password": "second-owner-pass",
+        },
+    )
+    first_token = first_signup.json()["token"]
+    second_token = second_signup.json()["token"]
+
+    save_response = client.put(
+        "/providers/gmail/connection",
+        headers={"Authorization": f"Bearer {first_token}"},
+        json={
+            "status": "connected",
+            "account_hint": "first.mailbox@gmail.com",
+            "sync_enabled": True,
+            "dry_run_only": False,
+            "notes": "First user connected Gmail.",
+        },
+    )
+    first_connection = client.get(
+        "/providers/gmail/connection",
+        headers={"Authorization": f"Bearer {first_token}"},
+    )
+    second_connection = client.get(
+        "/providers/gmail/connection",
+        headers={"Authorization": f"Bearer {second_token}"},
+    )
+
+    assert save_response.status_code == 200
+    assert first_connection.status_code == 200
+    assert second_connection.status_code == 200
+    assert first_connection.json()["status"] == "connected"
+    assert first_connection.json()["account_hint"] == "first.mailbox@gmail.com"
+    assert second_connection.json()["status"] == "not_connected"
+    assert second_connection.json()["account_hint"] == ""
+
+
+def test_imap_provider_connection_roundtrip_hides_password():
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "full_name": "Yahoo Owner",
+            "email": "yahoo-owner@example.com",
+            "password": "yahoo-owner-pass",
+        },
+    )
+    token = signup.json()["token"]
+
+    save_response = client.put(
+        "/providers/yahoo/connection",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "status": "connected",
+            "account_hint": "owner@yahoo.com",
+            "sync_enabled": True,
+            "dry_run_only": False,
+            "notes": "Yahoo IMAP configured.",
+            "imap": {
+                "host": "imap.mail.yahoo.com",
+                "port": 993,
+                "username": "owner@yahoo.com",
+                "password": "yahoo-app-password",
+                "use_ssl": True,
+                "mailbox": "INBOX",
+                "archive_mailbox": "Archive",
+                "trash_mailbox": "Trash",
+            },
+        },
+    )
+    get_response = client.get(
+        "/providers/yahoo/connection",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert save_response.status_code == 200
+    assert get_response.status_code == 200
+    payload = get_response.json()
+    assert payload["provider"] == "yahoo"
+    assert payload["status"] == "connected"
+    assert payload["account_hint"] == "owner@yahoo.com"
+    assert payload["imap"]["host"] == "imap.mail.yahoo.com"
+    assert payload["imap"]["username"] == "owner@yahoo.com"
+    assert payload["imap"]["password_configured"] is True
+    assert "password" not in payload["imap"]
 
 
 def test_follow_up_reminders_can_be_created_rescheduled_and_completed():
@@ -361,7 +473,7 @@ def test_execute_uses_provider_from_stored_run(mocker):
     original_service = api_main.InboxAnchorService
     provider_calls: list[Optional[str]] = []
 
-    def recording_service(provider_name=None):
+    def recording_service(provider_name=None, **kwargs):
         provider_calls.append(provider_name)
         return original_service(provider_name=provider_name)
 
@@ -971,7 +1083,9 @@ def test_frontend_ops_scan_reclaims_stale_completed_job(monkeypatch):
 
     stale = frontend_router.FrontendRunJob(provider_name="gmail")
     stale.event.set()
-    frontend_router.FRONTEND_ACTIVE_RUNS["gmail::all_time"] = stale
+    frontend_router.FRONTEND_ACTIVE_RUNS[
+        frontend_router._scope_key("gmail", "all_time")
+    ] = stale
 
     release = threading.Event()
 
@@ -1013,8 +1127,10 @@ def test_frontend_ops_scan_reclaims_stale_nonrunning_active_job(monkeypatch):
     frontend_router.FRONTEND_ACTIVE_RUNS.clear()
 
     stale = frontend_router.FrontendRunJob(provider_name="gmail", mode="backfill")
-    frontend_router.FRONTEND_ACTIVE_RUNS["gmail::all_time"] = stale
-    frontend_router.FRONTEND_PROGRESS["gmail::all_time"] = {
+    frontend_router.FRONTEND_ACTIVE_RUNS[
+        frontend_router._scope_key("gmail", "all_time")
+    ] = stale
+    frontend_router.FRONTEND_PROGRESS[frontend_router._scope_key("gmail", "all_time")] = {
         "provider": "gmail",
         "time_range": "all_time",
         "time_range_label": "All time",
@@ -1153,7 +1269,9 @@ def test_frontend_unread_sync_uses_industrial_stream_for_gmail_all_time(monkeypa
             "time_range": "all_time",
         }
     ]
-    progress = frontend_router.FRONTEND_PROGRESS["gmail::all_time"]
+    progress = frontend_router.FRONTEND_PROGRESS[
+        frontend_router._scope_key("gmail", "all_time")
+    ]
     assert progress["target_count"] == 13
     assert progress["processed_count"] == 13
     assert progress["status"] == "complete"
@@ -1452,6 +1570,7 @@ def test_frontend_gmail_aliases_can_be_generated_and_revoked():
         token = signup.json()["token"]
         client.put(
             "/providers/gmail/connection",
+            headers={"Authorization": f"Bearer {token}"},
             json={
                 "status": "connected",
                 "account_hint": "owner@gmail.com",
@@ -1630,6 +1749,7 @@ def test_frontend_alias_generation_falls_back_to_plus_when_managed_path_is_not_l
     token = signup.json()["token"]
     client.put(
         "/providers/gmail/connection",
+        headers={"Authorization": f"Bearer {token}"},
         json={
             "status": "connected",
             "account_hint": "fallback-owner@gmail.com",
@@ -2191,7 +2311,7 @@ def test_frontend_initial_live_run_bootstraps_with_smaller_limit(monkeypatch):
 
 
 def test_frontend_ops_progress_reflects_registry_state():
-    frontend_router.FRONTEND_PROGRESS["gmail::all_time"] = {
+    frontend_router.FRONTEND_PROGRESS[frontend_router._scope_key("gmail", "all_time")] = {
         "provider": "gmail",
         "time_range": "all_time",
         "time_range_label": "All time",
@@ -2223,10 +2343,9 @@ def test_frontend_ops_progress_prefers_active_scan_over_paused_backfill(monkeypa
     frontend_router.FRONTEND_PROGRESS.clear()
     frontend_router.FRONTEND_ACTIVE_RUNS.clear()
 
-    frontend_router.FRONTEND_ACTIVE_RUNS["gmail::all_time"] = frontend_router.FrontendRunJob(
-        provider_name="gmail",
-        mode="scan",
-    )
+    frontend_router.FRONTEND_ACTIVE_RUNS[
+        frontend_router._scope_key("gmail", "all_time")
+    ] = frontend_router.FrontendRunJob(provider_name="gmail", mode="scan")
     monkeypatch.setattr(
         frontend_router,
         "_load_mailbox_cache_stats",
@@ -2264,7 +2383,7 @@ def test_frontend_ops_progress_prefers_active_scan_over_paused_backfill(monkeypa
 
 
 def test_frontend_ops_progress_reconciles_empty_stale_scan(monkeypatch):
-    frontend_router.FRONTEND_PROGRESS["gmail::all_time"] = {
+    frontend_router.FRONTEND_PROGRESS[frontend_router._scope_key("gmail", "all_time")] = {
         "provider": "gmail",
         "time_range": "all_time",
         "time_range_label": "All time",
@@ -2664,7 +2783,10 @@ def test_frontend_gmail_auth_routes_issue_local_session(monkeypatch, tmp_path):
     assert me_response.json()["authenticated"] is True
     assert me_response.json()["user"]["email"] == "gmail.user@example.com"
 
-    connection_response = client.get("/providers/gmail/connection")
+    connection_response = client.get(
+        "/providers/gmail/connection",
+        headers={"Authorization": f"Bearer {payload['access_token']}"},
+    )
     assert connection_response.status_code == 200
     assert connection_response.json()["status"] == "connected"
     workspace_response = client.get("/settings/workspace")
@@ -2673,6 +2795,75 @@ def test_frontend_gmail_auth_routes_issue_local_session(monkeypatch, tmp_path):
     assert callback_payload["state"] == "state-123"
     assert callback_payload["code_verifier"] == "frontend-verifier"
     assert marked_providers == ["gmail"]
+
+
+def test_frontend_gmail_callback_keeps_existing_actor_and_links_mailbox(monkeypatch, tmp_path):
+    credentials_path = tmp_path / "credentials.json"
+    token_path = tmp_path / "token.json"
+    credentials_path.write_text("{}", encoding="utf-8")
+
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "full_name": "InboxAnchor Owner",
+            "email": "owner@example.com",
+            "password": "owner-pass",
+        },
+    )
+    owner_token = signup.json()["token"]
+
+    monkeypatch.setattr(auth_router.SETTINGS, "gmail_credentials_path", str(credentials_path))
+    monkeypatch.setattr(auth_router.SETTINGS, "gmail_token_path", str(token_path))
+    monkeypatch.setattr(auth_router.SETTINGS, "gmail_redirect_uri", "http://localhost:3000/login")
+    monkeypatch.setattr(
+        auth_router,
+        "build_authorization_url",
+        lambda *args, **kwargs: (
+            "https://accounts.google.com/o/oauth2/test",
+            "state-456",
+            "frontend-verifier-2",
+        ),
+    )
+    monkeypatch.setattr(
+        auth_router,
+        "exchange_code_for_token",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        auth_router,
+        "_fetch_google_email",
+        lambda credentials: "linked.mailbox@gmail.com",
+    )
+
+    auth_url_response = client.get(
+        "/auth/gmail/url",
+        headers={
+            "Authorization": f"Bearer {owner_token}",
+            "Referer": "http://localhost:3000/login",
+        },
+    )
+    assert auth_url_response.status_code == 200
+
+    callback_response = client.post(
+        "/auth/gmail/callback",
+        json={"code": "demo-code", "state": "state-456"},
+        headers={
+            "Authorization": f"Bearer {owner_token}",
+            "Referer": "http://localhost:3000/login?code=demo-code",
+        },
+    )
+
+    assert callback_response.status_code == 200
+    payload = callback_response.json()
+    assert payload["user"]["email"] == "owner@example.com"
+
+    connection_response = client.get(
+        "/providers/gmail/connection",
+        headers={"Authorization": f"Bearer {owner_token}"},
+    )
+    assert connection_response.status_code == 200
+    assert connection_response.json()["status"] == "connected"
+    assert connection_response.json()["account_hint"] == "linked.mailbox@gmail.com"
 
 
 def test_frontend_gmail_auth_always_uses_login_redirect(monkeypatch, tmp_path):

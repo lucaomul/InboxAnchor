@@ -80,3 +80,24 @@ def test_incremental_triage_can_force_full_scan_even_with_checkpoint():
     assert provider.received_checkpoint is None
     assert result.sync_type == "full"
     assert result.total_emails == len(build_demo_emails())
+
+
+def test_incremental_triage_auto_starts_sender_warmup_on_first_live_like_full_run(monkeypatch):
+    class LiveLikeProvider(FakeEmailProvider):
+        provider_name = "gmail"
+
+    provider = LiveLikeProvider(build_demo_emails(), provider_name="gmail")
+    base_engine = TriageEngine(provider)
+    engine = IncrementalTriageEngine(base_engine, provider_name="gmail")
+    started: list[str] = []
+
+    monkeypatch.setattr(
+        engine,
+        "_start_sender_warmup",
+        lambda provider: started.append(provider.provider_name),
+    )
+
+    result = engine.run(dry_run=True, limit=10)
+
+    assert result.sync_type == "full"
+    assert started == ["gmail"]

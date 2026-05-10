@@ -22,6 +22,17 @@ class ProviderProfile(BaseModel):
     safety_notes: list[str] = Field(default_factory=list)
 
 
+class IMAPConnectionState(BaseModel):
+    host: str = ""
+    port: int = 993
+    username: str = ""
+    use_ssl: bool = True
+    mailbox: str = "INBOX"
+    archive_mailbox: str = ""
+    trash_mailbox: str = ""
+    password_configured: bool = False
+
+
 class ProviderConnectionState(BaseModel):
     provider: str
     status: str = "not_connected"
@@ -30,3 +41,4 @@ class ProviderConnectionState(BaseModel):
     dry_run_only: bool = True
     last_tested_at: Optional[datetime] = None
     notes: str = ""
+    imap: Optional[IMAPConnectionState] = None

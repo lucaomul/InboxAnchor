@@ -42,6 +42,10 @@ class Settings:
     llm_retry_max_delay_seconds: float = float(
         os.getenv("INBOXANCHOR_LLM_RETRY_MAX_DELAY_SECONDS", "30.0")
     )
+    use_smart_classifier: bool = _as_bool(
+        os.getenv("INBOXANCHOR_USE_SMART_CLASSIFIER"),
+        False,
+    )
     session_ttl_days: int = int(os.getenv("INBOXANCHOR_SESSION_TTL_DAYS", "30"))
     gmail_credentials_path: str = os.getenv("GMAIL_CREDENTIALS_PATH", "")
     gmail_token_path: str = os.getenv("GMAIL_TOKEN_PATH", "")
@@ -72,6 +76,23 @@ class Settings:
     )
     gmail_history_expiry_days: int = int(
         os.getenv("INBOXANCHOR_GMAIL_HISTORY_EXPIRY_DAYS", "7")
+    )
+    sender_warmup_months_back: int = int(
+        os.getenv("INBOXANCHOR_SENDER_WARMUP_MONTHS_BACK", "6")
+    )
+    sender_warmup_max_emails: int = int(
+        os.getenv("INBOXANCHOR_SENDER_WARMUP_MAX_EMAILS", "50000")
+    )
+    sender_warmup_batch_size: int = int(
+        os.getenv("INBOXANCHOR_SENDER_WARMUP_BATCH_SIZE", "500")
+    )
+    sender_warmup_auto_on_first_run: bool = _as_bool(
+        os.getenv("INBOXANCHOR_SENDER_WARMUP_AUTO_ON_FIRST_RUN"),
+        True,
+    )
+    gmail_watch_auto_renew: bool = _as_bool(
+        os.getenv("INBOXANCHOR_GMAIL_WATCH_AUTO_RENEW"),
+        True,
     )
     alias_managed_enabled: bool = _as_bool(
         os.getenv("INBOXANCHOR_ALIAS_MANAGED_ENABLED"),

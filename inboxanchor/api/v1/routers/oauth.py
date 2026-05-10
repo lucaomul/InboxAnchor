@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import secrets
+import tempfile
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
@@ -18,9 +20,10 @@ from inboxanchor.connectors.gmail_transport import (
 from inboxanchor.connectors.oauth_flow import build_authorization_url, exchange_code_for_token
 from inboxanchor.infra.database import session_scope
 from inboxanchor.infra.repository import InboxRepository
+from inboxanchor.infra.request_context import get_current_actor_email
 
 router = APIRouter(prefix="/oauth", tags=["oauth"])
-GMAIL_PKCE_REGISTRY: dict[str, str] = {}
+GMAIL_PKCE_REGISTRY: dict[str, dict[str, str] | str] = {}
 GMAIL_AUTH_SCOPES = [GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE, GMAIL_SETTINGS_BASIC_SCOPE]
 
 
@@ -31,6 +34,41 @@ def _resolve_token_path() -> str:
         credentials_path = Path(SETTINGS.gmail_credentials_path).expanduser()
         return str(credentials_path.with_name("token.json"))
     return ""
+
+
+def _token_data_dir() -> Path:
+    return Path(
+        os.getenv(
+            "INBOXANCHOR_DATA_DIR",
+            str(Path(tempfile.gettempdir()) / "inboxanchor"),
+        )
+    ).expanduser()
+
+
+def _safe_email_slug(email: str) -> str:
+    return (
+        email.strip()
+        .lower()
+        .replace("@", "__at__")
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace(":", "_")
+    )
+
+
+def _resolve_token_path_for_owner(owner_email: Optional[str]) -> str:
+    normalized_owner = (owner_email or "").strip().lower()
+    if normalized_owner:
+        token_dir = _token_data_dir() / "oauth" / _safe_email_slug(normalized_owner)
+        token_dir.mkdir(parents=True, exist_ok=True)
+        token_path = token_dir / "gmail_token.json"
+        if token_path.exists():
+            return str(token_path)
+        legacy_path = _resolve_token_path()
+        if legacy_path and Path(legacy_path).expanduser().exists():
+            return legacy_path
+        return str(token_path)
+    return _resolve_token_path()
 
 
 def _html_page(message: str, *, success: bool) -> HTMLResponse:
@@ -76,6 +114,7 @@ def gmail_oauth_start():
         )
 
     try:
+        owner_email = get_current_actor_email()
         auth_url, state, code_verifier = _normalize_auth_url_result(
             build_authorization_url(
                 str(credentials_path),
@@ -85,7 +124,10 @@ def gmail_oauth_start():
             )
         )
         if code_verifier:
-            GMAIL_PKCE_REGISTRY[state] = code_verifier
+            GMAIL_PKCE_REGISTRY[state] = {
+                "code_verifier": code_verifier,
+                "owner_email": owner_email or "",
+            }
     except Exception as error:
         return JSONResponse(
             status_code=400,
@@ -108,12 +150,20 @@ def gmail_oauth_callback(
     if not SETTINGS.gmail_credentials_path:
         return _html_page("GMAIL_CREDENTIALS_PATH is not configured.", success=False)
 
+    owner_email: Optional[str] = get_current_actor_email()
     token_path = _resolve_token_path()
     if not token_path:
         return _html_page("Unable to determine where token.json should be stored.", success=False)
 
     try:
-        code_verifier = GMAIL_PKCE_REGISTRY.pop(state, None) if state else None
+        pending = GMAIL_PKCE_REGISTRY.pop(state, None) if state else None
+        code_verifier: Optional[str]
+        if isinstance(pending, dict):
+            code_verifier = pending.get("code_verifier")
+            owner_email = owner_email or pending.get("owner_email") or None
+        else:
+            code_verifier = pending
+        token_path = _resolve_token_path_for_owner(owner_email)
         exchange_code_for_token(
             SETTINGS.gmail_credentials_path,
             token_path,
@@ -125,7 +175,7 @@ def gmail_oauth_callback(
         )
         with session_scope() as session:
             repository = InboxRepository(session)
-            current = repository.get_provider_connection("gmail")
+            current = repository.get_provider_connection("gmail", owner_email=owner_email)
             updated = current.model_copy(
                 update={
                     "status": "connected",
@@ -135,7 +185,7 @@ def gmail_oauth_callback(
                     "last_tested_at": datetime.now(timezone.utc),
                 }
             )
-            repository.save_provider_connection(updated)
+            repository.save_provider_connection(updated, owner_email=owner_email)
     except Exception as oauth_error:
         return _html_page(f"Gmail OAuth failed: {oauth_error}", success=False)
 

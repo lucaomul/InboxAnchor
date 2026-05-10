@@ -229,6 +229,39 @@ export interface ProviderConnectionState {
   dry_run_only: boolean;
   last_tested_at: string | null;
   notes: string;
+  imap?: ImapConnectionState | null;
+}
+
+export interface ImapConnectionState {
+  host: string;
+  port: number;
+  username: string;
+  use_ssl: boolean;
+  mailbox: string;
+  archive_mailbox: string;
+  trash_mailbox: string;
+  password_configured: boolean;
+}
+
+export interface ProviderConnectionSavePayload {
+  provider: string;
+  status: string;
+  account_hint: string;
+  sync_enabled: boolean;
+  dry_run_only: boolean;
+  last_tested_at?: string | null;
+  notes: string;
+  imap?: {
+    host: string;
+    port: number;
+    username: string;
+    password?: string;
+    use_ssl: boolean;
+    mailbox: string;
+    archive_mailbox: string;
+    trash_mailbox: string;
+    clear_password?: boolean;
+  } | null;
 }
 
 export async function fetchProviderConnection(provider: string): Promise<ProviderConnectionState> {
@@ -237,7 +270,7 @@ export async function fetchProviderConnection(provider: string): Promise<Provide
 
 export async function saveProviderConnection(
   provider: string,
-  payload: ProviderConnectionState,
+  payload: ProviderConnectionSavePayload,
 ): Promise<ProviderConnectionState> {
   return apiFetch<ProviderConnectionState>(`/providers/${provider}/connection`, {
     method: "PUT",

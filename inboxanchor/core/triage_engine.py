@@ -44,6 +44,7 @@ class TriageEngine:
         safety_verifier: Optional[SafetyVerifierAgent] = None,
         rules_engine: Optional[RulesEngine] = None,
         audit_logger: Optional[AuditLogger] = None,
+        use_smart_classifier: bool = False,
     ):
         self.provider = provider
         self.classifier = classifier or ClassifierAgent()
@@ -54,6 +55,7 @@ class TriageEngine:
         self.safety_verifier = safety_verifier or SafetyVerifierAgent()
         self.rules_engine = rules_engine or RulesEngine()
         self.audit_logger = audit_logger or AuditLogger()
+        self.use_smart_classifier = use_smart_classifier
 
     def run(
         self,
@@ -130,9 +132,18 @@ class TriageEngine:
             for email in batch:
                 scanned_emails += 1
                 intelligence = sender_intelligence.resolve(email)
+                base_classification = (
+                    self.classifier.classify_smart(
+                        email,
+                        sender_profile=intelligence.sender_profile,
+                        domain_profile=intelligence.domain_profile,
+                    )
+                    if self.use_smart_classifier
+                    else self.classifier.classify(email, intelligence=intelligence)
+                )
                 classification = self.priority_agent.prioritize(
                     email,
-                    self.classifier.classify(email, intelligence=intelligence),
+                    base_classification,
                 )
                 sender_intelligence.observe(email, context=intelligence)
                 if category_filters and classification.category not in category_filters:

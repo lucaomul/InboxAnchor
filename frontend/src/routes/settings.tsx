@@ -33,6 +33,45 @@ export const Route = createFileRoute("/settings")({
   component: SettingsPage,
 });
 
+type ImapProvider = "yahoo" | "outlook" | "imap";
+
+const IMAP_PROVIDER_DEFAULTS: Record<
+  ImapProvider,
+  {
+    host: string;
+    port: number;
+    use_ssl: boolean;
+    mailbox: string;
+    archive_mailbox: string;
+    trash_mailbox: string;
+  }
+> = {
+  yahoo: {
+    host: "imap.mail.yahoo.com",
+    port: 993,
+    use_ssl: true,
+    mailbox: "INBOX",
+    archive_mailbox: "Archive",
+    trash_mailbox: "Trash",
+  },
+  outlook: {
+    host: "outlook.office365.com",
+    port: 993,
+    use_ssl: true,
+    mailbox: "INBOX",
+    archive_mailbox: "Archive",
+    trash_mailbox: "Deleted Items",
+  },
+  imap: {
+    host: "",
+    port: 993,
+    use_ssl: true,
+    mailbox: "INBOX",
+    archive_mailbox: "Archive",
+    trash_mailbox: "Trash",
+  },
+};
+
 function SettingsPage() {
   const [apiUrl, setApiUrlState] = useState("");
   const [saved, setSaved] = useState(false);
@@ -40,6 +79,24 @@ function SettingsPage() {
   const [gmailAccountHint, setGmailAccountHint] = useState("");
   const [gmailLoading, setGmailLoading] = useState(false);
   const [gmailError, setGmailError] = useState("");
+  const [imapProvider, setImapProvider] = useState<ImapProvider>("yahoo");
+  const [imapConnected, setImapConnected] = useState(false);
+  const [imapAccountHint, setImapAccountHint] = useState("");
+  const [imapLoading, setImapLoading] = useState(false);
+  const [imapError, setImapError] = useState("");
+  const [imapHost, setImapHost] = useState(IMAP_PROVIDER_DEFAULTS.yahoo.host);
+  const [imapPort, setImapPort] = useState(String(IMAP_PROVIDER_DEFAULTS.yahoo.port));
+  const [imapUsername, setImapUsername] = useState("");
+  const [imapPassword, setImapPassword] = useState("");
+  const [imapUseSsl, setImapUseSsl] = useState(IMAP_PROVIDER_DEFAULTS.yahoo.use_ssl);
+  const [imapMailbox, setImapMailbox] = useState(IMAP_PROVIDER_DEFAULTS.yahoo.mailbox);
+  const [imapArchiveMailbox, setImapArchiveMailbox] = useState(
+    IMAP_PROVIDER_DEFAULTS.yahoo.archive_mailbox,
+  );
+  const [imapTrashMailbox, setImapTrashMailbox] = useState(
+    IMAP_PROVIDER_DEFAULTS.yahoo.trash_mailbox,
+  );
+  const [imapPasswordConfigured, setImapPasswordConfigured] = useState(false);
   const [apiError, setApiError] = useState("");
   const [webhookStatus, setWebhookStatus] = useState<string | null>(null);
   const [webhookLoading, setWebhookLoading] = useState(false);
@@ -78,6 +135,7 @@ function SettingsPage() {
     setApiUrlState(currentApiUrl);
     if (currentApiUrl) {
       void loadGmailConnection();
+      void loadImapConnection("yahoo");
       void loadAliases();
     }
   }, []);
@@ -102,11 +160,18 @@ function SettingsPage() {
         .catch((err) => setGmailError(err.message))
         .finally(async () => {
           await loadGmailConnection();
+          await loadImapConnection(imapProvider);
           await loadAliases();
           setGmailLoading(false);
         });
     }
   }, []);
+
+  useEffect(() => {
+    if (getApiUrl()) {
+      void loadImapConnection(imapProvider);
+    }
+  }, [imapProvider]);
 
   const loadGmailConnection = async () => {
     try {
@@ -116,6 +181,38 @@ function SettingsPage() {
     } catch {
       setGmailConnected(false);
       setGmailAccountHint("");
+    }
+  };
+
+  const loadImapConnection = async (provider: ImapProvider) => {
+    const defaults = IMAP_PROVIDER_DEFAULTS[provider];
+    try {
+      const connection = await fetchProviderConnection(provider);
+      const imap = connection.imap;
+      setImapConnected(connection.status === "connected");
+      setImapAccountHint(connection.account_hint || imap?.username || "");
+      setImapHost(imap?.host || defaults.host);
+      setImapPort(String(imap?.port || defaults.port));
+      setImapUsername(imap?.username || "");
+      setImapUseSsl(imap?.use_ssl ?? defaults.use_ssl);
+      setImapMailbox(imap?.mailbox || defaults.mailbox);
+      setImapArchiveMailbox(imap?.archive_mailbox || defaults.archive_mailbox);
+      setImapTrashMailbox(imap?.trash_mailbox || defaults.trash_mailbox);
+      setImapPassword("");
+      setImapPasswordConfigured(Boolean(imap?.password_configured));
+      setImapError("");
+    } catch {
+      setImapConnected(false);
+      setImapAccountHint("");
+      setImapHost(defaults.host);
+      setImapPort(String(defaults.port));
+      setImapUsername("");
+      setImapPassword("");
+      setImapUseSsl(defaults.use_ssl);
+      setImapMailbox(defaults.mailbox);
+      setImapArchiveMailbox(defaults.archive_mailbox);
+      setImapTrashMailbox(defaults.trash_mailbox);
+      setImapPasswordConfigured(false);
     }
   };
 
@@ -150,6 +247,7 @@ function SettingsPage() {
       setSaved(true);
       toast.success("API URL saved");
       void loadGmailConnection();
+      void loadImapConnection(imapProvider);
       void loadAliases();
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
@@ -223,6 +321,97 @@ function SettingsPage() {
       setGmailError(err instanceof Error ? err.message : "Unable to disconnect Gmail");
     } finally {
       setGmailLoading(false);
+    }
+  };
+
+  const handleConnectImap = async () => {
+    if (!imapUsername.trim()) {
+      setImapError("Enter the mailbox username or full Yahoo email address first.");
+      toast.error("Yahoo / IMAP username is required");
+      return;
+    }
+    if (!imapPassword.trim() && !imapPasswordConfigured) {
+      setImapError("Enter the Yahoo app password or IMAP password first.");
+      toast.error("Yahoo / IMAP password is required");
+      return;
+    }
+
+    setImapLoading(true);
+    setImapError("");
+    try {
+      await saveProviderConnection(imapProvider, {
+        provider: imapProvider,
+        status: "connected",
+        account_hint: imapUsername.trim(),
+        sync_enabled: true,
+        dry_run_only: false,
+        notes: `${imapProvider} mailbox connected from the InboxAnchor settings workspace.`,
+        imap: {
+          host: imapHost.trim(),
+          port: Number(imapPort) || 993,
+          username: imapUsername.trim(),
+          password: imapPassword,
+          use_ssl: imapUseSsl,
+          mailbox: imapMailbox.trim() || "INBOX",
+          archive_mailbox: imapArchiveMailbox.trim(),
+          trash_mailbox: imapTrashMailbox.trim(),
+        },
+      });
+      const workspace = await fetchWorkspaceSettings();
+      if (workspace.preferred_provider !== imapProvider) {
+        await saveWorkspaceSettings({
+          ...workspace,
+          preferred_provider: imapProvider,
+        });
+      }
+      await loadImapConnection(imapProvider);
+      setImapPassword("");
+      toast.success(
+        `${imapProvider === "yahoo" ? "Yahoo" : imapProvider === "outlook" ? "Outlook" : "IMAP"} account connected`,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unable to save IMAP credentials";
+      setImapError(message);
+      toast.error(message);
+    } finally {
+      setImapLoading(false);
+    }
+  };
+
+  const handleDisconnectImap = async () => {
+    setImapLoading(true);
+    setImapError("");
+    try {
+      await saveProviderConnection(imapProvider, {
+        provider: imapProvider,
+        status: "configured",
+        account_hint: "",
+        sync_enabled: false,
+        dry_run_only: true,
+        notes: `${imapProvider} mailbox disconnected from the InboxAnchor settings workspace.`,
+        imap: {
+          host: imapHost.trim(),
+          port: Number(imapPort) || 993,
+          username: "",
+          password: "",
+          clear_password: true,
+          use_ssl: imapUseSsl,
+          mailbox: imapMailbox.trim() || "INBOX",
+          archive_mailbox: imapArchiveMailbox.trim(),
+          trash_mailbox: imapTrashMailbox.trim(),
+        },
+      });
+      await loadImapConnection(imapProvider);
+      setImapPassword("");
+      toast.success(
+        `${imapProvider === "yahoo" ? "Yahoo" : imapProvider === "outlook" ? "Outlook" : "IMAP"} account disconnected`,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unable to disconnect IMAP provider";
+      setImapError(message);
+      toast.error(message);
+    } finally {
+      setImapLoading(false);
     }
   };
 
@@ -440,6 +629,154 @@ function SettingsPage() {
             )}
             {!apiUrl && !gmailConnected && (
               <p className="text-xs text-warning">Set the API URL above first to enable Gmail connection.</p>
+            )}
+          </section>
+
+          <section className="rounded-lg border border-border bg-card p-5 space-y-4">
+            <div className="flex items-center gap-2">
+              <Mail className="w-5 h-5 text-primary" />
+              <h2 className="text-sm font-semibold text-foreground">Yahoo / IMAP Account</h2>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Connect a Yahoo, Outlook, or generic IMAP inbox per InboxAnchor user. This path is separate from Gmail OAuth and no longer depends on the shared Gmail workspace account.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {([
+                { value: "yahoo", label: "Yahoo" },
+                { value: "outlook", label: "Outlook" },
+                { value: "imap", label: "Generic IMAP" },
+              ] as const).map((item) => (
+                <Button
+                  key={item.value}
+                  type="button"
+                  size="sm"
+                  variant={imapProvider === item.value ? "default" : "outline"}
+                  onClick={() => setImapProvider(item.value)}
+                  disabled={imapLoading}
+                >
+                  {item.label}
+                </Button>
+              ))}
+            </div>
+
+            {imapError && (
+              <div className="rounded-md bg-destructive/10 border border-destructive/30 p-3">
+                <p className="text-xs text-destructive">{imapError}</p>
+              </div>
+            )}
+
+            {imapConnected ? (
+              <div className="flex items-center justify-between rounded-md bg-safe/10 border border-safe/30 p-3">
+                <div className="flex items-center gap-2">
+                  <CheckCircle className="w-4 h-4 text-safe" />
+                  <div>
+                    <span className="text-sm text-foreground">
+                      {imapProvider === "yahoo" ? "Yahoo" : imapProvider === "outlook" ? "Outlook" : "IMAP"} connected
+                    </span>
+                    {imapAccountHint && (
+                      <p className="text-[11px] text-muted-foreground">{imapAccountHint}</p>
+                    )}
+                  </div>
+                  <Badge variant="safe" className="text-[10px]">Active</Badge>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={handleDisconnectImap}
+                  className="text-muted-foreground"
+                  disabled={imapLoading}
+                >
+                  <LogOut className="w-3.5 h-3.5 mr-1" />
+                  Disconnect
+                </Button>
+              </div>
+            ) : null}
+
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-1">
+                <p className="text-[11px] font-medium text-foreground">IMAP host</p>
+                <Input
+                  value={imapHost}
+                  onChange={(e) => setImapHost(e.target.value)}
+                  placeholder="imap.mail.yahoo.com"
+                />
+              </div>
+              <div className="space-y-1">
+                <p className="text-[11px] font-medium text-foreground">Port</p>
+                <Input
+                  value={imapPort}
+                  onChange={(e) => setImapPort(e.target.value)}
+                  placeholder="993"
+                />
+              </div>
+              <div className="space-y-1 sm:col-span-2">
+                <p className="text-[11px] font-medium text-foreground">Mailbox username</p>
+                <Input
+                  value={imapUsername}
+                  onChange={(e) => setImapUsername(e.target.value)}
+                  placeholder="your@yahoo.com"
+                />
+              </div>
+              <div className="space-y-1 sm:col-span-2">
+                <p className="text-[11px] font-medium text-foreground">
+                  App password
+                  {imapPasswordConfigured ? " (saved already, leave blank to keep it)" : ""}
+                </p>
+                <Input
+                  type="password"
+                  value={imapPassword}
+                  onChange={(e) => setImapPassword(e.target.value)}
+                  placeholder={imapProvider === "yahoo" ? "Yahoo app password" : "IMAP password or app password"}
+                />
+              </div>
+              <div className="space-y-1">
+                <p className="text-[11px] font-medium text-foreground">Mailbox</p>
+                <Input value={imapMailbox} onChange={(e) => setImapMailbox(e.target.value)} placeholder="INBOX" />
+              </div>
+              <div className="space-y-1">
+                <p className="text-[11px] font-medium text-foreground">Archive mailbox</p>
+                <Input
+                  value={imapArchiveMailbox}
+                  onChange={(e) => setImapArchiveMailbox(e.target.value)}
+                  placeholder="Archive"
+                />
+              </div>
+              <div className="space-y-1">
+                <p className="text-[11px] font-medium text-foreground">Trash mailbox</p>
+                <Input
+                  value={imapTrashMailbox}
+                  onChange={(e) => setImapTrashMailbox(e.target.value)}
+                  placeholder="Trash"
+                />
+              </div>
+              <label className="flex items-center gap-2 rounded-md border border-border px-3 py-2 text-xs text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={imapUseSsl}
+                  onChange={(e) => setImapUseSsl(e.target.checked)}
+                />
+                Use SSL
+              </label>
+            </div>
+
+            <div className="rounded-md border border-border bg-secondary/30 p-3 text-[11px] leading-5 text-muted-foreground">
+              Yahoo usually requires an app password from Yahoo Account Security. InboxAnchor stores that secret only in the owner-scoped backend credential store and does not send it back into the UI after save.
+            </div>
+
+            <Button
+              onClick={handleConnectImap}
+              disabled={imapLoading || !apiUrl || !authEmail}
+              className="w-full"
+            >
+              {imapLoading
+                ? "Saving mailbox credentials..."
+                : `Connect ${imapProvider === "yahoo" ? "Yahoo" : imapProvider === "outlook" ? "Outlook" : "IMAP"} Account`}
+            </Button>
+            {!authEmail && (
+              <p className="text-xs text-warning">Sign in to InboxAnchor first so this mailbox connection stays isolated to your account.</p>
+            )}
+            {!apiUrl && (
+              <p className="text-xs text-warning">Set the API URL above first to enable Yahoo / IMAP connection.</p>
             )}
           </section>
 

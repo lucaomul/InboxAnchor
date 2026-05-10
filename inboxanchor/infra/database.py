@@ -257,6 +257,24 @@ class ProviderConnectionORM(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class UserProviderConnectionORM(Base):
+    __tablename__ = "user_provider_connections"
+
+    owner_email: Mapped[str] = mapped_column(String(255), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), primary_key=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class UserProviderSecretORM(Base):
+    __tablename__ = "user_provider_secrets"
+
+    owner_email: Mapped[str] = mapped_column(String(255), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), primary_key=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class ProviderCheckpointORM(Base):
     __tablename__ = "provider_checkpoints"
 
@@ -265,9 +283,28 @@ class ProviderCheckpointORM(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class UserProviderCheckpointORM(Base):
+    __tablename__ = "user_provider_checkpoints"
+
+    owner_email: Mapped[str] = mapped_column(String(255), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), primary_key=True)
+    checkpoint_value: Mapped[str] = mapped_column(String(255))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class ProviderSyncStateORM(Base):
     __tablename__ = "provider_sync_states"
 
+    provider: Mapped[str] = mapped_column(String(32), primary_key=True)
+    sync_kind: Mapped[str] = mapped_column(String(64), primary_key=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class UserProviderSyncStateORM(Base):
+    __tablename__ = "user_provider_sync_states"
+
+    owner_email: Mapped[str] = mapped_column(String(255), primary_key=True)
     provider: Mapped[str] = mapped_column(String(32), primary_key=True)
     sync_kind: Mapped[str] = mapped_column(String(64), primary_key=True)
     payload: Mapped[dict] = mapped_column(JSON, default=dict)

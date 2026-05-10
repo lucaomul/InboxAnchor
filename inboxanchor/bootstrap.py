@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -11,8 +13,10 @@ from inboxanchor.connectors import FakeEmailProvider, GmailClient, IMAPEmailClie
 from inboxanchor.core import IncrementalTriageEngine, TriageEngine
 from inboxanchor.infra.database import init_db, session_scope
 from inboxanchor.infra.repository import InboxRepository
+from inboxanchor.infra.request_context import get_current_actor_email
 from inboxanchor.models import (
     EmailMessage,
+    IMAPConnectionState,
     ProviderConnectionState,
     ProviderProfile,
     WorkspaceSettings,
@@ -223,15 +227,59 @@ def _provider_has_live_connection(state: ProviderConnectionState) -> bool:
     return state.status in {"configured", "connected"} and state.sync_enabled
 
 
-def _load_provider_connection_state(provider_name: str) -> ProviderConnectionState:
+def _load_provider_connection_state(
+    provider_name: str,
+    *,
+    owner_email: Optional[str] = None,
+) -> ProviderConnectionState:
     try:
         with session_scope() as session:
-            return InboxRepository(session).get_provider_connection(provider_name)
+            return InboxRepository(session).get_provider_connection(
+                provider_name,
+                owner_email=owner_email,
+            )
     except Exception:
         return ProviderConnectionState(provider=provider_name)
 
 
-def _gmail_token_path() -> str:
+def _data_dir() -> Path:
+    return Path(
+        os.getenv(
+            "INBOXANCHOR_DATA_DIR",
+            str(Path(tempfile.gettempdir()) / "inboxanchor"),
+        )
+    ).expanduser()
+
+
+def _safe_email_slug(email: str) -> str:
+    return (
+        email.strip()
+        .lower()
+        .replace("@", "__at__")
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace(":", "_")
+    )
+
+
+def _gmail_token_path(owner_email: Optional[str] = None) -> str:
+    normalized_owner = (owner_email or "").strip().lower()
+    if normalized_owner:
+        token_dir = _data_dir() / "oauth" / _safe_email_slug(normalized_owner)
+        token_dir.mkdir(parents=True, exist_ok=True)
+        token_path = token_dir / "gmail_token.json"
+        if token_path.exists():
+            return str(token_path)
+        if SETTINGS.gmail_token_path:
+            legacy = Path(SETTINGS.gmail_token_path).expanduser()
+            if legacy.exists():
+                return str(legacy)
+        if SETTINGS.gmail_credentials_path:
+            credentials_path = Path(SETTINGS.gmail_credentials_path).expanduser()
+            legacy = credentials_path.with_name("token.json")
+            if legacy.exists():
+                return str(legacy)
+        return str(token_path)
     if SETTINGS.gmail_token_path:
         return SETTINGS.gmail_token_path
     if SETTINGS.gmail_credentials_path:
@@ -250,27 +298,79 @@ def _imap_host_for_provider(provider_name: str) -> str:
     return defaults.get(provider_name, "")
 
 
-def _provider_can_run_live(provider_name: str, state: ProviderConnectionState) -> bool:
+def _load_provider_secret(
+    provider_name: str,
+    *,
+    owner_email: Optional[str] = None,
+) -> dict:
+    try:
+        with session_scope() as session:
+            return InboxRepository(session).get_provider_secret(
+                provider_name,
+                owner_email=owner_email,
+            )
+    except Exception:
+        return {}
+
+
+def _resolved_imap_state(
+    provider_name: str,
+    state: ProviderConnectionState,
+    *,
+    owner_email: Optional[str] = None,
+) -> IMAPConnectionState:
+    stored = state.imap or IMAPConnectionState()
+    secret = _load_provider_secret(provider_name, owner_email=owner_email)
+    return IMAPConnectionState(
+        host=stored.host or _imap_host_for_provider(provider_name),
+        port=stored.port or SETTINGS.imap_port,
+        username=stored.username or SETTINGS.imap_username,
+        use_ssl=stored.use_ssl if state.imap is not None else SETTINGS.imap_use_ssl,
+        mailbox=stored.mailbox or SETTINGS.imap_mailbox,
+        archive_mailbox=stored.archive_mailbox or SETTINGS.imap_archive_mailbox,
+        trash_mailbox=stored.trash_mailbox or SETTINGS.imap_trash_mailbox,
+        password_configured=bool(secret.get("password") or SETTINGS.imap_password),
+    )
+
+
+def _resolved_imap_password(
+    provider_name: str,
+    *,
+    owner_email: Optional[str] = None,
+) -> str:
+    secret = _load_provider_secret(provider_name, owner_email=owner_email)
+    return str(secret.get("password") or SETTINGS.imap_password or "")
+
+
+def _provider_can_run_live(
+    provider_name: str,
+    state: ProviderConnectionState,
+    *,
+    owner_email: Optional[str] = None,
+) -> bool:
     if provider_name == "gmail":
+        token_path = _gmail_token_path(owner_email)
         return bool(
             SETTINGS.gmail_credentials_path
-            and (SETTINGS.gmail_token_path or SETTINGS.gmail_credentials_path)
-            and (_provider_has_live_connection(state) or SETTINGS.gmail_credentials_path)
+            and token_path
+            and (_provider_has_live_connection(state) or Path(token_path).expanduser().exists())
         )
     if provider_name in IMAP_FAMILY_PROVIDERS:
+        imap_state = _resolved_imap_state(provider_name, state, owner_email=owner_email)
+        password = _resolved_imap_password(provider_name, owner_email=owner_email)
         return bool(
-            SETTINGS.imap_username
-            and SETTINGS.imap_password
-            and _imap_host_for_provider(provider_name)
-            and (_provider_has_live_connection(state) or SETTINGS.imap_username)
+            imap_state.username
+            and password
+            and imap_state.host
+            and (_provider_has_live_connection(state) or imap_state.username)
         )
     return provider_name == "fake"
 
 
-def _build_live_gmail_provider():
+def _build_live_gmail_provider(owner_email: Optional[str] = None):
     from inboxanchor.connectors.gmail_transport import GoogleAPITransport
 
-    token_path = _gmail_token_path()
+    token_path = _gmail_token_path(owner_email)
     return GmailClient(
         transport=GoogleAPITransport(
             credentials_path=SETTINGS.gmail_credentials_path,
@@ -279,36 +379,46 @@ def _build_live_gmail_provider():
     )
 
 
-def _build_live_imap_provider(provider_name: str):
+def _build_live_imap_provider(
+    provider_name: str,
+    state: ProviderConnectionState,
+    *,
+    owner_email: Optional[str] = None,
+):
+    imap_state = _resolved_imap_state(provider_name, state, owner_email=owner_email)
     return ImaplibTransport(
-        host=_imap_host_for_provider(provider_name),
-        port=SETTINGS.imap_port,
-        username=SETTINGS.imap_username,
-        password=SETTINGS.imap_password,
-        use_ssl=SETTINGS.imap_use_ssl,
-        mailbox=SETTINGS.imap_mailbox,
+        host=imap_state.host,
+        port=imap_state.port,
+        username=imap_state.username,
+        password=_resolved_imap_password(provider_name, owner_email=owner_email),
+        use_ssl=imap_state.use_ssl,
+        mailbox=imap_state.mailbox,
         provider_name=provider_name,
-        archive_mailbox=SETTINGS.imap_archive_mailbox or None,
-        trash_mailbox=SETTINGS.imap_trash_mailbox or None,
+        archive_mailbox=imap_state.archive_mailbox or None,
+        trash_mailbox=imap_state.trash_mailbox or None,
     )
 
 
-def build_provider(provider_name: Optional[str] = None):
+def build_provider(provider_name: Optional[str] = None, *, owner_email: Optional[str] = None):
     provider_name = (provider_name or SETTINGS.default_provider).lower()
     demo_emails = build_demo_emails()
-    state = _load_provider_connection_state(provider_name)
+    state = _load_provider_connection_state(provider_name, owner_email=owner_email)
 
     if provider_name == "gmail":
-        if _provider_can_run_live(provider_name, state):
+        if _provider_can_run_live(provider_name, state, owner_email=owner_email):
             try:
-                return _build_live_gmail_provider()
+                return _build_live_gmail_provider(owner_email)
             except Exception as error:  # pragma: no cover - optional dependencies/env-driven
                 logger.warning("Falling back to Gmail preview provider: %s", error)
         return FakeEmailProvider(demo_emails, provider_name="gmail")
     if provider_name in IMAP_FAMILY_PROVIDERS:
-        if _provider_can_run_live(provider_name, state):
+        if _provider_can_run_live(provider_name, state, owner_email=owner_email):
             try:
-                return _build_live_imap_provider(provider_name)
+                return _build_live_imap_provider(
+                    provider_name,
+                    state,
+                    owner_email=owner_email,
+                )
             except Exception as error:  # pragma: no cover - env-driven
                 logger.warning(
                     "Falling back to IMAP preview provider for %s: %s",
@@ -325,9 +435,11 @@ def build_provider(provider_name: Optional[str] = None):
 def _runtime_profile(profile: ProviderProfile) -> ProviderProfile:
     if profile.slug == "fake":
         return profile
+    owner_email = get_current_actor_email()
     live_ready = _provider_can_run_live(
         profile.slug,
-        _load_provider_connection_state(profile.slug),
+        _load_provider_connection_state(profile.slug, owner_email=owner_email),
+        owner_email=owner_email,
     )
     status = "live-ready" if live_ready else profile.status
     return profile.model_copy(update={"live_ready": live_ready, "status": status})
@@ -343,16 +455,19 @@ def get_provider_profile(provider_name: Optional[str]) -> ProviderProfile:
 
 
 class InboxAnchorService:
-    def __init__(self, provider_name: Optional[str] = None):
+    def __init__(self, provider_name: Optional[str] = None, *, owner_email: Optional[str] = None):
         init_db()
-        self.provider = build_provider(provider_name)
+        self.owner_email = (owner_email or get_current_actor_email() or "").strip().lower() or None
+        self.provider = build_provider(provider_name, owner_email=self.owner_email)
         base_engine = TriageEngine(
             self.provider,
             safety_verifier=SafetyVerifierAgent(),
+            use_smart_classifier=SETTINGS.use_smart_classifier,
         )
         self.engine = IncrementalTriageEngine(
             base_engine,
             provider_name=self.provider.provider_name,
+            owner_email=self.owner_email,
         )
         self.approvals: dict[str, set[str]] = {}
 
@@ -366,14 +481,34 @@ class InboxAnchorService:
 
     def load_provider_connection(self, provider: str) -> ProviderConnectionState:
         with session_scope() as session:
-            return InboxRepository(session).get_provider_connection(provider)
+            state = InboxRepository(session).get_provider_connection(
+                provider,
+                owner_email=self.owner_email,
+            )
+        if provider in IMAP_FAMILY_PROVIDERS:
+            return state.model_copy(
+                update={
+                    "imap": _resolved_imap_state(
+                        provider,
+                        state,
+                        owner_email=self.owner_email,
+                    )
+                }
+            )
+        return state
 
     def save_provider_connection(
         self,
         state: ProviderConnectionState,
     ) -> ProviderConnectionState:
         with session_scope() as session:
-            return InboxRepository(session).save_provider_connection(state)
+            saved = InboxRepository(session).save_provider_connection(
+                state,
+                owner_email=self.owner_email,
+            )
+        if state.provider in IMAP_FAMILY_PROVIDERS:
+            return self.load_provider_connection(state.provider)
+        return saved
 
     def approve(self, run_id: str, email_ids: list[str]) -> list[str]:
         approved = self.approvals.setdefault(run_id, set())

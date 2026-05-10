@@ -24,8 +24,13 @@ from inboxanchor.infra.database import (
     RecommendationORM,
     SenderProfileORM,
     TriageRunORM,
+    UserProviderCheckpointORM,
+    UserProviderConnectionORM,
+    UserProviderSecretORM,
+    UserProviderSyncStateORM,
     WorkspaceSettingsORM,
 )
+from inboxanchor.infra.request_context import get_current_actor_email
 from inboxanchor.infra.text_normalizer import normalize_email_body_text
 from inboxanchor.models import (
     AuditLogEntry,
@@ -51,6 +56,27 @@ from inboxanchor.sender_intelligence import (
 class InboxRepository:
     def __init__(self, session):
         self.session = session
+        self._current_actor_email = self._normalize_owner_email(get_current_actor_email())
+
+    def _effective_owner_email(self, owner_email: Optional[str] = None) -> Optional[str]:
+        return self._normalize_owner_email(owner_email) or self._current_actor_email
+
+    def _scoped_provider_key(self, provider: str, *, owner_email: Optional[str] = None) -> str:
+        normalized_owner = self._effective_owner_email(owner_email)
+        if not normalized_owner:
+            return provider
+        return f"user:{normalized_owner}::{provider}"
+
+    @staticmethod
+    def _logical_provider_key(provider: str) -> str:
+        if provider.startswith("user:") and "::" in provider:
+            return provider.rsplit("::", 1)[-1]
+        return provider
+
+    def _actor_run_provider_prefix(self) -> Optional[str]:
+        if not self._current_actor_email:
+            return None
+        return f"user:{self._current_actor_email}::"
 
     def _run_email_details_query(
         self,
@@ -100,7 +126,7 @@ class InboxRepository:
     @staticmethod
     def _mailbox_email_payload(row: MailboxEmailORM) -> dict:
         return {
-            "provider": row.provider,
+            "provider": InboxRepository._logical_provider_key(row.provider),
             "email_id": row.email_id,
             "thread_id": row.thread_id,
             "sender": row.sender,
@@ -162,14 +188,14 @@ class InboxRepository:
     @staticmethod
     def _sender_profile_payload(row: SenderProfileORM) -> dict:
         payload = dict(row.payload or {})
-        payload["provider"] = row.provider
+        payload["provider"] = InboxRepository._logical_provider_key(row.provider)
         payload["sender_address"] = row.sender_address
         return payload
 
     @staticmethod
     def _domain_profile_payload(row: DomainProfileORM) -> dict:
         payload = dict(row.payload or {})
-        payload["provider"] = row.provider
+        payload["provider"] = InboxRepository._logical_provider_key(row.provider)
         payload["domain"] = row.domain
         return payload
 
@@ -226,10 +252,11 @@ class InboxRepository:
         classifications = persisted_classifications or result.classifications
         action_items = persisted_action_items or result.action_items
         recommendations = persisted_recommendations or result.recommendations
+        scoped_provider = self._scoped_provider_key(result.provider)
 
         run = TriageRunORM(
             run_id=result.run_id,
-            provider=result.provider,
+            provider=scoped_provider,
             dry_run=result.dry_run,
             total_emails=result.total_emails,
             digest_summary=result.digest.summary,
@@ -324,7 +351,11 @@ class InboxRepository:
     def get_latest_run_id(self, provider: Optional[str] = None) -> Optional[str]:
         query = self.session.query(TriageRunORM)
         if provider:
-            query = query.filter(TriageRunORM.provider == provider)
+            query = query.filter(TriageRunORM.provider == self._scoped_provider_key(provider))
+        else:
+            actor_prefix = self._actor_run_provider_prefix()
+            if actor_prefix:
+                query = query.filter(TriageRunORM.provider.like(f"{actor_prefix}%"))
         row = query.order_by(TriageRunORM.started_at.desc()).first()
         return row.run_id if row else None
 
@@ -332,10 +363,11 @@ class InboxRepository:
         address = sender_address(sender)
         if not address:
             return None
+        provider_key = self._scoped_provider_key(provider)
         row = (
             self.session.query(SenderProfileORM)
             .filter(
-                SenderProfileORM.provider == provider,
+                SenderProfileORM.provider == provider_key,
                 SenderProfileORM.sender_address == address,
             )
             .first()
@@ -346,31 +378,54 @@ class InboxRepository:
         normalized = (domain or "").strip().lower()
         if not normalized:
             return None
+        provider_key = self._scoped_provider_key(provider)
         row = (
             self.session.query(DomainProfileORM)
             .filter(
-                DomainProfileORM.provider == provider,
+                DomainProfileORM.provider == provider_key,
                 DomainProfileORM.domain == normalized,
             )
             .first()
         )
         return self._domain_profile_payload(row) if row else None
 
+    def count_sender_profiles(self, provider: str) -> int:
+        provider_key = self._scoped_provider_key(provider)
+        return (
+            self.session.query(SenderProfileORM)
+            .filter(SenderProfileORM.provider == provider_key)
+            .count()
+        )
+
+    def observe_sender_intelligence(
+        self,
+        provider: str,
+        email,
+        *,
+        count_message: bool = True,
+    ) -> None:
+        self._observe_sender_intelligence(
+            provider,
+            email,
+            count_message=count_message,
+        )
+
     def _observe_sender_intelligence(self, provider: str, email, *, count_message: bool) -> None:
+        provider_key = self._scoped_provider_key(provider)
         address = sender_address(email.sender)
         domain = sender_domain(email.sender)
         if address:
             sender_row = (
                 self.session.query(SenderProfileORM)
                 .filter(
-                    SenderProfileORM.provider == provider,
+                    SenderProfileORM.provider == provider_key,
                     SenderProfileORM.sender_address == address,
                 )
                 .first()
             )
             sender_payload = observe_profile_email(
                 self._sender_profile_payload(sender_row) if sender_row else None,
-                provider=provider,
+                provider=provider_key,
                 email=email,
                 profile_kind="sender",
                 count_message=count_message,
@@ -378,7 +433,7 @@ class InboxRepository:
             if sender_row is None:
                 self.session.add(
                     SenderProfileORM(
-                        provider=provider,
+                        provider=provider_key,
                         sender_address=address,
                         payload=sender_payload,
                         updated_at=datetime.now(timezone.utc),
@@ -392,14 +447,14 @@ class InboxRepository:
             domain_row = (
                 self.session.query(DomainProfileORM)
                 .filter(
-                    DomainProfileORM.provider == provider,
+                    DomainProfileORM.provider == provider_key,
                     DomainProfileORM.domain == domain,
                 )
                 .first()
             )
             domain_payload = observe_profile_email(
                 self._domain_profile_payload(domain_row) if domain_row else None,
-                provider=provider,
+                provider=provider_key,
                 email=email,
                 profile_kind="domain",
                 count_message=count_message,
@@ -407,7 +462,7 @@ class InboxRepository:
             if domain_row is None:
                 self.session.add(
                     DomainProfileORM(
-                        provider=provider,
+                        provider=provider_key,
                         domain=domain,
                         payload=domain_payload,
                         updated_at=datetime.now(timezone.utc),
@@ -418,10 +473,11 @@ class InboxRepository:
                 domain_row.updated_at = datetime.now(timezone.utc)
 
     def upsert_mailbox_email(self, provider: str, email) -> None:
+        provider_key = self._scoped_provider_key(provider)
         row = (
             self.session.query(MailboxEmailORM)
             .filter(
-                MailboxEmailORM.provider == provider,
+                MailboxEmailORM.provider == provider_key,
                 MailboxEmailORM.email_id == email.id,
             )
             .first()
@@ -469,7 +525,7 @@ class InboxRepository:
             self._observe_sender_intelligence(provider, email, count_message=True)
             self.session.add(
                 MailboxEmailORM(
-                    provider=provider,
+                    provider=provider_key,
                     email_id=email.id,
                     **payload,
                 )
@@ -498,10 +554,11 @@ class InboxRepository:
         source: str = "heuristic",
         run_id: Optional[str] = None,
     ) -> dict:
+        provider_key = self._scoped_provider_key(provider)
         row = (
             self.session.query(MailboxClassificationORM)
             .filter(
-                MailboxClassificationORM.provider == provider,
+                MailboxClassificationORM.provider == provider_key,
                 MailboxClassificationORM.email_id == email_id,
             )
             .first()
@@ -517,7 +574,7 @@ class InboxRepository:
         }
         if row is None:
             row = MailboxClassificationORM(
-                provider=provider,
+                provider=provider_key,
                 email_id=email_id,
                 **payload,
             )
@@ -542,10 +599,11 @@ class InboxRepository:
         source: str = "heuristic",
         run_id: Optional[str] = None,
     ) -> list[dict]:
+        provider_key = self._scoped_provider_key(provider)
         (
             self.session.query(MailboxActionItemORM)
             .filter(
-                MailboxActionItemORM.provider == provider,
+                MailboxActionItemORM.provider == provider_key,
                 MailboxActionItemORM.email_id == email_id,
             )
             .delete(synchronize_session=False)
@@ -554,7 +612,7 @@ class InboxRepository:
         timestamp = datetime.now(timezone.utc)
         for item in items:
             row = MailboxActionItemORM(
-                provider=provider,
+                provider=provider_key,
                 email_id=email_id,
                 action_type=item.action_type,
                 description=item.description,
@@ -578,10 +636,11 @@ class InboxRepository:
         source: str = "heuristic",
         run_id: Optional[str] = None,
     ) -> dict:
+        provider_key = self._scoped_provider_key(provider)
         row = (
             self.session.query(MailboxRecommendationORM)
             .filter(
-                MailboxRecommendationORM.provider == provider,
+                MailboxRecommendationORM.provider == provider_key,
                 MailboxRecommendationORM.email_id == email_id,
             )
             .first()
@@ -600,7 +659,7 @@ class InboxRepository:
         }
         if row is None:
             row = MailboxRecommendationORM(
-                provider=provider,
+                provider=provider_key,
                 email_id=email_id,
                 **payload,
             )
@@ -627,10 +686,11 @@ class InboxRepository:
         deduped_email_ids = [email_id for email_id in dict.fromkeys(email_ids) if email_id]
         if not deduped_email_ids:
             return
+        provider_key = self._scoped_provider_key(provider)
         (
             self.session.query(MailboxActionItemORM)
             .filter(
-                MailboxActionItemORM.provider == provider,
+                MailboxActionItemORM.provider == provider_key,
                 MailboxActionItemORM.email_id.in_(deduped_email_ids),
             )
             .delete(synchronize_session=False)
@@ -638,7 +698,7 @@ class InboxRepository:
         (
             self.session.query(MailboxRecommendationORM)
             .filter(
-                MailboxRecommendationORM.provider == provider,
+                MailboxRecommendationORM.provider == provider_key,
                 MailboxRecommendationORM.email_id.in_(deduped_email_ids),
             )
             .delete(synchronize_session=False)
@@ -646,7 +706,7 @@ class InboxRepository:
         (
             self.session.query(MailboxClassificationORM)
             .filter(
-                MailboxClassificationORM.provider == provider,
+                MailboxClassificationORM.provider == provider_key,
                 MailboxClassificationORM.email_id.in_(deduped_email_ids),
             )
             .delete(synchronize_session=False)
@@ -659,10 +719,11 @@ class InboxRepository:
     ) -> dict[str, dict]:
         if not email_ids:
             return {}
+        provider_key = self._scoped_provider_key(provider)
         rows = (
             self.session.query(MailboxClassificationORM)
             .filter(
-                MailboxClassificationORM.provider == provider,
+                MailboxClassificationORM.provider == provider_key,
                 MailboxClassificationORM.email_id.in_(email_ids),
             )
             .all()
@@ -677,10 +738,11 @@ class InboxRepository:
         provider: str,
         email_id: str,
     ) -> list[dict]:
+        provider_key = self._scoped_provider_key(provider)
         rows = (
             self.session.query(MailboxActionItemORM)
             .filter(
-                MailboxActionItemORM.provider == provider,
+                MailboxActionItemORM.provider == provider_key,
                 MailboxActionItemORM.email_id == email_id,
             )
             .order_by(MailboxActionItemORM.id.asc())
@@ -695,6 +757,7 @@ class InboxRepository:
         unread_only: Optional[bool] = None,
         time_range: Optional[str] = None,
     ) -> int:
+        provider_key = self._scoped_provider_key(provider)
         query = (
             self.session.query(MailboxActionItemORM)
             .join(
@@ -704,7 +767,7 @@ class InboxRepository:
                     MailboxEmailORM.email_id == MailboxActionItemORM.email_id,
                 ),
             )
-            .filter(MailboxActionItemORM.provider == provider)
+            .filter(MailboxActionItemORM.provider == provider_key)
         )
         if unread_only is True:
             query = query.filter(MailboxEmailORM.unread.is_(True))
@@ -725,10 +788,11 @@ class InboxRepository:
     ) -> dict[str, dict]:
         if not email_ids:
             return {}
+        provider_key = self._scoped_provider_key(provider)
         rows = (
             self.session.query(MailboxRecommendationORM)
             .filter(
-                MailboxRecommendationORM.provider == provider,
+                MailboxRecommendationORM.provider == provider_key,
                 MailboxRecommendationORM.email_id.in_(email_ids),
             )
             .all()
@@ -743,10 +807,11 @@ class InboxRepository:
         provider: str,
         email_id: str,
     ) -> Optional[dict]:
+        provider_key = self._scoped_provider_key(provider)
         row = (
             self.session.query(MailboxRecommendationORM)
             .filter(
-                MailboxRecommendationORM.provider == provider,
+                MailboxRecommendationORM.provider == provider_key,
                 MailboxRecommendationORM.email_id == email_id,
             )
             .first()
@@ -758,10 +823,11 @@ class InboxRepository:
         provider: str,
         email_id: str,
     ) -> Optional[dict]:
+        provider_key = self._scoped_provider_key(provider)
         row = (
             self.session.query(MailboxClassificationORM)
             .filter(
-                MailboxClassificationORM.provider == provider,
+                MailboxClassificationORM.provider == provider_key,
                 MailboxClassificationORM.email_id == email_id,
             )
             .first()
@@ -776,6 +842,7 @@ class InboxRepository:
         q: Optional[str] = None,
         time_range: Optional[str] = None,
     ) -> dict[str, dict]:
+        provider_key = self._scoped_provider_key(provider)
         query = (
             self.session.query(MailboxClassificationORM, MailboxEmailORM)
             .join(
@@ -785,7 +852,7 @@ class InboxRepository:
                     MailboxEmailORM.email_id == MailboxClassificationORM.email_id,
                 ),
             )
-            .filter(MailboxClassificationORM.provider == provider)
+            .filter(MailboxClassificationORM.provider == provider_key)
         )
         if unread_only is True:
             query = query.filter(MailboxEmailORM.unread.is_(True))
@@ -821,6 +888,7 @@ class InboxRepository:
         time_range: Optional[str] = None,
         high_priority_limit: int = 250,
     ) -> dict:
+        provider_key = self._scoped_provider_key(provider)
         query = (
             self.session.query(MailboxClassificationORM, MailboxEmailORM)
             .join(
@@ -830,7 +898,7 @@ class InboxRepository:
                     MailboxEmailORM.email_id == MailboxClassificationORM.email_id,
                 ),
             )
-            .filter(MailboxClassificationORM.provider == provider)
+            .filter(MailboxClassificationORM.provider == provider_key)
         )
         if unread_only is True:
             query = query.filter(MailboxEmailORM.unread.is_(True))
@@ -866,6 +934,7 @@ class InboxRepository:
         unread_only: Optional[bool] = None,
         time_range: Optional[str] = None,
     ) -> dict:
+        provider_key = self._scoped_provider_key(provider)
         query = (
             self.session.query(MailboxRecommendationORM, MailboxEmailORM)
             .join(
@@ -875,7 +944,7 @@ class InboxRepository:
                     MailboxEmailORM.email_id == MailboxRecommendationORM.email_id,
                 ),
             )
-            .filter(MailboxRecommendationORM.provider == provider)
+            .filter(MailboxRecommendationORM.provider == provider_key)
         )
         if unread_only is True:
             query = query.filter(MailboxEmailORM.unread.is_(True))
@@ -916,10 +985,11 @@ class InboxRepository:
         body_full: str,
         body_preview: Optional[str] = None,
     ) -> Optional[dict]:
+        provider_key = self._scoped_provider_key(provider)
         row = (
             self.session.query(MailboxEmailORM)
             .filter(
-                MailboxEmailORM.provider == provider,
+                MailboxEmailORM.provider == provider_key,
                 MailboxEmailORM.email_id == email_id,
             )
             .first()
@@ -945,6 +1015,7 @@ class InboxRepository:
         limit: int = 500,
         unread_only: Optional[bool] = True,
     ) -> list[tuple[EmailMessage, EmailClassification]]:
+        provider_key = self._scoped_provider_key(provider)
         query = (
             self.session.query(MailboxEmailORM, MailboxClassificationORM)
             .join(
@@ -955,7 +1026,7 @@ class InboxRepository:
                 ),
             )
             .filter(
-                MailboxEmailORM.provider == provider,
+                MailboxEmailORM.provider == provider_key,
                 MailboxClassificationORM.confidence < confidence_threshold,
             )
         )
@@ -1032,10 +1103,11 @@ class InboxRepository:
         labels_to_add: Optional[list[str]] = None,
         labels_to_remove: Optional[list[str]] = None,
     ) -> Optional[dict]:
+        provider_key = self._scoped_provider_key(provider)
         row = (
             self.session.query(MailboxEmailORM)
             .filter(
-                MailboxEmailORM.provider == provider,
+                MailboxEmailORM.provider == provider_key,
                 MailboxEmailORM.email_id == email_id,
             )
             .first()
@@ -1059,11 +1131,12 @@ class InboxRepository:
         normalized_ids = [str(email_id) for email_id in email_ids if str(email_id).strip()]
         if not normalized_ids:
             return 0
+        provider_key = self._scoped_provider_key(provider)
         now = datetime.now(timezone.utc)
         rows = (
             self.session.query(MailboxEmailORM)
             .filter(
-                MailboxEmailORM.provider == provider,
+                MailboxEmailORM.provider == provider_key,
                 MailboxEmailORM.email_id.in_(normalized_ids),
             )
             .all()
@@ -1106,7 +1179,8 @@ class InboxRepository:
         unread_email_ids: list[str],
         time_range: Optional[str] = None,
     ) -> int:
-        query = self.session.query(MailboxEmailORM).filter(MailboxEmailORM.provider == provider)
+        provider_key = self._scoped_provider_key(provider)
+        query = self.session.query(MailboxEmailORM).filter(MailboxEmailORM.provider == provider_key)
         if time_range:
             window = resolve_time_window(time_range)
             if window.start_at is not None:
@@ -1159,7 +1233,8 @@ class InboxRepository:
         if not labels:
             return 0
         label_set = set(labels)
-        query = self.session.query(MailboxEmailORM).filter(MailboxEmailORM.provider == provider)
+        provider_key = self._scoped_provider_key(provider)
+        query = self.session.query(MailboxEmailORM).filter(MailboxEmailORM.provider == provider_key)
         if email_ids:
             query = query.filter(MailboxEmailORM.email_id.in_(email_ids))
         rows = query.all()
@@ -1174,10 +1249,11 @@ class InboxRepository:
         return updated
 
     def get_mailbox_email(self, provider: str, email_id: str) -> Optional[dict]:
+        provider_key = self._scoped_provider_key(provider)
         row = (
             self.session.query(MailboxEmailORM)
             .filter(
-                MailboxEmailORM.provider == provider,
+                MailboxEmailORM.provider == provider_key,
                 MailboxEmailORM.email_id == email_id,
             )
             .first()
@@ -1189,10 +1265,11 @@ class InboxRepository:
     def get_mailbox_email_map(self, provider: str, email_ids: list[str]) -> dict[str, dict]:
         if not email_ids:
             return {}
+        provider_key = self._scoped_provider_key(provider)
         rows = (
             self.session.query(MailboxEmailORM)
             .filter(
-                MailboxEmailORM.provider == provider,
+                MailboxEmailORM.provider == provider_key,
                 MailboxEmailORM.email_id.in_(email_ids),
             )
             .all()
@@ -1211,7 +1288,8 @@ class InboxRepository:
         priority: Optional[str] = None,
         category: Optional[str] = None,
     ) -> int:
-        query = self.session.query(MailboxEmailORM).filter(MailboxEmailORM.provider == provider)
+        provider_key = self._scoped_provider_key(provider)
+        query = self.session.query(MailboxEmailORM).filter(MailboxEmailORM.provider == provider_key)
         if priority or category:
             query = query.join(
                 MailboxClassificationORM,
@@ -1264,7 +1342,8 @@ class InboxRepository:
         priority: Optional[str] = None,
         category: Optional[str] = None,
     ) -> list[dict]:
-        query = self.session.query(MailboxEmailORM).filter(MailboxEmailORM.provider == provider)
+        provider_key = self._scoped_provider_key(provider)
+        query = self.session.query(MailboxEmailORM).filter(MailboxEmailORM.provider == provider_key)
         if priority or category:
             query = query.join(
                 MailboxClassificationORM,
@@ -1312,6 +1391,7 @@ class InboxRepository:
     ) -> dict[str, dict]:
         if not email_ids:
             return {}
+        provider_key = self._scoped_provider_key(provider)
         rows = (
             self.session.query(ClassificationORM, EmailRecordORM, TriageRunORM)
             .join(
@@ -1323,7 +1403,7 @@ class InboxRepository:
             )
             .join(TriageRunORM, TriageRunORM.run_id == ClassificationORM.run_id)
             .filter(
-                TriageRunORM.provider == provider,
+                TriageRunORM.provider == provider_key,
                 EmailRecordORM.email_id.in_(email_ids),
             )
             .order_by(EmailRecordORM.email_id.asc(), TriageRunORM.started_at.desc())
@@ -1354,7 +1434,8 @@ class InboxRepository:
         return details.get(email_id)
 
     def get_mailbox_cache_stats(self, provider: str, *, time_range: Optional[str] = None) -> dict:
-        query = self.session.query(MailboxEmailORM).filter(MailboxEmailORM.provider == provider)
+        provider_key = self._scoped_provider_key(provider)
+        query = self.session.query(MailboxEmailORM).filter(MailboxEmailORM.provider == provider_key)
         if time_range:
             window = resolve_time_window(time_range)
             if window.start_at is not None:
@@ -1375,16 +1456,15 @@ class InboxRepository:
         }
 
     def list_runs(self, limit: int = 25) -> list[dict]:
-        rows = (
-            self.session.query(TriageRunORM)
-            .order_by(TriageRunORM.started_at.desc())
-            .limit(limit)
-            .all()
-        )
+        query = self.session.query(TriageRunORM)
+        actor_prefix = self._actor_run_provider_prefix()
+        if actor_prefix:
+            query = query.filter(TriageRunORM.provider.like(f"{actor_prefix}%"))
+        rows = query.order_by(TriageRunORM.started_at.desc()).limit(limit).all()
         return [
             {
                 "run_id": row.run_id,
-                "provider": row.provider,
+                "provider": self._logical_provider_key(row.provider),
                 "dry_run": row.dry_run,
                 "total_emails": row.total_emails,
                 "scanned_emails": row.raw_payload.get("scanned_emails", row.total_emails),
@@ -1427,26 +1507,146 @@ class InboxRepository:
             row.payload = payload
         return WorkspaceSettings.model_validate(payload)
 
-    def get_provider_connection(self, provider: str) -> ProviderConnectionState:
+    @staticmethod
+    def _normalize_owner_email(owner_email: Optional[str]) -> Optional[str]:
+        cleaned = (owner_email or "").strip().lower()
+        return cleaned or None
+
+    def get_provider_connection(
+        self,
+        provider: str,
+        *,
+        owner_email: Optional[str] = None,
+    ) -> ProviderConnectionState:
+        normalized_owner_email = self._effective_owner_email(owner_email)
+        if normalized_owner_email:
+            user_row = self.session.get(
+                UserProviderConnectionORM,
+                (normalized_owner_email, provider),
+            )
+            if user_row is not None and user_row.payload:
+                return ProviderConnectionState.model_validate(user_row.payload)
         row = self.session.get(ProviderConnectionORM, provider)
         if not row or not row.payload:
             return ProviderConnectionState(provider=provider)
+        if normalized_owner_email:
+            legacy_state = ProviderConnectionState.model_validate(row.payload)
+            if legacy_state.account_hint.strip().lower() != normalized_owner_email:
+                return ProviderConnectionState(provider=provider)
         return ProviderConnectionState.model_validate(row.payload)
 
     def save_provider_connection(
         self,
         state: ProviderConnectionState,
+        *,
+        owner_email: Optional[str] = None,
     ) -> ProviderConnectionState:
         payload = state.model_dump(mode="json")
+        normalized_owner_email = self._effective_owner_email(owner_email)
+        if normalized_owner_email:
+            row = self.session.get(
+                UserProviderConnectionORM,
+                (normalized_owner_email, state.provider),
+            )
+            if row is None:
+                row = UserProviderConnectionORM(
+                    owner_email=normalized_owner_email,
+                    provider=state.provider,
+                    payload=payload,
+                )
+                self.session.add(row)
+            else:
+                row.payload = payload
+                row.updated_at = datetime.now(timezone.utc)
+            return ProviderConnectionState.model_validate(payload)
+
         row = self.session.get(ProviderConnectionORM, state.provider)
         if row is None:
             row = ProviderConnectionORM(provider=state.provider, payload=payload)
             self.session.add(row)
         else:
             row.payload = payload
+            row.updated_at = datetime.now(timezone.utc)
         return ProviderConnectionState.model_validate(payload)
 
-    def list_provider_connections(self, providers: Optional[list[str]] = None) -> list[dict]:
+    def get_provider_secret(
+        self,
+        provider: str,
+        *,
+        owner_email: Optional[str] = None,
+    ) -> dict:
+        normalized_owner_email = self._effective_owner_email(owner_email)
+        if not normalized_owner_email:
+            return {}
+        row = self.session.get(
+            UserProviderSecretORM,
+            (normalized_owner_email, provider),
+        )
+        if row is None or not row.payload:
+            return {}
+        return dict(row.payload)
+
+    def save_provider_secret(
+        self,
+        provider: str,
+        payload: dict,
+        *,
+        owner_email: Optional[str] = None,
+    ) -> dict:
+        normalized_owner_email = self._effective_owner_email(owner_email)
+        if not normalized_owner_email:
+            return {}
+        row = self.session.get(
+            UserProviderSecretORM,
+            (normalized_owner_email, provider),
+        )
+        normalized_payload = dict(payload)
+        if row is None:
+            row = UserProviderSecretORM(
+                owner_email=normalized_owner_email,
+                provider=provider,
+                payload=normalized_payload,
+            )
+            self.session.add(row)
+        else:
+            row.payload = normalized_payload
+            row.updated_at = datetime.now(timezone.utc)
+        return normalized_payload
+
+    def clear_provider_secret(
+        self,
+        provider: str,
+        *,
+        owner_email: Optional[str] = None,
+    ) -> None:
+        normalized_owner_email = self._effective_owner_email(owner_email)
+        if not normalized_owner_email:
+            return
+        row = self.session.get(
+            UserProviderSecretORM,
+            (normalized_owner_email, provider),
+        )
+        if row is not None:
+            self.session.delete(row)
+
+    def list_provider_connections(
+        self,
+        providers: Optional[list[str]] = None,
+        *,
+        owner_email: Optional[str] = None,
+    ) -> list[dict]:
+        normalized_owner_email = self._effective_owner_email(owner_email)
+        if normalized_owner_email:
+            query = self.session.query(UserProviderConnectionORM).filter(
+                UserProviderConnectionORM.owner_email == normalized_owner_email
+            )
+            if providers:
+                query = query.filter(UserProviderConnectionORM.provider.in_(providers))
+            rows = query.order_by(UserProviderConnectionORM.provider.asc()).all()
+            return [
+                ProviderConnectionState.model_validate(row.payload).model_dump(mode="json")
+                for row in rows
+            ]
         query = self.session.query(ProviderConnectionORM)
         if providers:
             query = query.filter(ProviderConnectionORM.provider.in_(providers))
@@ -1456,11 +1656,76 @@ class InboxRepository:
             for row in rows
         ]
 
-    def get_checkpoint(self, provider_name: str) -> Optional[str]:
+    def find_provider_connection_owner(
+        self,
+        provider: str,
+        account_hint: str,
+    ) -> Optional[str]:
+        normalized_hint = (account_hint or "").strip().lower()
+        if not normalized_hint:
+            return None
+
+        rows = (
+            self.session.query(UserProviderConnectionORM)
+            .filter(UserProviderConnectionORM.provider == provider)
+            .all()
+        )
+        for row in rows:
+            if not row.payload:
+                continue
+            state = ProviderConnectionState.model_validate(row.payload)
+            if state.account_hint.strip().lower() == normalized_hint:
+                return row.owner_email
+
+        legacy_row = self.session.get(ProviderConnectionORM, provider)
+        if legacy_row and legacy_row.payload:
+            legacy_state = ProviderConnectionState.model_validate(legacy_row.payload)
+            if legacy_state.account_hint.strip().lower() == normalized_hint:
+                return normalized_hint
+        return None
+
+    def get_checkpoint(
+        self,
+        provider_name: str,
+        *,
+        owner_email: Optional[str] = None,
+    ) -> Optional[str]:
+        normalized_owner_email = self._effective_owner_email(owner_email)
+        if normalized_owner_email:
+            user_row = self.session.get(
+                UserProviderCheckpointORM,
+                (normalized_owner_email, provider_name),
+            )
+            if user_row is not None:
+                return user_row.checkpoint_value
         row = self.session.get(ProviderCheckpointORM, provider_name)
         return row.checkpoint_value if row else None
 
-    def save_checkpoint(self, provider_name: str, checkpoint_value: str) -> None:
+    def save_checkpoint(
+        self,
+        provider_name: str,
+        checkpoint_value: str,
+        *,
+        owner_email: Optional[str] = None,
+    ) -> None:
+        normalized_owner_email = self._effective_owner_email(owner_email)
+        if normalized_owner_email:
+            row = self.session.get(
+                UserProviderCheckpointORM,
+                (normalized_owner_email, provider_name),
+            )
+            if row is None:
+                row = UserProviderCheckpointORM(
+                    owner_email=normalized_owner_email,
+                    provider=provider_name,
+                    checkpoint_value=checkpoint_value,
+                )
+                self.session.add(row)
+            else:
+                row.checkpoint_value = checkpoint_value
+                row.updated_at = datetime.now(timezone.utc)
+            return
+
         row = self.session.get(ProviderCheckpointORM, provider_name)
         if row is None:
             row = ProviderCheckpointORM(
@@ -1472,21 +1737,50 @@ class InboxRepository:
             row.checkpoint_value = checkpoint_value
             row.updated_at = datetime.now(timezone.utc)
 
-    def get_sync_checkpoint(self, provider_name: str) -> Optional[str]:
-        return self.get_checkpoint(provider_name)
+    def get_sync_checkpoint(
+        self,
+        provider_name: str,
+        *,
+        owner_email: Optional[str] = None,
+    ) -> Optional[str]:
+        return self.get_checkpoint(provider_name, owner_email=owner_email)
 
-    def save_sync_checkpoint(self, provider_name: str, checkpoint_value: str) -> None:
-        self.save_checkpoint(provider_name, checkpoint_value)
+    def save_sync_checkpoint(
+        self,
+        provider_name: str,
+        checkpoint_value: str,
+        *,
+        owner_email: Optional[str] = None,
+    ) -> None:
+        self.save_checkpoint(provider_name, checkpoint_value, owner_email=owner_email)
 
-    def get_provider_sync_state(self, provider_name: str, sync_kind: str) -> Optional[dict]:
-        row = (
-            self.session.query(ProviderSyncStateORM)
-            .filter(
-                ProviderSyncStateORM.provider == provider_name,
-                ProviderSyncStateORM.sync_kind == sync_kind,
+    def get_provider_sync_state(
+        self,
+        provider_name: str,
+        sync_kind: str,
+        *,
+        owner_email: Optional[str] = None,
+    ) -> Optional[dict]:
+        normalized_owner_email = self._effective_owner_email(owner_email)
+        if normalized_owner_email:
+            row = (
+                self.session.query(UserProviderSyncStateORM)
+                .filter(
+                    UserProviderSyncStateORM.owner_email == normalized_owner_email,
+                    UserProviderSyncStateORM.provider == provider_name,
+                    UserProviderSyncStateORM.sync_kind == sync_kind,
+                )
+                .first()
             )
-            .first()
-        )
+        else:
+            row = (
+                self.session.query(ProviderSyncStateORM)
+                .filter(
+                    ProviderSyncStateORM.provider == provider_name,
+                    ProviderSyncStateORM.sync_kind == sync_kind,
+                )
+                .first()
+            )
         if row is None:
             return None
         payload = self._normalize_provider_sync_payload(dict(row.payload or {}))
@@ -1500,23 +1794,46 @@ class InboxRepository:
         provider_name: str,
         sync_kind: str,
         payload: dict,
+        *,
+        owner_email: Optional[str] = None,
     ) -> dict:
-        row = (
-            self.session.query(ProviderSyncStateORM)
-            .filter(
-                ProviderSyncStateORM.provider == provider_name,
-                ProviderSyncStateORM.sync_kind == sync_kind,
+        normalized_owner_email = self._effective_owner_email(owner_email)
+        if normalized_owner_email:
+            row = (
+                self.session.query(UserProviderSyncStateORM)
+                .filter(
+                    UserProviderSyncStateORM.owner_email == normalized_owner_email,
+                    UserProviderSyncStateORM.provider == provider_name,
+                    UserProviderSyncStateORM.sync_kind == sync_kind,
+                )
+                .first()
             )
-            .first()
-        )
+        else:
+            row = (
+                self.session.query(ProviderSyncStateORM)
+                .filter(
+                    ProviderSyncStateORM.provider == provider_name,
+                    ProviderSyncStateORM.sync_kind == sync_kind,
+                )
+                .first()
+            )
         normalized = self._normalize_provider_sync_payload(dict(payload))
         normalized.setdefault("provider", provider_name)
         normalized.setdefault("sync_kind", sync_kind)
         if row is None:
-            row = ProviderSyncStateORM(
-                provider=provider_name,
-                sync_kind=sync_kind,
-                payload=normalized,
+            row = (
+                UserProviderSyncStateORM(
+                    owner_email=normalized_owner_email,
+                    provider=provider_name,
+                    sync_kind=sync_kind,
+                    payload=normalized,
+                )
+                if normalized_owner_email
+                else ProviderSyncStateORM(
+                    provider=provider_name,
+                    sync_kind=sync_kind,
+                    payload=normalized,
+                )
             )
             self.session.add(row)
         else:
@@ -1543,15 +1860,33 @@ class InboxRepository:
             normalized["target_count"] = target_count
         return normalized
 
-    def clear_provider_sync_state(self, provider_name: str, sync_kind: str) -> None:
-        row = (
-            self.session.query(ProviderSyncStateORM)
-            .filter(
-                ProviderSyncStateORM.provider == provider_name,
-                ProviderSyncStateORM.sync_kind == sync_kind,
+    def clear_provider_sync_state(
+        self,
+        provider_name: str,
+        sync_kind: str,
+        *,
+        owner_email: Optional[str] = None,
+    ) -> None:
+        normalized_owner_email = self._effective_owner_email(owner_email)
+        if normalized_owner_email:
+            row = (
+                self.session.query(UserProviderSyncStateORM)
+                .filter(
+                    UserProviderSyncStateORM.owner_email == normalized_owner_email,
+                    UserProviderSyncStateORM.provider == provider_name,
+                    UserProviderSyncStateORM.sync_kind == sync_kind,
+                )
+                .first()
             )
-            .first()
-        )
+        else:
+            row = (
+                self.session.query(ProviderSyncStateORM)
+                .filter(
+                    ProviderSyncStateORM.provider == provider_name,
+                    ProviderSyncStateORM.sync_kind == sync_kind,
+                )
+                .first()
+            )
         if row is not None:
             self.session.delete(row)
 
@@ -2081,6 +2416,10 @@ class InboxRepository:
         run = self.session.get(TriageRunORM, run_id)
         if run is None:
             raise KeyError(run_id)
+        actor_prefix = self._actor_run_provider_prefix()
+        if actor_prefix and not run.provider.startswith(actor_prefix):
+            raise KeyError(run_id)
+        logical_provider = self._logical_provider_key(run.provider)
 
         email_rows = (
             self.session.query(EmailRecordORM)
@@ -2112,7 +2451,7 @@ class InboxRepository:
                 subject=row.subject,
                 snippet=row.snippet,
                 body_preview=row.body_preview,
-                body_full=(self.get_mailbox_email(run.provider, row.email_id) or {}).get(
+                body_full=(self.get_mailbox_email(logical_provider, row.email_id) or {}).get(
                     "body_full",
                     row.body_preview,
                 ),
@@ -2159,7 +2498,7 @@ class InboxRepository:
         digest = InboxDigest.model_validate(payload["digest"])
         return TriageRunResult(
             run_id=run_id,
-            provider=run.provider,
+            provider=logical_provider,
             dry_run=run.dry_run,
             total_emails=run.total_emails,
             scanned_emails=payload["scanned_emails"],

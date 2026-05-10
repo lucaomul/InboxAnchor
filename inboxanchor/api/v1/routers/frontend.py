@@ -34,6 +34,11 @@ from inboxanchor.infra.audit_log import AuditLogger
 from inboxanchor.infra.auth import AuthService
 from inboxanchor.infra.database import session_scope
 from inboxanchor.infra.repository import InboxRepository
+from inboxanchor.infra.request_context import (
+    get_current_actor_email,
+    reset_current_actor_email,
+    set_current_actor_email,
+)
 from inboxanchor.infra.text_normalizer import normalize_email_body_text
 from inboxanchor.mail_intelligence import (
     dedupe_labels,
@@ -48,6 +53,7 @@ from inboxanchor.models import (
     EmailClassification,
     EmailMessage,
     EmailRecommendation,
+    ProviderConnectionState,
     SafetyStatus,
     WorkspaceSettings,
 )
@@ -124,6 +130,18 @@ class FrontendProviderWorkflowRequest(BaseModel):
     time_range: Optional[str] = None
 
 
+class WarmupRequest(BaseModel):
+    provider: Optional[str] = None
+    months_back: int = Field(default=SETTINGS.sender_warmup_months_back, ge=1, le=120)
+    max_emails: int = Field(default=SETTINGS.sender_warmup_max_emails, ge=100, le=250_000)
+    batch_size: int = Field(default=SETTINGS.sender_warmup_batch_size, ge=10, le=1000)
+
+
+class WatchRequest(BaseModel):
+    topic_name: str = Field(default="", max_length=512)
+    label_ids: list[str] = Field(default_factory=lambda: ["UNREAD"])
+
+
 class FrontendMailboxBackfillRequest(BaseModel):
     provider: Optional[str] = None
     force_refresh: bool = False
@@ -163,8 +181,15 @@ class AliasResolveRequest(BaseModel):
     subject: str = Field(default="", max_length=998)
 
 
-def _scope_key(provider_name: str, time_range: Optional[str]) -> str:
-    return f"{provider_name}::{normalize_time_range(time_range)}"
+def _scope_key(
+    provider_name: str,
+    time_range: Optional[str],
+    *,
+    actor_email: Optional[str] = None,
+) -> str:
+    normalized_actor = (actor_email or get_current_actor_email() or "").strip().lower()
+    namespace = normalized_actor or "workspace"
+    return f"{namespace}::{provider_name}::{normalize_time_range(time_range)}"
 
 
 def _scope_sync_kind(time_range: Optional[str]) -> str:
@@ -254,6 +279,9 @@ def _managed_alias_public_backend_ready() -> bool:
 
 
 def _current_actor_email(authorization: Optional[str]) -> str:
+    context_actor = get_current_actor_email()
+    if context_actor:
+        return context_actor
     token = _extract_bearer_token(authorization)
     if not token:
         return "workspace@inboxanchor.local"
@@ -265,6 +293,9 @@ def _current_actor_email(authorization: Optional[str]) -> str:
 
 
 def _require_actor_email(authorization: Optional[str]) -> str:
+    context_actor = get_current_actor_email()
+    if context_actor:
+        return context_actor
     token = _extract_bearer_token(authorization)
     if not token:
         raise HTTPException(status_code=401, detail="Log in to use this feature.")
@@ -275,15 +306,35 @@ def _require_actor_email(authorization: Optional[str]) -> str:
     return auth_session.user.email
 
 
-def _get_provider_name(provider: Optional[str] = None) -> str:
-    service = InboxAnchorService()
+def _service_cache_key(provider_name: str, actor_email: Optional[str] = None) -> str:
+    normalized_actor = (actor_email or get_current_actor_email() or "").strip().lower()
+    namespace = normalized_actor or "workspace"
+    return f"{namespace}::{provider_name}"
+
+
+def _get_provider_name(
+    provider: Optional[str] = None,
+    *,
+    actor_email: Optional[str] = None,
+) -> str:
+    normalized_actor = actor_email or get_current_actor_email()
+    service = (
+        InboxAnchorService(owner_email=normalized_actor)
+        if normalized_actor
+        else InboxAnchorService()
+    )
     settings = service.load_workspace_settings()
     if provider:
         return provider.lower()
 
     preferred = (settings.preferred_provider or "fake").lower()
     if preferred != "fake":
-        return preferred
+        preferred_connection = service.load_provider_connection(preferred)
+        if preferred_connection.sync_enabled and preferred_connection.status in {
+            "configured",
+            "connected",
+        }:
+            return preferred
 
     for candidate in ("gmail", "imap", "yahoo", "outlook"):
         connection = service.load_provider_connection(candidate)
@@ -297,23 +348,61 @@ def _get_workspace_settings() -> WorkspaceSettings:
     return InboxAnchorService().load_workspace_settings()
 
 
-def _service_for_provider(provider_name: str) -> InboxAnchorService:
-    service = FRONTEND_SERVICE_CACHE.get(provider_name)
+def _service_for_provider(
+    provider_name: str,
+    *,
+    actor_email: Optional[str] = None,
+) -> InboxAnchorService:
+    cache_key = _service_cache_key(provider_name, actor_email)
+    service = FRONTEND_SERVICE_CACHE.get(cache_key)
     if service is None:
-        service = InboxAnchorService(provider_name=provider_name)
-        FRONTEND_SERVICE_CACHE[provider_name] = service
+        normalized_actor = actor_email or get_current_actor_email()
+        service = (
+            InboxAnchorService(
+                provider_name=provider_name,
+                owner_email=normalized_actor,
+            )
+            if normalized_actor
+            else InboxAnchorService(provider_name=provider_name)
+        )
+        FRONTEND_SERVICE_CACHE[cache_key] = service
     return service
 
 
+def _require_live_gmail_transport():
+    service = _service_for_provider("gmail")
+    transport_getter = getattr(service.provider, "_require_transport", None)
+    if service.provider.provider_name != "gmail" or not callable(transport_getter):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "InboxAnchor Gmail push notifications require a live Gmail transport. "
+                "Connect Gmail with real credentials first."
+            ),
+        )
+    try:
+        transport = transport_getter()
+    except Exception as exc:  # pragma: no cover - env-driven
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "InboxAnchor Gmail push notifications are not configured yet. "
+                "Check Gmail credentials and token wiring first."
+            ),
+        ) from exc
+    return service, transport
+
+
 def mark_frontend_provider_dirty(provider_name: str) -> None:
-    FRONTEND_SERVICE_CACHE.pop(provider_name, None)
+    for key in [item for item in FRONTEND_SERVICE_CACHE if item.endswith(f"::{provider_name}")]:
+        FRONTEND_SERVICE_CACHE.pop(key, None)
     FRONTEND_BLOCK_REGISTRY.pop(provider_name, None)
     for registry in (FRONTEND_RUN_CACHE, FRONTEND_PROVIDER_ERRORS, FRONTEND_PROGRESS):
         registry.pop(provider_name, None)
-        for key in [item for item in registry if item.startswith(f"{provider_name}::")]:
+        for key in [item for item in registry if f"::{provider_name}::" in item]:
             registry.pop(key, None)
     with FRONTEND_ACTIVE_RUNS_LOCK:
-        for key in [item for item in FRONTEND_ACTIVE_RUNS if item.startswith(f"{provider_name}::")]:
+        for key in [item for item in FRONTEND_ACTIVE_RUNS if f"::{provider_name}::" in item]:
             FRONTEND_ACTIVE_RUNS.pop(key, None)
     FRONTEND_FORCE_REFRESH_PROVIDERS.add(provider_name)
 
@@ -911,7 +1000,7 @@ def _configure_alias_inbox_routing(
     label: str = "",
     purpose: str = "",
 ) -> str:
-    gmail_service = InboxAnchorService(provider_name="gmail")
+    gmail_service = _service_for_provider("gmail")
     provider = gmail_service.provider
     if not _provider_is_live_gmail(provider):
         return ""
@@ -944,7 +1033,7 @@ def _configure_alias_inbox_routing(
 
 
 def _remove_alias_inbox_routing(alias_address: str) -> None:
-    gmail_service = InboxAnchorService(provider_name="gmail")
+    gmail_service = _service_for_provider("gmail")
     provider = gmail_service.provider
     if not _provider_is_live_gmail(provider):
         return
@@ -1539,6 +1628,7 @@ def _start_unread_sync_job(
     force_refresh: bool = True,
     time_range: Optional[str] = None,
 ) -> bool:
+    actor_email = get_current_actor_email()
     normalized_time_range = normalize_time_range(time_range)
     scope_key = _scope_key(provider_name, normalized_time_range)
     job, wait_job = _claim_frontend_job(
@@ -1584,6 +1674,7 @@ def _start_unread_sync_job(
     )
 
     def _runner() -> None:
+        context_token = set_current_actor_email(actor_email)
         try:
             _sync_unread_working_set(
                 provider_name,
@@ -1606,6 +1697,8 @@ def _start_unread_sync_job(
                 },
                 time_range=normalized_time_range,
             )
+        finally:
+            reset_current_actor_email(context_token)
 
     threading.Thread(
         target=_runner,
@@ -2547,7 +2640,12 @@ def _build_ops_overview(
     settings = _get_workspace_settings()
     digest = _build_cache_digest(provider_name, time_range=normalized_time_range, run_id=run_id)
     blocked = FRONTEND_BLOCK_REGISTRY.setdefault(provider_name, set())
-    connection = InboxAnchorService().load_provider_connection(provider_name)
+    service = _service_for_provider(provider_name)
+    load_provider_connection = getattr(service, "load_provider_connection", None)
+    if callable(load_provider_connection):
+        connection = load_provider_connection(provider_name)
+    else:
+        connection = ProviderConnectionState(provider=provider_name)
     cache_stats = _load_mailbox_cache_stats(provider_name, time_range=normalized_time_range)
     sync_state = _load_mailbox_sync_state(provider_name, time_range=normalized_time_range)
     processed_total = max(
@@ -3113,7 +3211,9 @@ def frontend_generate_alias(
     authorization: Optional[str] = Header(default=None),
 ):
     actor_email = _require_actor_email(authorization)
-    connection = InboxAnchorService().load_provider_connection("gmail")
+    connection = _service_for_provider("gmail", actor_email=actor_email).load_provider_connection(
+        "gmail"
+    )
     target_email = (connection.account_hint or actor_email).strip().lower()
     if "@" not in target_email:
         raise HTTPException(
@@ -3525,6 +3625,184 @@ def frontend_ops_scan(payload: FrontendProviderWorkflowRequest):
     return _build_ops_overview(provider_name, run_id, time_range=payload.time_range)
 
 
+@router.post("/ops/warmup")
+def frontend_ops_warmup(payload: WarmupRequest):
+    from inboxanchor.core.sender_warmup import SenderWarmupJob
+
+    actor_email = get_current_actor_email()
+    provider_name = _get_provider_name(payload.provider)
+    normalized_time_range = ALL_TIME_RANGE
+    scope_key = _scope_key(provider_name, normalized_time_range)
+    job, wait_job = _claim_frontend_job(
+        scope_key,
+        provider_name=provider_name,
+        mode="warmup",
+    )
+    if wait_job is not None:
+        return {
+            "status": "running",
+            "provider": provider_name,
+            "months_back": payload.months_back,
+            "max_emails": payload.max_emails,
+        }
+    assert job is not None
+
+    _update_frontend_progress(
+        provider_name,
+        {
+            "mode": "warmup",
+            "status": "running",
+            "stage": "warmup",
+            "limit": payload.max_emails,
+            "processed_emails": 0,
+            "read_count": 0,
+            "batch_count": 0,
+            "latest_action": "sender_warmup",
+            "error": None,
+        },
+        time_range=normalized_time_range,
+    )
+
+    def _runner() -> None:
+        context_token = set_current_actor_email(actor_email)
+        try:
+            service = _service_for_provider(provider_name)
+            stats = SenderWarmupJob(service.provider, provider_name).run(
+                months_back=payload.months_back,
+                max_emails=payload.max_emails,
+                batch_size=payload.batch_size,
+                include_body=False,
+                progress_callback=lambda progress: _update_frontend_progress(
+                    provider_name,
+                    {
+                        "mode": "warmup",
+                        "status": "running",
+                        "stage": "warmup",
+                        "limit": payload.max_emails,
+                        "processed_emails": progress["emails_scanned"],
+                        "batch_count": max(
+                            1,
+                            (progress["emails_scanned"] + payload.batch_size - 1)
+                            // payload.batch_size,
+                        ),
+                        "latest_subject": (
+                            f"Warmup: {progress['senders_discovered']} senders found"
+                        ),
+                        "latest_action": "sender_warmup",
+                        "error": None,
+                    },
+                    time_range=normalized_time_range,
+                ),
+            )
+            _update_frontend_progress(
+                provider_name,
+                {
+                    "mode": "warmup",
+                    "status": "complete",
+                    "stage": "warmup_done",
+                    "limit": payload.max_emails,
+                    "processed_emails": stats.emails_scanned,
+                    "batch_count": max(
+                        1,
+                        (stats.emails_scanned + payload.batch_size - 1) // payload.batch_size,
+                    )
+                    if stats.emails_scanned
+                    else 0,
+                    "latest_subject": f"Warmup: {stats.senders_discovered} senders found",
+                    "latest_action": "sender_warmup",
+                    "error": None,
+                },
+                time_range=normalized_time_range,
+            )
+            STREAM_HUB.emit(
+                {
+                    "type": "warmup_complete",
+                    "provider": provider_name,
+                    "emails_scanned": stats.emails_scanned,
+                    "senders_discovered": stats.senders_discovered,
+                    "senders_updated": stats.senders_updated,
+                }
+            )
+        except Exception as exc:
+            message = _provider_runtime_error_message(provider_name, exc)
+            job.error = message
+            _update_frontend_progress(
+                provider_name,
+                {
+                    "mode": "warmup",
+                    "status": "error",
+                    "stage": "warmup_failed",
+                    "error": message,
+                },
+                time_range=normalized_time_range,
+            )
+        finally:
+            reset_current_actor_email(context_token)
+            job.event.set()
+            with FRONTEND_ACTIVE_RUNS_LOCK:
+                FRONTEND_ACTIVE_RUNS.pop(scope_key, None)
+
+    threading.Thread(
+        target=_runner,
+        name=f"inboxanchor-warmup-{provider_name}",
+        daemon=True,
+    ).start()
+    return {
+        "status": "started",
+        "provider": provider_name,
+        "months_back": payload.months_back,
+        "max_emails": payload.max_emails,
+    }
+
+
+@router.post("/ops/watch/start")
+def frontend_ops_watch_start(payload: WatchRequest):
+    from inboxanchor.connectors.gmail_webhook import register_gmail_watch, start_watch_renewal
+
+    provider_name = _get_provider_name(None)
+    if provider_name != "gmail":
+        raise HTTPException(
+            status_code=400,
+            detail="Push notifications only supported for Gmail.",
+        )
+    _service, transport = _require_live_gmail_transport()
+    topic_name = (payload.topic_name or SETTINGS.gmail_pubsub_topic).strip()
+    if not topic_name:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide a Pub/Sub topic name or configure GMAIL_PUBSUB_TOPIC.",
+        )
+    result = register_gmail_watch(
+        transport,
+        topic_name=topic_name,
+        label_ids=payload.label_ids or ["UNREAD"],
+    )
+    if SETTINGS.gmail_watch_auto_renew:
+        start_watch_renewal(transport, topic_name=topic_name)
+    STREAM_HUB.emit(
+        {
+            "type": "watch_registered",
+            "provider": "gmail",
+            "topic": topic_name,
+            "expiration": result.get("expiration"),
+        }
+    )
+    return result
+
+
+@router.post("/ops/watch/stop")
+def frontend_ops_watch_stop():
+    from inboxanchor.connectors.gmail_webhook import stop_gmail_watch, stop_watch_renewal
+
+    provider_name = _get_provider_name(None)
+    if provider_name != "gmail":
+        raise HTTPException(status_code=400, detail="Gmail only.")
+    _service, transport = _require_live_gmail_transport()
+    stop_watch_renewal()
+    stop_gmail_watch(transport)
+    return {"ok": True, "status": "watch_stopped"}
+
+
 @router.post("/ops/classify-cache")
 def frontend_ops_classify_cache(payload: FrontendProviderWorkflowRequest):
     provider_name = _get_provider_name(payload.provider)
@@ -3598,6 +3876,7 @@ def _start_mailbox_backfill_job(
     provider_name: str,
     payload: FrontendMailboxBackfillRequest,
 ) -> bool:
+    actor_email = get_current_actor_email()
     normalized_time_range = normalize_time_range(payload.time_range)
     scope_key = _scope_key(provider_name, normalized_time_range)
     job, wait_job = _claim_frontend_job(
@@ -3654,6 +3933,7 @@ def _start_mailbox_backfill_job(
     )
 
     def _runner() -> None:
+        context_token = set_current_actor_email(actor_email)
         try:
             frontend_ops_backfill(payload.model_copy(update={"background": False}))
         except HTTPException:
@@ -3671,6 +3951,7 @@ def _start_mailbox_backfill_job(
                 time_range=normalized_time_range,
             )
         finally:
+            reset_current_actor_email(context_token)
             with FRONTEND_ACTIVE_RUNS_LOCK:
                 finished_job = FRONTEND_ACTIVE_RUNS.pop(scope_key, None)
             if finished_job is not None:

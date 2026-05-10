@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import secrets
+import tempfile
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse, urlunparse
@@ -19,6 +22,7 @@ from inboxanchor.connectors.oauth_flow import build_authorization_url, exchange_
 from inboxanchor.infra.auth import AuthError, AuthService
 from inboxanchor.infra.database import session_scope
 from inboxanchor.infra.repository import InboxRepository
+from inboxanchor.infra.request_context import get_current_actor_email
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 GMAIL_PKCE_REGISTRY: dict[str, dict[str, str]] = {}
@@ -58,6 +62,38 @@ def _resolve_gmail_token_path() -> str:
         credentials_path = Path(SETTINGS.gmail_credentials_path).expanduser()
         return str(credentials_path.with_name("token.json"))
     return ""
+
+
+def _token_data_dir() -> Path:
+    return Path(
+        os.getenv(
+            "INBOXANCHOR_DATA_DIR",
+            str(Path(tempfile.gettempdir()) / "inboxanchor"),
+        )
+    ).expanduser()
+
+
+def _safe_email_slug(email: str) -> str:
+    return (
+        email.strip()
+        .lower()
+        .replace("@", "__at__")
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace(":", "_")
+    )
+
+
+def _resolve_gmail_token_path_for_owner(owner_email: str) -> str:
+    token_dir = _token_data_dir() / "oauth" / _safe_email_slug(owner_email)
+    token_dir.mkdir(parents=True, exist_ok=True)
+    return str(token_dir / "gmail_token.json")
+
+
+def _resolve_pending_gmail_token_path() -> str:
+    pending_dir = _token_data_dir() / "oauth" / "pending"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    return str(pending_dir / f"gmail-{secrets.token_urlsafe(12)}.json")
 
 
 def _sanitize_redirect_uri(value: str) -> Optional[str]:
@@ -219,14 +255,23 @@ def gmail_auth_url(request: Request):
 
 
 @router.post("/gmail/callback")
-def gmail_auth_callback(payload: GmailCodeExchangeRequest, request: Request):
+def gmail_auth_callback(
+    payload: GmailCodeExchangeRequest,
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+):
     if not SETTINGS.gmail_credentials_path:
         return JSONResponse(
             status_code=400,
             content={"error": True, "message": "GMAIL_CREDENTIALS_PATH is not configured."},
         )
 
-    token_path = _resolve_gmail_token_path()
+    current_actor_email = get_current_actor_email()
+    token_path = (
+        _resolve_gmail_token_path_for_owner(current_actor_email)
+        if current_actor_email
+        else _resolve_pending_gmail_token_path()
+    )
     if not token_path:
         return JSONResponse(
             status_code=400,
@@ -258,24 +303,61 @@ def gmail_auth_callback(payload: GmailCodeExchangeRequest, request: Request):
         if not email:
             raise AuthError("Google OAuth completed but no Gmail address was returned.", 400)
 
+        final_owner_email = current_actor_email or email
+        final_token_path = _resolve_gmail_token_path_for_owner(final_owner_email)
+        source_token_path = Path(token_path)
+        destination_token_path = Path(final_token_path)
+        if source_token_path != destination_token_path and source_token_path.exists():
+            destination_token_path.parent.mkdir(parents=True, exist_ok=True)
+            destination_token_path.write_text(
+                source_token_path.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            try:
+                source_token_path.unlink()
+            except OSError:
+                pass
+
         with session_scope() as session:
             repository = InboxRepository(session)
             auth_service = AuthService(session)
-            auth_session = auth_service.authenticate_or_register_oauth(
-                email=email,
-                full_name=email.split("@", 1)[0].replace(".", " ").title(),
+            bearer_token = _extract_bearer_token(authorization)
+            existing_session = (
+                auth_service.get_session(bearer_token)
+                if bearer_token and current_actor_email
+                else None
             )
-            connection = repository.get_provider_connection("gmail")
+            if existing_session is not None:
+                auth_session = existing_session
+            else:
+                auth_session = auth_service.authenticate_or_register_oauth(
+                    email=email,
+                    full_name=email.split("@", 1)[0].replace(".", " ").title(),
+                )
+            connection = repository.get_provider_connection(
+                "gmail",
+                owner_email=final_owner_email,
+            )
             updated_connection = connection.model_copy(
                 update={
                     "status": "connected",
                     "account_hint": email,
                     "sync_enabled": True,
                     "dry_run_only": False,
-                    "notes": "Connected through Gmail OAuth browser flow.",
+                    "notes": (
+                        "Connected through Gmail OAuth browser flow."
+                        if final_owner_email == email
+                        else (
+                            "Connected Gmail mailbox "
+                            f"{email} for InboxAnchor account {final_owner_email}."
+                        )
+                    ),
                 }
             )
-            repository.save_provider_connection(updated_connection)
+            repository.save_provider_connection(
+                updated_connection,
+                owner_email=final_owner_email,
+            )
             settings = repository.get_workspace_settings()
             repository.save_workspace_settings(
                 settings.model_copy(update={"preferred_provider": "gmail"})

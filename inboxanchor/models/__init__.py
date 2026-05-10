@@ -15,7 +15,11 @@ from inboxanchor.models.email import (
     TriageRunResult,
 )
 from inboxanchor.models.policy import WorkspacePolicy, WorkspaceSettings
-from inboxanchor.models.provider import ProviderConnectionState, ProviderProfile
+from inboxanchor.models.provider import (
+    IMAPConnectionState,
+    ProviderConnectionState,
+    ProviderProfile,
+)
 from inboxanchor.models.reminder import FollowUpReminder, FollowUpReminderStatus
 
 __all__ = [
@@ -31,6 +35,7 @@ __all__ = [
     "EmailRecommendation",
     "EmailThread",
     "InboxDigest",
+    "IMAPConnectionState",
     "PriorityLevel",
     "ProviderConnectionState",
     "FollowUpReminder",
