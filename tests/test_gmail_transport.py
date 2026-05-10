@@ -631,6 +631,32 @@ def test_google_api_transport_apply_labels_uses_batch_modify_endpoint():
     assert session.calls[1][3]["addLabelIds"] == ["Label_1"]
 
 
+def test_google_api_transport_reuses_existing_label_after_conflict():
+    session = StubSession(
+        [
+            StubResponse({"labels": []}),
+            StubResponse({}, status_code=409),
+            StubResponse({"labels": [{"id": "Label_1", "name": "work"}]}),
+            StubResponse({}),
+        ]
+    )
+    transport = GoogleAPITransport(
+        credentials_path="~/credentials.json",
+        token_path="~/token.json",
+        session=session,
+    )
+
+    transport.apply_labels(["msg-1"], ["work"])
+
+    assert session.calls[0][0] == "GET"
+    assert session.calls[1][0] == "POST"
+    assert session.calls[1][1].endswith("/users/me/labels")
+    assert session.calls[2][0] == "GET"
+    assert session.calls[3][0] == "POST"
+    assert session.calls[3][1].endswith("/users/me/messages/batchModify")
+    assert session.calls[3][3]["addLabelIds"] == ["Label_1"]
+
+
 def test_google_api_transport_can_delete_labels_from_gmail():
     session = StubSession(
         [

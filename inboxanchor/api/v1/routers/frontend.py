@@ -271,6 +271,11 @@ def _provider_runtime_error_message(provider_name: str, exc: Exception) -> str:
             "backend, so the unread scan never completed. Check the backend machine's "
             "internet/DNS access, then retry Refresh unread scan."
         )
+    if "gmail.googleapis.com" in lowered and "/labels" in lowered and "409" in lowered:
+        return (
+            "Gmail rejected a duplicate label create request. InboxAnchor should refresh its "
+            "provider label cache and retry instead of failing the workflow."
+        )
     if provider_name == "gmail":
         return f"Gmail connected, but InboxAnchor could not fetch unread mail: {message}"
     if provider_name in {"imap", "yahoo", "outlook"}:

@@ -595,28 +595,36 @@ class GoogleAPITransport(GmailTransport):
         if label_name in self._label_cache:
             return self._label_cache[label_name]
 
-        if self._service is not None:
-            service = self._build_service()
-            created = self._execute_legacy(
-                service.users().labels().create(
-                    userId=self.user_id,
-                    body={
+        try:
+            if self._service is not None:
+                service = self._build_service()
+                created = self._execute_legacy(
+                    service.users().labels().create(
+                        userId=self.user_id,
+                        body={
+                            "name": label_name,
+                            "messageListVisibility": "show",
+                            "labelListVisibility": "labelShow",
+                        },
+                    )
+                )
+            else:
+                created = self._request_json(
+                    "POST",
+                    "labels",
+                    json_body={
                         "name": label_name,
                         "messageListVisibility": "show",
                         "labelListVisibility": "labelShow",
                     },
                 )
-            )
-        else:
-            created = self._request_json(
-                "POST",
-                "labels",
-                json_body={
-                    "name": label_name,
-                    "messageListVisibility": "show",
-                    "labelListVisibility": "labelShow",
-                },
-            )
+        except Exception as exc:
+            if self._is_label_conflict_error(exc):
+                self._refresh_label_cache()
+                existing_id = self._label_cache.get(label_name)
+                if existing_id:
+                    return existing_id
+            raise
         self._label_cache[label_name] = created["id"]
         return created["id"]
 
@@ -654,6 +662,17 @@ class GoogleAPITransport(GmailTransport):
         if legacy_status == 404:
             return True
         return "404" in str(exc)
+
+    @staticmethod
+    def _is_label_conflict_error(exc: Exception) -> bool:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if status_code == 409:
+            return True
+        legacy_status = getattr(getattr(exc, "resp", None), "status", None)
+        if legacy_status == 409:
+            return True
+        lowered = str(exc).lower()
+        return "409" in lowered
 
     def apply_labels(self, email_ids: list[str], labels: list[str]) -> None:
         if not labels:
