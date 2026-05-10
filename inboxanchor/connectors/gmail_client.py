@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Optional, Protocol
 
+from inboxanchor.config.settings import SETTINGS
 from inboxanchor.connectors.base import EmailProvider, ProviderActionResult
 from inboxanchor.core.time_windows import ALL_TIME_RANGE, normalize_time_range
 from inboxanchor.models import EmailMessage
@@ -33,6 +34,14 @@ class GmailTransport(Protocol):
         include_body: bool = False,
         unread_only: bool = False,
         offset: int = 0,
+        time_range: Optional[str] = None,
+    ): ...
+    def iter_all_unread(
+        self,
+        *,
+        batch_size: int = 500,
+        include_body: bool = True,
+        max_workers: Optional[int] = None,
         time_range: Optional[str] = None,
     ): ...
     def mark_read(self, email_ids: list[str]) -> None: ...
@@ -100,6 +109,27 @@ class GmailClient(EmailProvider):
     ):
         transport = self._require_transport()
         normalized_time_range = normalize_time_range(time_range)
+        industrial_iterator = getattr(transport, "iter_all_unread", None)
+        if normalized_time_range == ALL_TIME_RANGE and callable(industrial_iterator):
+            fetched = 0
+            page_fetch_size = min(max(batch_size, 1), SETTINGS.gmail_batch_size)
+            for batch in industrial_iterator(
+                batch_size=page_fetch_size,
+                include_body=include_body,
+                max_workers=SETTINGS.gmail_fetch_workers,
+                time_range=normalized_time_range,
+            ):
+                if fetched >= limit:
+                    break
+                next_batch = batch[: max(0, limit - fetched)]
+                if not next_batch:
+                    break
+                yield next_batch
+                fetched += len(next_batch)
+                if len(next_batch) < len(batch):
+                    break
+            return
+
         if hasattr(transport, "list_unread_page"):
             if normalized_time_range == ALL_TIME_RANGE:
                 fetched = 0
@@ -130,6 +160,33 @@ class GmailClient(EmailProvider):
         )
         for start in range(0, len(emails), batch_size):
             yield emails[start : start + batch_size]
+
+    def iter_all_unread_batches(
+        self,
+        *,
+        batch_size: int = 500,
+        include_body: bool = True,
+        time_range: Optional[str] = None,
+    ):
+        """
+        Industrial-scale unread streaming without offset math when the transport supports it.
+        """
+        transport = self._require_transport()
+        industrial_iterator = getattr(transport, "iter_all_unread", None)
+        if callable(industrial_iterator):
+            yield from industrial_iterator(
+                batch_size=batch_size,
+                include_body=include_body,
+                max_workers=SETTINGS.gmail_fetch_workers,
+                time_range=normalize_time_range(time_range),
+            )
+            return
+        yield from self.iter_unread_batches(
+            limit=999_999,
+            batch_size=batch_size,
+            include_body=include_body,
+            time_range=time_range,
+        )
 
     def iter_mailbox_batches(
         self,

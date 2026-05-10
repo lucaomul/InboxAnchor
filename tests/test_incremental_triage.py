@@ -35,33 +35,48 @@ class IncrementalProvider(FakeEmailProvider):
         return "next-history"
 
 
-def test_incremental_triage_uses_and_updates_checkpoint():
+def test_incremental_triage_uses_checkpoint_if_available_by_default():
     provider = IncrementalProvider(build_demo_emails())
     base_engine = TriageEngine(provider)
     engine = IncrementalTriageEngine(base_engine, provider_name="incremental")
 
     with session_scope() as session:
-        InboxRepository(session).save_checkpoint("incremental", "history-1")
+        InboxRepository(session).save_sync_checkpoint("incremental", "history-1")
 
-    result = engine.run(dry_run=True, limit=10, incremental=True)
+    result = engine.run(dry_run=True, limit=10)
 
     assert provider.received_checkpoint == "history-1"
     assert result.total_emails == 2
+    assert result.sync_type == "incremental"
+    assert result.history_id_used == "history-1"
 
     with session_scope() as session:
-        checkpoint = InboxRepository(session).get_checkpoint("incremental")
+        checkpoint = InboxRepository(session).get_sync_checkpoint("incremental")
     assert checkpoint == "next-history"
 
 
-def test_incremental_triage_defaults_to_full_unread_scan():
+def test_incremental_triage_falls_back_to_full_sync_if_no_checkpoint():
     provider = IncrementalProvider(build_demo_emails())
     base_engine = TriageEngine(provider)
     engine = IncrementalTriageEngine(base_engine, provider_name="incremental")
-
-    with session_scope() as session:
-        InboxRepository(session).save_checkpoint("incremental", "history-1")
 
     result = engine.run(dry_run=True, limit=10)
 
     assert provider.received_checkpoint is None
+    assert result.total_emails == len(build_demo_emails())
+    assert result.sync_type == "full"
+
+
+def test_incremental_triage_can_force_full_scan_even_with_checkpoint():
+    provider = IncrementalProvider(build_demo_emails())
+    base_engine = TriageEngine(provider)
+    engine = IncrementalTriageEngine(base_engine, provider_name="incremental")
+
+    with session_scope() as session:
+        InboxRepository(session).save_sync_checkpoint("incremental", "history-1")
+
+    result = engine.run(dry_run=True, limit=10, incremental=False)
+
+    assert provider.received_checkpoint is None
+    assert result.sync_type == "full"
     assert result.total_emails == len(build_demo_emails())

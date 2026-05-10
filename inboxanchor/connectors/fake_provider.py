@@ -33,7 +33,28 @@ class FakeEmailProvider(EmailProvider):
             if email.unread and in_time_window(email.received_at, time_range)
         ]
         unread.sort(key=lambda item: item.received_at, reverse=True)
-        return unread[:limit]
+        unread = unread[:limit]
+        if include_body:
+            return [
+                email.model_copy(
+                    update={
+                        "body_fetched": True,
+                        "body_stored": bool(email.body_full),
+                    }
+                )
+                for email in unread
+            ]
+        return [
+            email.model_copy(
+                update={
+                    "body_full": "",
+                    "body_preview": email.snippet,
+                    "body_fetched": False,
+                    "body_stored": False,
+                }
+            )
+            for email in unread
+        ]
 
     def iter_unread_batches(
         self,
@@ -70,7 +91,24 @@ class FakeEmailProvider(EmailProvider):
         emails = emails[offset : offset + limit]
         if not include_body:
             emails = [
-                email.model_copy(update={"body_full": "", "body_preview": email.snippet})
+                email.model_copy(
+                    update={
+                        "body_full": "",
+                        "body_preview": email.snippet,
+                        "body_fetched": False,
+                        "body_stored": False,
+                    }
+                )
+                for email in emails
+            ]
+        else:
+            emails = [
+                email.model_copy(
+                    update={
+                        "body_fetched": True,
+                        "body_stored": bool(email.body_full),
+                    }
+                )
                 for email in emails
             ]
         for start in range(0, len(emails), batch_size):

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Callable, Optional
 from uuid import uuid4
@@ -23,6 +23,7 @@ from inboxanchor.models import (
     EmailClassification,
     EmailMessage,
     EmailRecommendation,
+    InboxDigest,
     TriageRunResult,
     WorkspacePolicy,
 )
@@ -70,6 +71,7 @@ class TriageEngine:
         workspace_policy: Optional[WorkspacePolicy] = None,
         progress_callback: Optional[Callable[[dict], None]] = None,
         time_range: Optional[str] = None,
+        metadata_only: bool = False,
     ) -> TriageRunResult:
         workspace_policy = workspace_policy or WorkspacePolicy()
         classifications: dict[str, EmailClassification] = {}
@@ -81,6 +83,7 @@ class TriageEngine:
         scanned_emails = 0
         total_action_items = 0
         sender_intelligence = SenderIntelligenceResolver(self.provider.provider_name)
+        fetch_bodies = include_body and not metadata_only
 
         if progress_callback:
             progress_callback(
@@ -89,7 +92,8 @@ class TriageEngine:
                     "provider": self.provider.provider_name,
                     "limit": limit,
                     "batch_size": batch_size,
-                    "include_body": include_body,
+                    "include_body": fetch_bodies,
+                    "metadata_only": metadata_only,
                     "scanned_emails": 0,
                     "processed_emails": 0,
                     "read_count": 0,
@@ -102,7 +106,7 @@ class TriageEngine:
         for batch in self.provider.iter_unread_batches(
             limit=limit,
             batch_size=batch_size,
-            include_body=include_body,
+            include_body=fetch_bodies,
             time_range=time_range,
         ):
             batch_count += 1
@@ -113,7 +117,8 @@ class TriageEngine:
                         "provider": self.provider.provider_name,
                         "limit": limit,
                         "batch_size": batch_size,
-                        "include_body": include_body,
+                        "include_body": fetch_bodies,
+                        "metadata_only": metadata_only,
                         "scanned_emails": scanned_emails,
                         "processed_emails": len(all_emails),
                         "read_count": len(all_emails),
@@ -142,14 +147,12 @@ class TriageEngine:
                         }
                     )
 
-                items = (
-                    self.action_extractor.extract(
+                items = []
+                if extract_actions and not metadata_only:
+                    items = self.action_extractor.extract(
                         email,
                         classification=classification,
                     )
-                    if extract_actions
-                    else []
-                )
                 recommendation = self.safety_verifier.verify(
                     email,
                     classification,
@@ -165,7 +168,7 @@ class TriageEngine:
                 classifications[email.id] = classification
                 action_items[email.id].extend(items)
                 total_action_items += len(items)
-                if draft_replies and items:
+                if draft_replies and items and not metadata_only:
                     draft = self.reply_drafter.draft(
                         email,
                         items,
@@ -182,7 +185,8 @@ class TriageEngine:
                             "provider": self.provider.provider_name,
                             "limit": limit,
                             "batch_size": batch_size,
-                            "include_body": include_body,
+                            "include_body": fetch_bodies,
+                            "metadata_only": metadata_only,
                             "scanned_emails": scanned_emails,
                             "processed_emails": len(all_emails),
                             "read_count": len(all_emails),
@@ -193,7 +197,11 @@ class TriageEngine:
                         }
                     )
 
-        digest = self.summarizer.build_digest(all_emails, classifications)
+        digest = (
+            self._build_metadata_digest(all_emails, classifications)
+            if metadata_only
+            else self.summarizer.build_digest(all_emails, classifications)
+        )
         approvals_required = [
             rec.email_id
             for rec in recommendations
@@ -240,6 +248,7 @@ class TriageEngine:
             scanned_emails=scanned_emails,
             batch_size=batch_size,
             batch_count=batch_count,
+            metadata_only=metadata_only,
             email_preview_limit=email_preview_limit,
             recommendation_preview_limit=recommendation_preview_limit,
             email_preview_truncated=len(all_emails) > len(preview_emails),
@@ -268,7 +277,8 @@ class TriageEngine:
                     "provider": self.provider.provider_name,
                     "limit": limit,
                     "batch_size": batch_size,
-                    "include_body": include_body,
+                    "include_body": fetch_bodies,
+                    "metadata_only": metadata_only,
                     "scanned_emails": scanned_emails,
                     "processed_emails": len(all_emails),
                     "read_count": len(all_emails),
@@ -279,6 +289,39 @@ class TriageEngine:
                 }
             )
         return result
+
+    def _build_metadata_digest(
+        self,
+        emails: list[EmailMessage],
+        classifications: dict[str, EmailClassification],
+    ) -> InboxDigest:
+        counts = Counter(classifications[email.id].category for email in emails)
+        high_priority_ids = [
+            email.id
+            for email in emails
+            if classifications[email.id].priority in {"critical", "high"}
+        ]
+        top_categories = ", ".join(f"{key}={value}" for key, value in counts.items()) or "none"
+        summary = (
+            f"InboxAnchor mapped {len(emails)} unread emails from metadata first. "
+            f"Current category mix: {top_categories}."
+        )
+        daily_digest = (
+            f"Metadata-first triage flagged {len(high_priority_ids)} high-priority emails. "
+            "Open detail view only for ambiguous or high-impact threads."
+        )
+        weekly_digest = (
+            "Unread sync is running in industrial metadata mode. "
+            "Use body backfill only for low-confidence emails that still need deeper review."
+        )
+        return InboxDigest(
+            total_unread=len(emails),
+            category_counts=dict(counts),
+            high_priority_ids=high_priority_ids,
+            summary=summary,
+            daily_digest=daily_digest,
+            weekly_digest=weekly_digest,
+        )
 
     def _recommendation_rank(
         self,

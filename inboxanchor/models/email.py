@@ -57,6 +57,8 @@ class EmailMessage(BaseModel):
     snippet: str
     body_preview: str
     body_full: str = ""
+    body_fetched: bool = False
+    body_stored: bool = False
     received_at: datetime
     labels: list[str] = Field(default_factory=list)
     has_attachments: bool = False
@@ -69,6 +71,13 @@ class EmailMessage(BaseModel):
         if max_chars is not None and len(text) > max_chars:
             return text[:max_chars]
         return text
+
+    def clear_body(self) -> None:
+        """
+        Release full body text from memory after processing.
+        """
+        self.body_full = ""
+        self.body_stored = False
 
 
 class EmailThread(BaseModel):
@@ -144,6 +153,10 @@ class TriageRunResult(BaseModel):
     scanned_emails: int
     batch_size: int
     batch_count: int
+    metadata_only: bool = False
+    sync_type: str = "full"
+    history_id_used: Optional[str] = None
+    history_id_saved: Optional[str] = None
     email_preview_limit: int
     recommendation_preview_limit: int
     email_preview_truncated: bool = False

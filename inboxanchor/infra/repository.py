@@ -33,6 +33,7 @@ from inboxanchor.models import (
     EmailAlias,
     EmailAliasStatus,
     EmailClassification,
+    EmailMessage,
     EmailRecommendation,
     FollowUpReminder,
     FollowUpReminderStatus,
@@ -426,19 +427,27 @@ class InboxRepository:
             .first()
         )
         incoming_body_full = getattr(email, "body_full", None)
-        if incoming_body_full is None:
-            incoming_body_full = email.body_preview or email.snippet
-        body_full = (
-            normalize_email_body_text(incoming_body_full)
-            if isinstance(incoming_body_full, str)
-            else ""
-        )
-        if (
-            not body_full
-            and (email.body_preview or "").strip()
-            and email.body_preview != email.snippet
-        ):
-            body_full = normalize_email_body_text(email.body_preview)
+        body_stored = getattr(email, "body_stored", None)
+        if body_stored is None:
+            body_stored = bool(incoming_body_full)
+        elif not body_stored and isinstance(incoming_body_full, str) and incoming_body_full.strip():
+            body_stored = True
+        if not body_stored:
+            body_full = row.body_full if row is not None and row.body_full else ""
+        else:
+            if incoming_body_full is None:
+                incoming_body_full = email.body_preview or email.snippet
+            body_full = (
+                normalize_email_body_text(incoming_body_full)
+                if isinstance(incoming_body_full, str)
+                else ""
+            )
+            if (
+                not body_full
+                and (email.body_preview or "").strip()
+                and email.body_preview != email.snippet
+            ):
+                body_full = normalize_email_body_text(email.body_preview)
         body_preview = normalize_email_body_text(email.body_preview or email.snippet)
         if row is not None and not body_full and row.body_full:
             body_full = row.body_full
@@ -927,6 +936,93 @@ class InboxRepository:
         self.session.flush()
         return self._mailbox_email_payload(row)
 
+    def get_low_confidence_emails(
+        self,
+        provider: str,
+        *,
+        confidence_threshold: float,
+        body_fetched: bool = False,
+        limit: int = 500,
+        unread_only: Optional[bool] = True,
+    ) -> list[tuple[EmailMessage, EmailClassification]]:
+        query = (
+            self.session.query(MailboxEmailORM, MailboxClassificationORM)
+            .join(
+                MailboxClassificationORM,
+                and_(
+                    MailboxClassificationORM.provider == MailboxEmailORM.provider,
+                    MailboxClassificationORM.email_id == MailboxEmailORM.email_id,
+                ),
+            )
+            .filter(
+                MailboxEmailORM.provider == provider,
+                MailboxClassificationORM.confidence < confidence_threshold,
+            )
+        )
+        if unread_only is True:
+            query = query.filter(MailboxEmailORM.unread.is_(True))
+        elif unread_only is False:
+            query = query.filter(MailboxEmailORM.unread.is_(False))
+        if body_fetched:
+            query = query.filter(func.length(func.trim(MailboxEmailORM.body_full)) > 0)
+        else:
+            query = query.filter(func.length(func.trim(MailboxEmailORM.body_full)) == 0)
+        rows = (
+            query.order_by(
+                MailboxClassificationORM.confidence.asc(),
+                MailboxEmailORM.received_at.desc(),
+            )
+            .limit(limit)
+            .all()
+        )
+        candidates: list[tuple[EmailMessage, EmailClassification]] = []
+        for email_row, classification_row in rows:
+            email = EmailMessage(
+                id=email_row.email_id,
+                thread_id=email_row.thread_id,
+                sender=email_row.sender,
+                subject=email_row.subject,
+                snippet=email_row.snippet,
+                body_preview=email_row.body_preview,
+                body_full=email_row.body_full or "",
+                body_fetched=bool((email_row.body_full or "").strip()),
+                body_stored=bool((email_row.body_full or "").strip()),
+                received_at=email_row.received_at,
+                labels=list(email_row.labels or []),
+                has_attachments=email_row.has_attachments,
+                unread=email_row.unread,
+            )
+            classification = EmailClassification(
+                category=classification_row.category,
+                priority=classification_row.priority,
+                confidence=classification_row.confidence,
+                reason=classification_row.reason,
+            )
+            candidates.append((email, classification))
+        return candidates
+
+    def update_email_body_and_classification(
+        self,
+        provider: str,
+        email: EmailMessage,
+        classification: EmailClassification,
+        *,
+        source: str = "body_backfill",
+    ) -> None:
+        self.save_mailbox_email_body(
+            provider,
+            email.id,
+            body_full=email.body_full,
+            body_preview=email.body_preview,
+        )
+        self.upsert_mailbox_classification(
+            provider,
+            email.id,
+            classification,
+            source=source,
+            run_id=None,
+        )
+
     def update_mailbox_email_state(
         self,
         provider: str,
@@ -1331,6 +1427,12 @@ class InboxRepository:
         else:
             row.checkpoint_value = checkpoint_value
             row.updated_at = datetime.now(timezone.utc)
+
+    def get_sync_checkpoint(self, provider_name: str) -> Optional[str]:
+        return self.get_checkpoint(provider_name)
+
+    def save_sync_checkpoint(self, provider_name: str, checkpoint_value: str) -> None:
+        self.save_checkpoint(provider_name, checkpoint_value)
 
     def get_provider_sync_state(self, provider_name: str, sync_kind: str) -> Optional[dict]:
         row = (

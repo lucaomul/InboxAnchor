@@ -3,6 +3,8 @@ from datetime import timedelta
 from inboxanchor.bootstrap import build_demo_emails
 from inboxanchor.connectors.fake_provider import FakeEmailProvider
 from inboxanchor.core.triage_engine import TriageEngine
+from inboxanchor.models import EmailClassification
+from inboxanchor.models.email import EmailCategory, PriorityLevel
 
 
 def test_triage_engine_with_fake_emails_produces_digest_and_recommendations():
@@ -48,3 +50,69 @@ def test_triage_engine_batches_large_inboxes_and_caps_previews():
     assert len(result.recommendations) == 90
     assert result.email_preview_truncated is True
     assert result.recommendation_preview_truncated is True
+
+
+def test_clear_body_releases_memory():
+    email = build_demo_emails()[0].model_copy(
+        update={
+            "body_full": "Long body",
+            "body_fetched": True,
+            "body_stored": True,
+        }
+    )
+
+    email.clear_body()
+
+    assert email.body_full == ""
+    assert email.body_stored is False
+
+
+def test_triage_run_metadata_only_skips_body_agents():
+    class CountingClassifier:
+        def __init__(self):
+            self.calls = 0
+
+        def classify(self, email, intelligence=None, allow_llm=True):
+            del email, intelligence, allow_llm
+            self.calls += 1
+            return EmailClassification(
+                category=EmailCategory.work,
+                priority=PriorityLevel.medium,
+                confidence=0.8,
+                reason="test",
+            )
+
+    class ForbiddenSummarizer:
+        def build_digest(self, emails, classifications):
+            raise AssertionError("metadata_only should skip summarizer")
+
+    class ForbiddenActionExtractor:
+        def extract(self, email, classification=None):
+            raise AssertionError("metadata_only should skip action extractor")
+
+    class ForbiddenReplyDrafter:
+        def draft(self, email, items, classification=None):
+            raise AssertionError("metadata_only should skip reply drafter")
+
+    classifier = CountingClassifier()
+    engine = TriageEngine(
+        FakeEmailProvider(build_demo_emails()),
+        classifier=classifier,
+        summarizer=ForbiddenSummarizer(),
+        action_extractor=ForbiddenActionExtractor(),
+        reply_drafter=ForbiddenReplyDrafter(),
+    )
+
+    result = engine.run(
+        dry_run=True,
+        limit=10,
+        metadata_only=True,
+        include_body=True,
+        extract_actions=True,
+        draft_replies=True,
+    )
+
+    assert classifier.calls == result.total_emails
+    assert result.metadata_only is True
+    assert result.digest.total_unread == result.total_emails
+    assert result.reply_drafts == {}

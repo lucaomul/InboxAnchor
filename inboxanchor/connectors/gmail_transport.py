@@ -5,6 +5,7 @@ import base64
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email.message import EmailMessage as MimeEmailMessage
 from email.utils import parseaddr, parsedate_to_datetime
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 from urllib.parse import quote
 
+from inboxanchor.config.settings import SETTINGS
 from inboxanchor.connectors.gmail_client import GmailTransport
 from inboxanchor.connectors.oauth_flow import get_credentials
 from inboxanchor.core.time_windows import gmail_query_with_time_range, in_time_window
@@ -50,6 +52,7 @@ class GoogleAPITransport(GmailTransport):
         self._page_tokens: dict[int, Optional[str]] = {0: None}
         self._label_cache: dict[str, str] = {}
         self._last_history_id: Optional[str] = None
+        self._fetch_workers = max(1, SETTINGS.gmail_fetch_workers)
 
     def _build_session(self):
         if self._session is not None:
@@ -254,7 +257,9 @@ class GoogleAPITransport(GmailTransport):
         mime_type = payload.get("mimeType", "")
         body_data = payload.get("body", {}).get("data")
         if mime_type == "text/plain" and body_data:
-            return normalize_email_body_text(self._decode_body_data(body_data).strip())
+            body = normalize_email_body_text(self._decode_body_data(body_data).strip())
+            max_chars = max(0, SETTINGS.gmail_body_max_chars)
+            return body[:max_chars] if max_chars else body
 
         text_plain = None
         text_html = None
@@ -268,7 +273,9 @@ class GoogleAPITransport(GmailTransport):
                 text_html = normalize_email_body_text(
                     self._strip_html(self._decode_body_data(part_data))
                 )
-        return normalize_email_body_text(text_plain or text_html or "")
+        body = normalize_email_body_text(text_plain or text_html or "")
+        max_chars = max(0, SETTINGS.gmail_body_max_chars)
+        return body[:max_chars] if max_chars else body
 
     def _has_attachments(self, payload: dict) -> bool:
         if payload.get("filename"):
@@ -309,11 +316,52 @@ class GoogleAPITransport(GmailTransport):
             snippet=snippet,
             body_preview=(body or snippet)[:500],
             body_full=body if include_body else "",
+            body_fetched=include_body,
+            body_stored=bool(body) if include_body else False,
             received_at=self._parse_received_at(headers.get("date", "")),
             labels=labels,
             has_attachments=self._has_attachments(payload),
             unread="UNREAD" in labels,
         )
+
+    def _fetch_messages_parallel(
+        self,
+        refs: list[dict],
+        *,
+        include_body: bool = True,
+        max_workers: int = 10,
+    ) -> list[EmailMessage]:
+        """
+        Fetch multiple messages in parallel while preserving the input order.
+        Failed individual fetches are logged and skipped.
+        """
+        if not refs:
+            return []
+        results: dict[str, EmailMessage] = {}
+        worker_count = max(1, min(max_workers, len(refs)))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    self._fetch_message_resource,
+                    item["id"],
+                    include_body=include_body,
+                ): item["id"]
+                for item in refs
+            }
+            for future in as_completed(futures):
+                email_id = futures[future]
+                try:
+                    resource = future.result()
+                    results[email_id] = self._message_to_email(
+                        resource,
+                        include_body=include_body,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to fetch message; skipping unread item.",
+                        extra={"email_id": email_id, "error": str(exc)},
+                    )
+        return [results[item["id"]] for item in refs if item["id"] in results]
 
     def _prime_page_token(
         self,
@@ -387,13 +435,11 @@ class GoogleAPITransport(GmailTransport):
         )
         refs = response.get("messages", []) or []
         self._page_tokens[offset + len(refs)] = response.get("nextPageToken")
-        return [
-            self._message_to_email(
-                self._fetch_message_resource(item["id"], include_body=include_body),
-                include_body=include_body,
-            )
-            for item in refs
-        ]
+        return self._fetch_messages_parallel(
+            refs,
+            include_body=include_body,
+            max_workers=self._fetch_workers,
+        )
 
     def get_message(self, email_id: str, include_body: bool = True) -> EmailMessage:
         return self._message_to_email(
@@ -441,11 +487,50 @@ class GoogleAPITransport(GmailTransport):
             refs = response.get("messages", []) or []
             if not refs:
                 break
-            yield [
-                self.get_message(ref["id"], include_body=include_body)
-                for ref in refs
-            ]
+            batch = self._fetch_messages_parallel(
+                refs,
+                include_body=include_body,
+                max_workers=self._fetch_workers,
+            )
+            if batch:
+                yield batch
             remaining -= len(refs)
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+
+    def iter_all_unread(
+        self,
+        *,
+        batch_size: int = 500,
+        include_body: bool = True,
+        max_workers: Optional[int] = None,
+        time_range: Optional[str] = None,
+    ):
+        """
+        Stream all unread Gmail messages with nextPageToken pagination.
+        """
+        page_token = None
+        query = gmail_query_with_time_range("is:unread", time_range)
+        page_size = min(max(batch_size, 1), SETTINGS.gmail_batch_size, 500)
+        worker_count = max_workers or self._fetch_workers
+
+        while True:
+            response = self._list_message_refs(
+                limit=page_size,
+                page_token=page_token,
+                q=query,
+            )
+            refs = response.get("messages", []) or []
+            if not refs:
+                break
+            batch = self._fetch_messages_parallel(
+                refs,
+                include_body=include_body,
+                max_workers=worker_count,
+            )
+            if batch:
+                yield batch
             page_token = response.get("nextPageToken")
             if not page_token:
                 break
@@ -817,19 +902,21 @@ class GoogleAPITransport(GmailTransport):
         time_range: Optional[str] = None,
     ):
         message_ids, _ = self.list_changed_message_ids(checkpoint, max_results=limit)
-        batch: list[EmailMessage] = []
-        for message_id in message_ids:
-            email = self.get_message(message_id, include_body=include_body)
-            if not email.unread:
-                continue
-            if time_range and not in_time_window(email.received_at, time_range):
-                continue
-            batch.append(email)
-            if len(batch) >= batch_size:
+        for start in range(0, len(message_ids), batch_size):
+            refs = [{"id": message_id} for message_id in message_ids[start : start + batch_size]]
+            batch = self._fetch_messages_parallel(
+                refs,
+                include_body=include_body,
+                max_workers=self._fetch_workers,
+            )
+            batch = [
+                email
+                for email in batch
+                if email.unread
+                and (not time_range or in_time_window(email.received_at, time_range))
+            ]
+            if batch:
                 yield batch
-                batch = []
-        if batch:
-            yield batch
 
     def get_incremental_checkpoint(self) -> Optional[str]:
         if self._last_history_id:

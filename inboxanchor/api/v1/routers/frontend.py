@@ -879,7 +879,8 @@ def _frontend_email_payload(
     reply_to_address: Optional[str] = None,
 ) -> dict:
     body_preview = normalize_email_body_text(detail.get("body_preview", ""))
-    body_full = normalize_email_body_text((mailbox_email or {}).get("body_full", body_preview))
+    mailbox_body = normalize_email_body_text((mailbox_email or {}).get("body_full", ""))
+    body_full = mailbox_body or body_preview
     return {
         "id": detail["email_id"],
         "threadId": detail["thread_id"],

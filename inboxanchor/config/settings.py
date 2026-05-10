@@ -53,6 +53,26 @@ class Settings:
     )
     gmail_pubsub_topic: str = os.getenv("GMAIL_PUBSUB_TOPIC", "")
     gmail_watch_label_ids: str = os.getenv("GMAIL_WATCH_LABEL_IDS", "INBOX")
+    gmail_fetch_workers: int = int(os.getenv("INBOXANCHOR_GMAIL_FETCH_WORKERS", "10"))
+    gmail_batch_size: int = int(os.getenv("INBOXANCHOR_GMAIL_BATCH_SIZE", "500"))
+    gmail_body_max_chars: int = int(os.getenv("INBOXANCHOR_GMAIL_BODY_MAX_CHARS", "50000"))
+    gmail_industrial_mode: bool = _as_bool(
+        os.getenv("INBOXANCHOR_GMAIL_INDUSTRIAL_MODE"),
+        False,
+    )
+    gmail_metadata_only_first_pass: bool = _as_bool(
+        os.getenv("INBOXANCHOR_GMAIL_METADATA_ONLY_FIRST_PASS"),
+        True,
+    )
+    gmail_backfill_confidence_threshold: float = float(
+        os.getenv("INBOXANCHOR_GMAIL_BACKFILL_CONFIDENCE_THRESHOLD", "0.75")
+    )
+    gmail_backfill_max_emails: int = int(
+        os.getenv("INBOXANCHOR_GMAIL_BACKFILL_MAX_EMAILS", "500")
+    )
+    gmail_history_expiry_days: int = int(
+        os.getenv("INBOXANCHOR_GMAIL_HISTORY_EXPIRY_DAYS", "7")
+    )
     alias_managed_enabled: bool = _as_bool(
         os.getenv("INBOXANCHOR_ALIAS_MANAGED_ENABLED"),
         False,

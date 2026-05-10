@@ -29,9 +29,16 @@ class StubGmailTransport:
         )
 
     def list_unread(self, limit: int, *, include_body=True, time_range=None):
-        del include_body
         del time_range
-        return [self.message]
+        return [
+            self.message.model_copy(
+                update={
+                    "body_full": self.message.body_preview if include_body else "",
+                    "body_fetched": include_body,
+                    "body_stored": include_body,
+                }
+            )
+        ]
 
     def get_message(self, email_id: str, include_body: bool = True):
         del email_id, include_body
@@ -251,3 +258,65 @@ def test_gmail_iter_unread_batches_uses_metadata_pages_for_large_lightweight_sca
         (100, 400, False, "all_time"),
         (100, 500, False, "all_time"),
     ]
+
+
+def test_iter_all_unread_batches_uses_transport_stream_when_available():
+    class StreamingTransport(StubGmailTransport):
+        def iter_all_unread(
+            self,
+            *,
+            batch_size: int = 500,
+            include_body: bool = True,
+            max_workers=None,
+            time_range=None,
+        ):
+            del batch_size, max_workers, time_range
+            yield [
+                self.message.model_copy(
+                    update={
+                        "id": "gmail-1",
+                        "body_full": "Full body" if include_body else "",
+                        "body_fetched": include_body,
+                        "body_stored": include_body,
+                    }
+                )
+            ]
+            yield [
+                self.message.model_copy(
+                    update={
+                        "id": "gmail-2",
+                        "body_full": "Full body" if include_body else "",
+                        "body_fetched": include_body,
+                        "body_stored": include_body,
+                    }
+                )
+            ]
+
+    client = GmailClient(transport=StreamingTransport())
+
+    batches = list(
+        client.iter_all_unread_batches(
+            batch_size=100,
+            include_body=False,
+            time_range="all_time",
+        )
+    )
+
+    assert [email.id for batch in batches for email in batch] == ["gmail-1", "gmail-2"]
+    assert all(email.body_full == "" for batch in batches for email in batch)
+
+
+def test_iter_all_unread_batches_fallback_non_gmail():
+    client = GmailClient(transport=StubGmailTransport())
+
+    batches = list(
+        client.iter_all_unread_batches(
+            batch_size=100,
+            include_body=False,
+            time_range="all_time",
+        )
+    )
+
+    assert len(batches) == 1
+    assert batches[0][0].id == "gmail-1"
+    assert batches[0][0].body_full == ""
