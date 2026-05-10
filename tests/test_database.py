@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 from inboxanchor.bootstrap import build_demo_emails
-from inboxanchor.infra.database import _resolve_database_url, session_scope
+from inboxanchor.infra.database import _resolve_database_url, _sqlite_connect_args, session_scope
 from inboxanchor.infra.repository import InboxRepository
 
 
@@ -22,6 +22,13 @@ def test_absolute_sqlite_url_is_preserved_when_parent_is_writable(tmp_path):
 
     assert resolved == f"sqlite:///{candidate}"
     assert Path(candidate.parent).exists()
+
+
+def test_sqlite_connect_args_enable_busy_timeout_and_cross_thread_access():
+    connect_args = _sqlite_connect_args()
+
+    assert connect_args["check_same_thread"] is False
+    assert connect_args["timeout"] == 30
 
 
 def test_mailbox_cache_preserves_existing_full_body_on_metadata_refresh():

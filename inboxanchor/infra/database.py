@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    event,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -390,17 +392,44 @@ def _resolve_database_url(raw_url: str) -> str:
     return f"sqlite:///{candidate}"
 
 
+def _is_sqlite_url(url: str) -> bool:
+    return url.startswith("sqlite:///")
+
+
+def _sqlite_connect_args() -> dict:
+    return {
+        "check_same_thread": False,
+        "timeout": 30,
+    }
+
+
 RESOLVED_DATABASE_URL = _resolve_database_url(SETTINGS.database_url)
 engine = create_engine(
     RESOLVED_DATABASE_URL,
     future=True,
-    connect_args=(
-        {"check_same_thread": False}
-        if RESOLVED_DATABASE_URL.startswith("sqlite:///")
-        else {}
-    ),
+    connect_args=_sqlite_connect_args() if _is_sqlite_url(RESOLVED_DATABASE_URL) else {},
 )
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+
+
+if _is_sqlite_url(RESOLVED_DATABASE_URL):
+
+    @event.listens_for(engine, "connect")
+    def _configure_sqlite_connection(
+        dbapi_connection,
+        connection_record,
+    ):  # pragma: no cover - event hook
+        del connection_record
+        if not isinstance(dbapi_connection, sqlite3.Connection):
+            return
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL;")
+            cursor.execute("PRAGMA synchronous=NORMAL;")
+            cursor.execute("PRAGMA busy_timeout=30000;")
+            cursor.execute("PRAGMA foreign_keys=ON;")
+        finally:
+            cursor.close()
 
 
 def init_db() -> None:
