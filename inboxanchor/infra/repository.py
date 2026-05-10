@@ -610,6 +610,39 @@ class InboxRepository:
         self.session.flush()
         return self._mailbox_recommendation_payload(row)
 
+    def clear_mailbox_workflow_enrichment(
+        self,
+        provider: str,
+        email_ids: list[str],
+    ) -> None:
+        deduped_email_ids = [email_id for email_id in dict.fromkeys(email_ids) if email_id]
+        if not deduped_email_ids:
+            return
+        (
+            self.session.query(MailboxActionItemORM)
+            .filter(
+                MailboxActionItemORM.provider == provider,
+                MailboxActionItemORM.email_id.in_(deduped_email_ids),
+            )
+            .delete(synchronize_session=False)
+        )
+        (
+            self.session.query(MailboxRecommendationORM)
+            .filter(
+                MailboxRecommendationORM.provider == provider,
+                MailboxRecommendationORM.email_id.in_(deduped_email_ids),
+            )
+            .delete(synchronize_session=False)
+        )
+        (
+            self.session.query(MailboxClassificationORM)
+            .filter(
+                MailboxClassificationORM.provider == provider,
+                MailboxClassificationORM.email_id.in_(deduped_email_ids),
+            )
+            .delete(synchronize_session=False)
+        )
+
     def get_mailbox_classification_map(
         self,
         provider: str,

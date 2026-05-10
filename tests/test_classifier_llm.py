@@ -206,3 +206,76 @@ def test_classifier_treats_social_security_alerts_as_urgent():
 
     assert result.category == "urgent"
     assert result.priority in {"high", "critical"}
+
+
+def test_classifier_uses_high_confidence_promo_archetype_for_plain_marketing_mail():
+    email = EmailMessage(
+        id="promo-arch-1",
+        thread_id="promo-arch-1",
+        sender="offers@store.example",
+        subject="A quick update for you",
+        snippet="Just checking in with a new campaign.",
+        body_preview="Here is a quick store update for this week.",
+        received_at=datetime.now(timezone.utc),
+        labels=["INBOX"],
+        has_attachments=False,
+        unread=True,
+    )
+    agent = ClassifierAgent(
+        llm_client=StubLLMClient(
+            LLMResult(content="{}", provider="mock", model="mock", latency_ms=1)
+        )
+    )
+    intelligence = SenderIntelligenceContext(
+        sender_profile={
+            "sender_address": "offers@store.example",
+            "scores": {
+                "promo": 0.92,
+                "automated": 0.88,
+            },
+        },
+        domain_profile=None,
+        message_signals=analyze_message_signals(email),
+    )
+
+    result = agent.classify(email, intelligence=intelligence)
+
+    assert result.category == "promo"
+    assert result.priority == "low"
+
+
+def test_classifier_uses_recruiter_archetype_for_plain_hiring_mail():
+    email = EmailMessage(
+        id="recruit-arch-1",
+        thread_id="recruit-arch-1",
+        sender="hello@talentpartners.example",
+        subject="Quick note",
+        snippet="Wanted to reach out about a role.",
+        body_preview="I wanted to share a quick note about a possible fit.",
+        received_at=datetime.now(timezone.utc),
+        labels=["INBOX"],
+        has_attachments=False,
+        unread=True,
+    )
+    agent = ClassifierAgent(
+        llm_client=StubLLMClient(
+            LLMResult(content="{}", provider="mock", model="mock", latency_ms=1)
+        )
+    )
+    intelligence = SenderIntelligenceContext(
+        sender_profile={
+            "sender_address": "hello@talentpartners.example",
+            "scores": {
+                "recruiter": 0.84,
+                "human": 0.78,
+                "importance": 0.72,
+            },
+        },
+        domain_profile=None,
+        message_signals=analyze_message_signals(email),
+    )
+
+    result = agent.classify(email, intelligence=intelligence)
+
+    assert result.category == "opportunity"
+    assert result.priority in {"medium", "high"}

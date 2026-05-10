@@ -919,11 +919,17 @@ def test_frontend_ops_workflows_expose_mailbox_upgrade_features():
     assert overview_response.status_code == 200
     overview = overview_response.json()
     assert overview["workflows"]
+    workflow_slugs = {item["slug"] for item in overview["workflows"]}
+    assert "classify-cache" in workflow_slugs
     assert overview["unreadCount"] >= 1
 
     scan_response = client.post("/ops/scan", json={"force_refresh": True})
     assert scan_response.status_code == 200
     assert scan_response.json()["runId"]
+
+    classify_response = client.post("/ops/classify-cache", json={"force_refresh": True})
+    assert classify_response.status_code == 200
+    assert classify_response.json()["count"] >= 1
 
     auto_label_response = client.post("/ops/auto-label", json={"force_refresh": True})
     assert auto_label_response.status_code == 200
@@ -977,6 +983,37 @@ def test_frontend_clean_labels_removes_inboxanchor_labels_only():
     assert sum(len(labels) for labels in generated_labels_after.values()) < sum(
         len(labels) for labels in generated_labels_before.values()
     )
+
+
+def test_frontend_ops_classify_cache_enriches_cached_unread_mail():
+    email = build_demo_emails()[0].model_copy(
+        update={
+            "id": "cache-classify-1",
+            "thread_id": "cache-classify-1",
+            "subject": "Cache classification smoke test",
+        }
+    )
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        repository.upsert_mailbox_email("fake", email)
+        repository.clear_mailbox_workflow_enrichment("fake", [email.id])
+
+    response = client.post("/ops/classify-cache", json={"force_refresh": True})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["count"] >= 1
+    assert payload["overview"]["provider"] == "fake"
+
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        classification = repository.get_mailbox_classification_detail("fake", email.id)
+        recommendation = repository.get_mailbox_recommendation_detail("fake", email.id)
+        action_items = repository.get_mailbox_action_items("fake", email.id)
+
+    assert classification is not None
+    assert recommendation is not None
+    assert isinstance(action_items, list)
 
 
 def test_frontend_clean_labels_uses_fast_gmail_delete_path_without_rescan(monkeypatch):

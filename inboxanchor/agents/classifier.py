@@ -11,6 +11,7 @@ from inboxanchor.models.email import EmailCategory, PriorityLevel
 from inboxanchor.sender_intelligence import (
     SenderIntelligenceContext,
     analyze_message_signals,
+    infer_profile_archetype,
     profile_scores,
 )
 
@@ -206,6 +207,61 @@ class ClassifierAgent:
         personal_prior = max(sender_scores["personal"], domain_scores["personal"])
         automation_prior = max(sender_scores["automated"], domain_scores["automated"])
         human_prior = max(sender_scores["human"], domain_scores["human"])
+
+        archetype_candidates: list[tuple[str, float]] = []
+        if context.sender_profile:
+            archetype_candidates.append(infer_profile_archetype(context.sender_profile))
+        if context.domain_profile:
+            archetype_candidates.append(infer_profile_archetype(context.domain_profile))
+        best_archetype, best_archetype_confidence = max(
+            archetype_candidates or [("unknown", 0.0)],
+            key=lambda item: item[1],
+        )
+        if best_archetype_confidence >= 0.72:
+            if best_archetype == "shopping_promo":
+                add(EmailCategory.promo, 5.6, "sender archetype maps to shopping promo")
+            elif best_archetype == "social_update":
+                add(
+                    EmailCategory.low_priority,
+                    5.0,
+                    "sender archetype maps to low-value social updates",
+                )
+            elif best_archetype == "social_security":
+                add(EmailCategory.urgent, 5.4, "sender archetype maps to social security alerts")
+            elif best_archetype == "finance_vendor":
+                add(EmailCategory.finance, 5.3, "sender archetype maps to finance mail")
+            elif best_archetype == "newsletter_editorial":
+                add(
+                    EmailCategory.newsletter,
+                    5.1,
+                    "sender archetype maps to high-value editorial newsletters",
+                )
+            elif best_archetype == "newsletter_routine":
+                add(
+                    EmailCategory.newsletter,
+                    4.8,
+                    "sender archetype maps to routine newsletters",
+                )
+            elif best_archetype == "dev_tooling":
+                add(EmailCategory.work, 5.2, "sender archetype maps to developer tooling")
+            elif best_archetype == "recruiter_human":
+                add(EmailCategory.opportunity, 5.4, "sender archetype maps to recruiter outreach")
+            elif best_archetype == "spam_risk":
+                add(EmailCategory.spam_like, 5.8, "sender archetype maps to spam risk")
+            elif best_archetype == "human_work":
+                add(EmailCategory.work, 4.8, "sender archetype maps to work correspondence")
+            elif best_archetype == "human_personal":
+                add(
+                    EmailCategory.personal,
+                    4.8,
+                    "sender archetype maps to personal correspondence",
+                )
+            elif best_archetype == "job_platform_alert":
+                add(
+                    EmailCategory.low_priority,
+                    5.1,
+                    "sender archetype maps to automated job-platform alerts",
+                )
 
         if work_prior > 0.1:
             add(EmailCategory.work, 2.6 * work_prior, "sender history leans strongly toward work")

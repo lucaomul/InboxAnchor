@@ -597,6 +597,15 @@ export async function runMailboxBackfill(timeRange?: MailboxTimeRange): Promise<
   });
 }
 
+export async function runMailboxClassification(
+  timeRange?: MailboxTimeRange,
+): Promise<WorkflowMutationResult> {
+  return apiFetch<WorkflowMutationResult>("/ops/classify-cache", {
+    method: "POST",
+    body: JSON.stringify({ force_refresh: true, time_range: timeRange }),
+  });
+}
+
 export async function runAutoLabel(timeRange?: MailboxTimeRange): Promise<WorkflowMutationResult> {
   return apiFetch<WorkflowMutationResult>("/ops/auto-label", {
     method: "POST",

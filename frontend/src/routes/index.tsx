@@ -9,6 +9,7 @@ import {
   useOpsOverview,
   useOpsProgress,
   useRunAutoLabel,
+  useRunMailboxClassification,
   useRunLabelCleanup,
   useRunMailboxBackfill,
   useRunFullAnchorWorkflow,
@@ -72,6 +73,7 @@ function CommandCenter() {
   const { data: overview, isLoading, isError, error } = useOpsOverview(timeRange);
   const scanMutation = useRunOpsScan();
   const backfillMutation = useRunMailboxBackfill();
+  const classifyMutation = useRunMailboxClassification();
   const autoLabelMutation = useRunAutoLabel();
   const cleanLabelsMutation = useRunLabelCleanup();
   const cleanupMutation = useRunSafeCleanupWorkflow();
@@ -81,6 +83,7 @@ function CommandCenter() {
   const busy =
     scanMutation.isPending ||
     backfillMutation.isPending ||
+    classifyMutation.isPending ||
     autoLabelMutation.isPending ||
     cleanLabelsMutation.isPending ||
     cleanupMutation.isPending ||
@@ -109,6 +112,13 @@ function CommandCenter() {
           { label: "Hydrated", value: progress.hydrated_count },
           { label: "Batches", value: progress.batch_count },
         ]
+      : progress?.latest_action === "classify"
+        ? [
+            { label: "Emails read", value: progress.read_count },
+            { label: "Prepared", value: progress.processed_count },
+            { label: "Actions", value: progress.action_item_count },
+            { label: "Suggestions", value: progress.recommendation_count },
+          ]
       : progress.latest_action === "remove_labels"
         ? [
             { label: "Emails read", value: progress.read_count },
@@ -135,6 +145,8 @@ function CommandCenter() {
     : undefined;
   const progressMessage = progress?.mode === "backfill"
     ? `Building mailbox memory. ${progress.cached_count} emails are cached so far, and ${progress.hydrated_count} already have full bodies ready.`
+    : progress?.latest_action === "classify"
+      ? `Preparing sender-aware classifications and safety recommendations from the cached unread working set before any live mailbox changes happen.`
     : progress?.mode === "workflow"
       ? `Applying live mailbox changes in ${overview?.timeRangeLabel?.toLowerCase() || "the selected window"}. Labels, archive actions, and read-state updates will keep moving while you wait.`
       : progress?.target_count
@@ -445,9 +457,18 @@ function CommandCenter() {
                 onClick={() => backfillMutation.mutate(timeRange)}
               />
               <WorkflowCard
+                title="Prepare unread decisions"
+                icon={<Sparkles className="h-4 w-4" />}
+                description="Rebuild sender-aware classifications and safety recommendations from the cached unread working set before you label or clean anything."
+                impact={overview?.workflows.find((item) => item.slug === "classify-cache")?.impact}
+                cta="Prepare cache"
+                loading={classifyMutation.isPending}
+                onClick={() => classifyMutation.mutate(timeRange)}
+              />
+              <WorkflowCard
                 title="Auto-label unread mail"
                 icon={<Tags className="h-4 w-4" />}
-                description="Apply category, urgency, attachment, and action labels so the mailbox becomes easier to scan inside Gmail or Yahoo itself."
+                description="Apply one clean InboxAnchor label per unread email so the mailbox becomes easier to scan inside Gmail or Yahoo itself."
                 impact={overview?.workflows.find((item) => item.slug === "auto-label")?.impact}
                 cta="Run labels"
                 loading={autoLabelMutation.isPending}
@@ -474,7 +495,7 @@ function CommandCenter() {
               <WorkflowCard
                 title="Mailbox upgrade sweep"
                 icon={<Layers3 className="h-4 w-4" />}
-                description="Label first, then execute the safe cleanup batch so the provider inbox looks cleaner immediately."
+                description="Prepare unread decisions, label the set, then execute the safe cleanup batch so the provider inbox looks cleaner immediately."
                 impact={overview?.workflows.find((item) => item.slug === "full-anchor")?.impact}
                 cta="Upgrade mailbox"
                 loading={fullAnchorMutation.isPending}

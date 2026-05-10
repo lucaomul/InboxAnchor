@@ -4,6 +4,7 @@ import {
   fetchOpsOverview,
   fetchOpsProgress,
   getApiUrl,
+  runMailboxClassification,
   runMailboxBackfill,
   runAutoLabel,
   runLabelCleanup,
@@ -85,6 +86,20 @@ export function useRunAutoLabel() {
       });
     },
     onError: (err) => toast.error(`Failed to apply labels: ${err.message}`),
+  });
+}
+
+export function useRunMailboxClassification() {
+  const invalidate = useInvalidateWorkspace();
+  return useMutation({
+    mutationFn: (timeRange: MailboxTimeRange) => runMailboxClassification(timeRange),
+    onSuccess: (result) => {
+      invalidate();
+      toast.success("Unread decisions prepared", {
+        description: `${result.count || 0} cached unread emails were classified and prepared for labels or cleanup.`,
+      });
+    },
+    onError: (err) => toast.error(`Failed to prepare unread decisions: ${err.message}`),
   });
 }
 

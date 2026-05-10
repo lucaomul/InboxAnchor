@@ -1216,7 +1216,6 @@ def _sync_unread_working_set(
             FRONTEND_RUN_CACHE[scope_key] = result.run_id
             cache_stats = _load_mailbox_cache_stats(provider_name, time_range=normalized_time_range)
         else:
-            resolver = SenderIntelligenceResolver(provider_name)
             for batch in provider.iter_unread_batches(
                 limit=scan_limit,
                 batch_size=scan_batch_size,
@@ -1226,68 +1225,17 @@ def _sync_unread_working_set(
                 batch_count += 1
                 with session_scope() as session:
                     repository = InboxRepository(session)
-                    for email in batch:
-                        intelligence = resolver.resolve(email)
-                        classification = MAILBOX_PRIORITY_AGENT.prioritize(
-                            email,
-                            MAILBOX_CLASSIFIER.classify(
-                                email,
-                                intelligence=intelligence,
-                                allow_llm=False,
-                            ),
-                        )
-                        action_items = [
-                            EmailActionItem.model_validate(item)
-                            for item in _mailbox_action_items_for_email(email, classification)
-                        ]
-                        recommendation = _mailbox_recommendation_for_email(
-                            email,
-                            classification,
-                            policy=settings.policy,
-                        )
-                        repository.upsert_mailbox_email(provider_name, email)
-                        repository.upsert_mailbox_classification(
-                            provider_name,
-                            email.id,
-                            classification,
-                            source="heuristic",
-                        )
-                        repository.replace_mailbox_action_items(
-                            provider_name,
-                            email.id,
-                            action_items,
-                            source="heuristic",
-                        )
-                        repository.upsert_mailbox_recommendation(
-                            provider_name,
-                            email.id,
-                            recommendation,
-                            source="heuristic",
-                        )
-                        resolver.observe(email, context=intelligence)
-                        seen_email_ids.append(email.id)
-                        processed_total += 1
+                    seen_email_ids.extend(_sync_mailbox_batch(repository, provider_name, batch))
+                    processed_total += len(batch)
                     cache_stats = repository.get_mailbox_cache_stats(
                         provider_name,
                         time_range=normalized_time_range,
                     )
-                    recommendation_stats = repository.get_mailbox_recommendation_stats(
+                    workflow_counts = _load_mailbox_workflow_counts(
                         provider_name,
                         unread_only=True,
                         time_range=normalized_time_range,
                     )
-                    workflow_counts = {
-                        "action_item_count": repository.count_mailbox_action_items(
-                            provider_name,
-                            unread_only=True,
-                            time_range=normalized_time_range,
-                        ),
-                        "recommendation_count": (
-                            int(recommendation_stats["safe_count"])
-                            + int(recommendation_stats["review_count"])
-                            + int(recommendation_stats["blocked_count"])
-                        ),
-                    }
                 cached_count = cache_stats["cached_count"]
                 latest_subject = batch[0].subject if batch else latest_subject
                 _update_frontend_progress(
@@ -1757,6 +1705,27 @@ def _mailbox_recommendation_detail(
     return detail
 
 
+def _classify_mailbox_email(
+    provider_name: str,
+    mailbox_email: dict,
+    *,
+    resolver: Optional[SenderIntelligenceResolver] = None,
+) -> tuple[EmailMessage, EmailClassification]:
+    email = _mailbox_email_to_model(mailbox_email)
+    local_resolver = resolver or SenderIntelligenceResolver(provider_name)
+    intelligence = local_resolver.resolve(email)
+    classification = MAILBOX_PRIORITY_AGENT.prioritize(
+        email,
+        MAILBOX_CLASSIFIER.classify(
+            email,
+            intelligence=intelligence,
+            allow_llm=False,
+        ),
+    )
+    local_resolver.observe(email, context=intelligence)
+    return email, classification
+
+
 def _persist_mailbox_workflow_enrichment(
     repository: InboxRepository,
     provider_name: str,
@@ -1765,16 +1734,42 @@ def _persist_mailbox_workflow_enrichment(
     mailbox_classification: Optional[dict] = None,
     latest_classification: Optional[dict] = None,
     policy: Optional[object] = None,
+    force_refresh: bool = False,
+    resolver: Optional[SenderIntelligenceResolver] = None,
 ) -> tuple[dict, list[dict]]:
-    detail = _mailbox_recommendation_detail(
+    effective_classification = mailbox_classification if not force_refresh else None
+    if effective_classification is None and not force_refresh:
+        effective_classification = latest_classification
+
+    if effective_classification and effective_classification.get("classification"):
+        email = _mailbox_email_to_model(mailbox_email)
+        classification = EmailClassification.model_validate(
+            effective_classification["classification"]
+        )
+    else:
+        email, classification = _classify_mailbox_email(
+            provider_name,
+            mailbox_email,
+            resolver=resolver,
+        )
+        effective_classification = repository.upsert_mailbox_classification(
+            provider_name,
+            email.id,
+            classification,
+            source="heuristic",
+        )
+
+    detail = _mailbox_email_detail_payload(
         provider_name,
         mailbox_email,
-        mailbox_classification=mailbox_classification,
-        latest_classification=latest_classification,
+        mailbox_classification=effective_classification,
+    )
+    recommendation = _mailbox_recommendation_for_email(
+        email,
+        classification,
         policy=policy,
     )
-    classification = EmailClassification.model_validate(detail["classification"])
-    email = _mailbox_email_to_model(mailbox_email)
+    detail.update(recommendation.model_dump(mode="json"))
     items = [
         EmailActionItem.model_validate(item)
         for item in _mailbox_action_items_for_email(email, classification)
@@ -1803,6 +1798,106 @@ def _persist_mailbox_workflow_enrichment(
         source="heuristic",
     )
     return detail, [item.model_dump(mode="json") for item in items]
+
+
+def _sync_mailbox_batch(
+    repository: InboxRepository,
+    provider_name: str,
+    batch: list[EmailMessage],
+) -> list[str]:
+    email_ids: list[str] = []
+    for email in batch:
+        repository.upsert_mailbox_email(provider_name, email)
+        email_ids.append(email.id)
+    repository.clear_mailbox_workflow_enrichment(provider_name, email_ids)
+    return email_ids
+
+
+def _enrich_mailbox_cache(
+    provider_name: str,
+    *,
+    unread_only: Optional[bool] = True,
+    time_range: Optional[str] = None,
+    force_refresh: bool = False,
+    page_size: int = 250,
+) -> dict:
+    normalized_time_range = normalize_time_range(time_range)
+    policy = _get_workspace_settings().policy
+    resolver = SenderIntelligenceResolver(provider_name)
+    offset = 0
+    processed_count = 0
+    latest_subject: Optional[str] = None
+    workflow_counts = {
+        "action_item_count": 0,
+        "recommendation_count": 0,
+    }
+
+    while True:
+        with session_scope() as session:
+            repository = InboxRepository(session)
+            page = repository.list_mailbox_emails(
+                provider_name,
+                limit=page_size,
+                offset=offset,
+                unread_only=unread_only,
+                time_range=normalized_time_range,
+            )
+            if not page:
+                break
+            email_ids = [item["email_id"] for item in page]
+            mailbox_classifications = (
+                {}
+                if force_refresh
+                else repository.get_mailbox_classification_map(provider_name, email_ids)
+            )
+            latest_classifications = (
+                {}
+                if force_refresh
+                else repository.get_latest_classification_map(
+                    provider_name,
+                    [email_id for email_id in email_ids if email_id not in mailbox_classifications],
+                )
+            )
+            for item in page:
+                _persist_mailbox_workflow_enrichment(
+                    repository,
+                    provider_name,
+                    item,
+                    mailbox_classification=mailbox_classifications.get(item["email_id"]),
+                    latest_classification=latest_classifications.get(item["email_id"]),
+                    policy=policy,
+                    force_refresh=force_refresh,
+                    resolver=resolver,
+                )
+                processed_count += 1
+                latest_subject = item.get("subject") or latest_subject
+            recommendation_stats = repository.get_mailbox_recommendation_stats(
+                provider_name,
+                unread_only=unread_only,
+                time_range=normalized_time_range,
+            )
+            workflow_counts = {
+                "action_item_count": repository.count_mailbox_action_items(
+                    provider_name,
+                    unread_only=unread_only,
+                    time_range=normalized_time_range,
+                ),
+                "recommendation_count": (
+                    int(recommendation_stats["safe_count"])
+                    + int(recommendation_stats["review_count"])
+                    + int(recommendation_stats["blocked_count"])
+                ),
+            }
+        if len(page) < page_size:
+            break
+        offset += len(page)
+
+    return {
+        "count": processed_count,
+        "latest_subject": latest_subject,
+        "action_item_count": workflow_counts["action_item_count"],
+        "recommendation_count": workflow_counts["recommendation_count"],
+    }
 
 
 def _load_mailbox_recommendation_details(
@@ -2318,13 +2413,34 @@ def _build_ops_overview(
                 ),
             },
             {
+                "slug": "classify-cache",
+                "label": "Prepare unread decisions",
+                "description": (
+                    "Rebuild sender-aware classifications, action items, and safety "
+                    "recommendations from the cached unread working set."
+                ),
+                "impact": (
+                    f"{cache_stats['cached_unread_count']} unread cached emails in "
+                    f"{time_range_label(normalized_time_range).lower()} can be prepared for "
+                    "labeling and cleanup without re-reading the live provider."
+                ),
+            },
+            {
                 "slug": "auto-label",
                 "label": "Auto-label unread mail",
-                "description": "Apply category, urgency, attachment, and action labels.",
+                "description": "Apply one clean InboxAnchor label per unread email.",
                 "impact": (
-                    f"{auto_label_candidates} unread emails in "
-                    f"{time_range_label(normalized_time_range).lower()} can receive helpful "
-                    "labels right now."
+                    (
+                        f"{auto_label_candidates} unread emails in "
+                        f"{time_range_label(normalized_time_range).lower()} already have prepared "
+                        "recommendations that can be labeled right now."
+                    )
+                    if auto_label_candidates
+                    else (
+                        f"Prepare unread decisions first to rebuild label-ready recommendations "
+                        f"for {cache_stats['cached_unread_count']} cached unread emails in "
+                        f"{time_range_label(normalized_time_range).lower()}."
+                    )
                 ),
             },
             {
@@ -2341,15 +2457,25 @@ def _build_ops_overview(
                 "label": "Run safe cleanup",
                 "description": "Apply only low-risk mark-read and archive actions.",
                 "impact": (
-                    f"{safe_count} recommendations in "
-                    f"{time_range_label(normalized_time_range).lower()} are safe to execute "
-                    "immediately."
+                    (
+                        f"{safe_count} prepared recommendations in "
+                        f"{time_range_label(normalized_time_range).lower()} are safe to execute "
+                        "immediately."
+                    )
+                    if safe_count
+                    else (
+                        "Prepare unread decisions first so InboxAnchor can rebuild the current "
+                        "safe cleanup set from cache."
+                    )
                 ),
             },
             {
                 "slug": "full-anchor",
                 "label": "Mailbox upgrade sweep",
-                "description": "Label first, then run safe cleanup on the same unread set.",
+                "description": (
+                    "Prepare unread decisions, label the set, then run safe cleanup on the "
+                    "same unread working set."
+                ),
                 "impact": (
                     f"Best for making {time_range_label(normalized_time_range).lower()} in "
                     "Gmail, Yahoo, and IMAP inboxes visibly cleaner without unsafe deletion."
@@ -2461,11 +2587,28 @@ def frontend_email(email_id: str, time_range: str = ""):
 def frontend_classifications(time_range: str = ""):
     provider_name = _get_provider_name()
     _maybe_seed_mailbox_cache(provider_name, time_range=time_range or None)
+    normalized_time_range = normalize_time_range(time_range or None)
     classifications = _load_mailbox_classifications(
         provider_name,
         unread_only=True,
-        time_range=time_range or None,
+        time_range=normalized_time_range,
     )
+    cache_stats = _load_mailbox_cache_stats(provider_name, time_range=normalized_time_range)
+    if (
+        cache_stats["cached_unread_count"]
+        and len(classifications) < cache_stats["cached_unread_count"]
+    ):
+        _enrich_mailbox_cache(
+            provider_name,
+            unread_only=True,
+            time_range=normalized_time_range,
+            force_refresh=False,
+        )
+        classifications = _load_mailbox_classifications(
+            provider_name,
+            unread_only=True,
+            time_range=normalized_time_range,
+        )
     return {email_id: payload["classification"] for email_id, payload in classifications.items()}
 
 
@@ -2907,6 +3050,75 @@ def frontend_ops_scan(payload: FrontendProviderWorkflowRequest):
     return _build_ops_overview(provider_name, run_id, time_range=payload.time_range)
 
 
+@router.post("/ops/classify-cache")
+def frontend_ops_classify_cache(payload: FrontendProviderWorkflowRequest):
+    provider_name = _get_provider_name(payload.provider)
+    _maybe_seed_mailbox_cache(provider_name, time_range=payload.time_range)
+    cache_stats = _load_mailbox_cache_stats(provider_name, time_range=payload.time_range)
+    _update_frontend_progress(
+        provider_name,
+        {
+            "mode": "workflow",
+            "status": "running",
+            "stage": "classifying_cache",
+            "limit": cache_stats["cached_unread_count"],
+            "processed_emails": 0,
+            "read_count": cache_stats["cached_unread_count"],
+            "action_item_count": 0,
+            "recommendation_count": 0,
+            "labeled_count": 0,
+            "archived_count": 0,
+            "marked_read_count": 0,
+            "trashed_count": 0,
+            "reply_sent_count": 0,
+            "latest_action": "classify",
+            "error": None,
+        },
+        time_range=payload.time_range,
+    )
+    result = _enrich_mailbox_cache(
+        provider_name,
+        unread_only=True,
+        time_range=payload.time_range,
+        force_refresh=payload.force_refresh,
+    )
+    refreshed_run_id = _get_cached_or_latest_run_id(
+        provider_name,
+        time_range=payload.time_range,
+    )
+    overview = _build_ops_overview(
+        provider_name,
+        refreshed_run_id,
+        time_range=payload.time_range,
+    )
+    _update_frontend_progress(
+        provider_name,
+        {
+            "mode": "workflow",
+            "status": "complete",
+            "stage": "classification_ready",
+            "limit": cache_stats["cached_unread_count"],
+            "processed_emails": result["count"],
+            "read_count": cache_stats["cached_unread_count"],
+            "action_item_count": result["action_item_count"],
+            "recommendation_count": result["recommendation_count"],
+            "latest_subject": result["latest_subject"],
+            "latest_action": "classify",
+            "error": None,
+        },
+        time_range=payload.time_range,
+    )
+    STREAM_HUB.emit(
+        {
+            "type": "mailbox_classification_completed",
+            "provider": provider_name,
+            "run_id": refreshed_run_id,
+            "count": result["count"],
+        }
+    )
+    return {"count": result["count"], "overview": overview}
+
+
 def _start_mailbox_backfill_job(
     provider_name: str,
     payload: FrontendMailboxBackfillRequest,
@@ -3038,7 +3250,6 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
     normalized_time_range = normalize_time_range(payload.time_range)
     sync_kind = _scope_sync_kind(normalized_time_range)
     service = _service_for_provider(provider_name)
-    settings = _get_workspace_settings()
     start_offset = 0
     processed_total = 0
     processed_this_run = 0
@@ -3158,7 +3369,6 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
     )
 
     try:
-        resolver = SenderIntelligenceResolver(provider_name)
         for batch in service.provider.iter_mailbox_batches(
             limit=max(payload.limit - start_offset, 0),
             batch_size=payload.batch_size,
@@ -3170,70 +3380,21 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
             batch_count += 1
             with session_scope() as session:
                 repository = InboxRepository(session)
+                batch_ids = _sync_mailbox_batch(repository, provider_name, batch)
+                processed_this_run += len(batch_ids)
+                processed_total += len(batch_ids)
                 for email in batch:
-                    intelligence = resolver.resolve(email)
-                    classification = MAILBOX_PRIORITY_AGENT.prioritize(
-                        email,
-                        MAILBOX_CLASSIFIER.classify(
-                            email,
-                            intelligence=intelligence,
-                            allow_llm=False,
-                        ),
-                    )
-                    action_items = [
-                        EmailActionItem.model_validate(item)
-                        for item in _mailbox_action_items_for_email(email, classification)
-                    ]
-                    recommendation = _mailbox_recommendation_for_email(
-                        email,
-                        classification,
-                        policy=settings.policy,
-                    )
-                    repository.upsert_mailbox_email(provider_name, email)
-                    repository.upsert_mailbox_classification(
-                        provider_name,
-                        email.id,
-                        classification,
-                        source="heuristic",
-                    )
-                    repository.replace_mailbox_action_items(
-                        provider_name,
-                        email.id,
-                        action_items,
-                        source="heuristic",
-                    )
-                    repository.upsert_mailbox_recommendation(
-                        provider_name,
-                        email.id,
-                        recommendation,
-                        source="heuristic",
-                    )
-                    resolver.observe(email, context=intelligence)
-                    processed_this_run += 1
-                    processed_total += 1
                     if (email.body_full or "").strip():
                         hydrated_total += 1
                 cache_stats = repository.get_mailbox_cache_stats(
                     provider_name,
                     time_range=normalized_time_range,
                 )
-                recommendation_stats = repository.get_mailbox_recommendation_stats(
+                workflow_counts = _load_mailbox_workflow_counts(
                     provider_name,
                     unread_only=_mailbox_workflow_unread_filter(payload.unread_only),
                     time_range=normalized_time_range,
                 )
-                workflow_counts = {
-                    "action_item_count": repository.count_mailbox_action_items(
-                        provider_name,
-                        unread_only=_mailbox_workflow_unread_filter(payload.unread_only),
-                        time_range=normalized_time_range,
-                    ),
-                    "recommendation_count": (
-                        int(recommendation_stats["safe_count"])
-                        + int(recommendation_stats["review_count"])
-                        + int(recommendation_stats["blocked_count"])
-                    ),
-                }
                 repository.save_provider_sync_state(
                     provider_name,
                     sync_kind,
@@ -3395,6 +3556,13 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
 def frontend_ops_auto_label(payload: FrontendProviderWorkflowRequest):
     provider_name = payload.provider or _get_provider_name()
     _maybe_seed_mailbox_cache(provider_name, time_range=payload.time_range)
+    if payload.force_refresh:
+        _enrich_mailbox_cache(
+            provider_name,
+            unread_only=True,
+            time_range=payload.time_range,
+            force_refresh=True,
+        )
     cache_stats = _load_mailbox_cache_stats(provider_name, time_range=payload.time_range)
     applied_count = 0
     scanned_count = 0
@@ -3716,6 +3884,13 @@ def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
 def frontend_ops_safe_cleanup(payload: FrontendProviderWorkflowRequest):
     provider_name = payload.provider or _get_provider_name()
     _maybe_seed_mailbox_cache(provider_name, time_range=payload.time_range)
+    if payload.force_refresh:
+        _enrich_mailbox_cache(
+            provider_name,
+            unread_only=True,
+            time_range=payload.time_range,
+            force_refresh=True,
+        )
     existing_progress = FRONTEND_PROGRESS.get(
         _scope_key(provider_name, payload.time_range),
         {},
