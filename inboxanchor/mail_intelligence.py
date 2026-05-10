@@ -70,7 +70,7 @@ AI_TOPIC_MARKERS = {
     "gpt",
     "claude",
     "cursor",
-    "ai ",
+    "ai",
     "artificial intelligence",
     "machine learning",
 }
@@ -676,7 +676,17 @@ def dedupe_labels(labels: list[str]) -> list[str]:
 
 
 def _contains_any(text: str, markers: set[str]) -> bool:
-    return any(marker in text for marker in markers)
+    for marker in markers:
+        normalized = marker.strip().lower()
+        if not normalized:
+            continue
+        if re.fullmatch(r"[a-z0-9]+", normalized):
+            if re.search(rf"\b{re.escape(normalized)}\b", text):
+                return True
+            continue
+        if normalized in text:
+            return True
+    return False
 
 
 def _slug(value: str) -> str:

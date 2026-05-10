@@ -1,7 +1,11 @@
 from datetime import datetime, timedelta, timezone
 
 from inboxanchor.core.rules import RulesEngine
-from inboxanchor.mail_intelligence import extract_project_slug, recommend_mailbox_labels
+from inboxanchor.mail_intelligence import (
+    extract_project_slug,
+    is_work_dev_or_ai,
+    recommend_mailbox_labels,
+)
 from inboxanchor.models import EmailClassification, EmailMessage, WorkspacePolicy
 from inboxanchor.models.email import EmailCategory, PriorityLevel, RecommendationStatus
 
@@ -129,3 +133,12 @@ def test_extract_project_slug_requires_explicit_project_signal():
     )
 
     assert slug is None
+
+
+def test_is_work_dev_or_ai_does_not_match_ci_inside_normal_words():
+    assert not is_work_dev_or_ai(
+        sender='"Booking.com" <email.campaign@sg.booking.com>',
+        subject="O calatorie la Bucuresti, ultimele preturi sunt aici",
+        snippet="Vezi ultimele preturi si oferte de sezon.",
+        body="Planifica o escapada si vezi ofertele disponibile.",
+    )
