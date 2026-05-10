@@ -16,6 +16,7 @@ from inboxanchor.api.main import app
 from inboxanchor.bootstrap import build_demo_emails
 from inboxanchor.infra.database import session_scope
 from inboxanchor.infra.repository import InboxRepository
+from inboxanchor.infra.request_context import reset_current_actor_email, set_current_actor_email
 from inboxanchor.models import EmailClassification, WorkspaceSettings
 
 client = TestClient(app)
@@ -306,7 +307,8 @@ def test_provider_connection_is_isolated_per_authenticated_user():
     assert second_connection.json()["account_hint"] == ""
 
 
-def test_imap_provider_connection_roundtrip_hides_password():
+def test_imap_provider_connection_roundtrip_hides_password(monkeypatch):
+    monkeypatch.setattr(api_main, "_validate_imap_connection", lambda *args, **kwargs: None)
     signup = client.post(
         "/auth/signup",
         json={
@@ -353,6 +355,245 @@ def test_imap_provider_connection_roundtrip_hides_password():
     assert payload["imap"]["username"] == "owner@yahoo.com"
     assert payload["imap"]["password_configured"] is True
     assert "password" not in payload["imap"]
+
+
+def test_imap_provider_connection_requires_new_password_when_switching_mailboxes(monkeypatch):
+    monkeypatch.setattr(api_main, "_validate_imap_connection", lambda *args, **kwargs: None)
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "full_name": "Yahoo Switch Owner",
+            "email": "yahoo-switch-owner@example.com",
+            "password": "yahoo-switch-owner-pass",
+        },
+    )
+    token = signup.json()["token"]
+
+    first_save = client.put(
+        "/providers/yahoo/connection",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "status": "connected",
+            "account_hint": "first@yahoo.com",
+            "sync_enabled": True,
+            "dry_run_only": False,
+            "notes": "First Yahoo mailbox configured.",
+            "imap": {
+                "host": "imap.mail.yahoo.com",
+                "port": 993,
+                "username": "first@yahoo.com",
+                "password": "first-yahoo-app-password",
+                "use_ssl": True,
+                "mailbox": "INBOX",
+                "archive_mailbox": "Archive",
+                "trash_mailbox": "Trash",
+            },
+        },
+    )
+
+    switched_without_password = client.put(
+        "/providers/yahoo/connection",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "status": "connected",
+            "account_hint": "second@yahoo.com",
+            "sync_enabled": True,
+            "dry_run_only": False,
+            "notes": "Switching Yahoo mailboxes.",
+            "imap": {
+                "host": "imap.mail.yahoo.com",
+                "port": 993,
+                "username": "second@yahoo.com",
+                "password": "",
+                "use_ssl": True,
+                "mailbox": "INBOX",
+                "archive_mailbox": "Archive",
+                "trash_mailbox": "Trash",
+            },
+        },
+    )
+
+    assert first_save.status_code == 200
+    assert switched_without_password.status_code == 400
+    assert "changed the IMAP mailbox username" in switched_without_password.json()["detail"]
+
+
+def test_imap_disconnect_clears_cached_provider_runtime_state():
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "full_name": "Yahoo Reset Owner",
+            "email": "yahoo-reset-owner@example.com",
+            "password": "yahoo-reset-owner-pass",
+        },
+    )
+    token = signup.json()["token"]
+    owner_email = "yahoo-reset-owner@example.com"
+
+    actor_token = set_current_actor_email(owner_email)
+    try:
+        with session_scope() as session:
+            repository = InboxRepository(session)
+            repository.upsert_mailbox_email(
+                "yahoo",
+                build_demo_emails()[0].model_copy(update={"id": "yahoo-reset-email-1"}),
+            )
+            repository.save_sync_checkpoint("yahoo", "yahoo-history-1")
+    finally:
+        reset_current_actor_email(actor_token)
+
+    disconnect_response = client.put(
+        "/providers/yahoo/connection",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "status": "configured",
+            "account_hint": "",
+            "sync_enabled": False,
+            "dry_run_only": True,
+            "notes": "Yahoo disconnected.",
+            "imap": {
+                "host": "imap.mail.yahoo.com",
+                "port": 993,
+                "username": "",
+                "password": "",
+                "clear_password": True,
+                "use_ssl": True,
+                "mailbox": "INBOX",
+                "archive_mailbox": "Archive",
+                "trash_mailbox": "Trash",
+            },
+        },
+    )
+
+    actor_token = set_current_actor_email(owner_email)
+    try:
+        with session_scope() as session:
+            repository = InboxRepository(session)
+            cached = repository.get_mailbox_email("yahoo", "yahoo-reset-email-1")
+            checkpoint = repository.get_sync_checkpoint("yahoo")
+    finally:
+        reset_current_actor_email(actor_token)
+
+    assert disconnect_response.status_code == 200
+    assert cached is None
+    assert checkpoint is None
+
+
+def test_imap_provider_connection_rejects_bad_yahoo_credentials(monkeypatch):
+    def fake_validate(provider: str, *, state, password: str) -> None:
+        raise api_main.HTTPException(
+            status_code=400,
+            detail=api_main._imap_auth_failure_message(provider),
+        )
+
+    monkeypatch.setattr(api_main, "_validate_imap_connection", fake_validate)
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "full_name": "Yahoo Invalid Owner",
+            "email": "yahoo-invalid-owner@example.com",
+            "password": "yahoo-invalid-owner-pass",
+        },
+    )
+    token = signup.json()["token"]
+
+    response = client.put(
+        "/providers/yahoo/connection",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "status": "connected",
+            "account_hint": "invalid@yahoo.com",
+            "sync_enabled": True,
+            "dry_run_only": False,
+            "notes": "Yahoo IMAP configured.",
+            "imap": {
+                "host": "imap.mail.yahoo.com",
+                "port": 993,
+                "username": "invalid@yahoo.com",
+                "password": "wrong-password",
+                "use_ssl": True,
+                "mailbox": "INBOX",
+                "archive_mailbox": "Archive",
+                "trash_mailbox": "Trash",
+            },
+        },
+    )
+
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        connection = repository.get_provider_connection(
+            "yahoo",
+            owner_email="yahoo-invalid-owner@example.com",
+        )
+        secret = repository.get_provider_secret(
+            "yahoo",
+            owner_email="yahoo-invalid-owner@example.com",
+        )
+
+    assert response.status_code == 400
+    assert "Yahoo rejected the IMAP login" in response.json()["detail"]
+    assert connection.status == "not_connected"
+    assert secret == {}
+
+
+def test_imap_provider_connection_reports_network_error_without_saving_secret(monkeypatch):
+    def fake_validate(provider: str, *, state, password: str) -> None:
+        raise api_main.HTTPException(
+            status_code=502,
+            detail=(
+                f"InboxAnchor could not reach the live {provider.upper()} IMAP server. "
+                "Check the host, port, and backend network access, then try again."
+            ),
+        )
+
+    monkeypatch.setattr(api_main, "_validate_imap_connection", fake_validate)
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "full_name": "Yahoo Offline Owner",
+            "email": "yahoo-offline-owner@example.com",
+            "password": "yahoo-offline-owner-pass",
+        },
+    )
+    token = signup.json()["token"]
+
+    response = client.put(
+        "/providers/yahoo/connection",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "status": "connected",
+            "account_hint": "offline@yahoo.com",
+            "sync_enabled": True,
+            "dry_run_only": False,
+            "notes": "Yahoo IMAP configured.",
+            "imap": {
+                "host": "imap.mail.yahoo.com",
+                "port": 993,
+                "username": "offline@yahoo.com",
+                "password": "yahoo-app-password",
+                "use_ssl": True,
+                "mailbox": "INBOX",
+                "archive_mailbox": "Archive",
+                "trash_mailbox": "Trash",
+            },
+        },
+    )
+
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        connection = repository.get_provider_connection(
+            "yahoo",
+            owner_email="yahoo-offline-owner@example.com",
+        )
+        secret = repository.get_provider_secret(
+            "yahoo",
+            owner_email="yahoo-offline-owner@example.com",
+        )
+
+    assert response.status_code == 502
+    assert "could not reach the live YAHOO IMAP server" in response.json()["detail"]
+    assert connection.status == "not_connected"
+    assert secret == {}
 
 
 def test_follow_up_reminders_can_be_created_rescheduled_and_completed():
@@ -455,7 +696,7 @@ def test_triage_pagination_endpoints_expose_totals():
     assert recommendation_detail_response.json()["items"][0]["email"]["subject"]
 
 
-def test_execute_uses_provider_from_stored_run(mocker):
+def test_execute_uses_provider_from_stored_run(monkeypatch):
     run_response = client.post(
         "/triage/run",
         json={"provider": "outlook", "dry_run": False, "limit": 10},
@@ -477,7 +718,7 @@ def test_execute_uses_provider_from_stored_run(mocker):
         provider_calls.append(provider_name)
         return original_service(provider_name=provider_name)
 
-    mocker.patch.object(api_main, "InboxAnchorService", side_effect=recording_service)
+    monkeypatch.setattr(api_main, "InboxAnchorService", recording_service)
     execute_response = client.post("/actions/execute", json={"run_id": run_id})
 
     assert execute_response.status_code == 200
@@ -1277,6 +1518,89 @@ def test_frontend_unread_sync_uses_industrial_stream_for_gmail_all_time(monkeypa
     assert progress["status"] == "complete"
 
 
+def test_frontend_unread_sync_uses_industrial_stream_for_yahoo_any_time_range(monkeypatch):
+    frontend_router.FRONTEND_PROGRESS.clear()
+    frontend_router.FRONTEND_PROVIDER_ERRORS.clear()
+    frontend_router.FRONTEND_RUN_CACHE.clear()
+    frontend_router.FRONTEND_ACTIVE_RUNS.clear()
+
+    seed = build_demo_emails()
+    emails = [
+        seed[index % len(seed)].model_copy(
+            update={
+                "id": f"industrial-yahoo-unread-{index}",
+                "thread_id": f"thread-industrial-yahoo-unread-{index}",
+                "subject": f"Industrial Yahoo unread {index}",
+            }
+        )
+        for index in range(9)
+    ]
+    calls: list[dict] = []
+
+    class IndustrialYahooProvider:
+        provider_name = "yahoo"
+
+        def iter_all_unread_batches(
+            self,
+            *,
+            batch_size: int = 500,
+            include_body: bool = True,
+            time_range: Optional[str] = None,
+        ):
+            calls.append(
+                {
+                    "kind": "iter_all_unread_batches",
+                    "batch_size": batch_size,
+                    "include_body": include_body,
+                    "time_range": time_range,
+                }
+            )
+            for start in range(0, len(emails), batch_size):
+                yield [item.model_copy(deep=True) for item in emails[start : start + batch_size]]
+
+        def iter_unread_batches(self, **kwargs):
+            raise AssertionError(
+                "Yahoo unread sync should use the unlimited industrial iterator."
+            )
+
+    monkeypatch.setattr(
+        frontend_router,
+        "_service_for_provider",
+        lambda provider_name: SimpleNamespace(provider=IndustrialYahooProvider()),
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_get_workspace_settings",
+        lambda: WorkspaceSettings(
+            preferred_provider="yahoo",
+            default_scan_limit=10000,
+            default_batch_size=1000,
+        ),
+    )
+    monkeypatch.setattr(
+        frontend_router,
+        "_get_cached_or_latest_run_id",
+        lambda provider_name, time_range=None: None,
+    )
+
+    result = frontend_router._sync_unread_working_set("yahoo", time_range="last_7_days")
+
+    assert result["count"] == 9
+    assert calls == [
+        {
+            "kind": "iter_all_unread_batches",
+            "batch_size": 250,
+            "include_body": False,
+            "time_range": "last_7_days",
+        }
+    ]
+    progress = frontend_router.FRONTEND_PROGRESS[
+        frontend_router._scope_key("yahoo", "last_7_days")
+    ]
+    assert progress["processed_count"] == 9
+    assert progress["status"] == "complete"
+
+
 def test_frontend_ops_workflows_expose_mailbox_upgrade_features():
     overview_response = client.get("/ops/overview")
     assert overview_response.status_code == 200
@@ -1341,6 +1665,18 @@ def test_frontend_industrial_read_marks_cached_unread_mail_as_read():
 
 def test_frontend_ops_overview_scan_workflow_mentions_full_unread_for_gmail_all_time(monkeypatch):
     monkeypatch.setattr(frontend_router, "_get_provider_name", lambda provider=None: "gmail")
+    monkeypatch.setattr(
+        frontend_router,
+        "_service_for_provider",
+        lambda provider_name: SimpleNamespace(
+            provider=SimpleNamespace(iter_all_unread_batches=lambda **kwargs: iter(())),
+            load_provider_connection=lambda provider: api_main.ProviderConnectionState(
+                provider=provider,
+                status="connected",
+                sync_enabled=True,
+            ),
+        ),
+    )
 
     response = client.get("/ops/overview", params={"provider": "gmail", "time_range": "all_time"})
 

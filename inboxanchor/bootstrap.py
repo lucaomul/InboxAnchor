@@ -425,8 +425,13 @@ def build_provider(provider_name: Optional[str] = None, *, owner_email: Optional
                     provider_name,
                     error,
                 )
+        preview_seed_messages = (
+            []
+            if state.status in {"configured", "connected"} or state.sync_enabled
+            else demo_emails
+        )
         return IMAPEmailClient(
-            seed_messages=demo_emails,
+            seed_messages=preview_seed_messages,
             provider_name=provider_name,
         )
     return FakeEmailProvider(demo_emails, provider_name=provider_name)

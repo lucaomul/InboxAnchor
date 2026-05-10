@@ -1629,6 +1629,62 @@ class InboxRepository:
         if row is not None:
             self.session.delete(row)
 
+    def reset_provider_runtime_state(
+        self,
+        provider: str,
+        *,
+        owner_email: Optional[str] = None,
+    ) -> None:
+        normalized_owner_email = self._effective_owner_email(owner_email)
+        provider_key = self._scoped_provider_key(provider, owner_email=normalized_owner_email)
+
+        for model in (
+            MailboxActionItemORM,
+            MailboxRecommendationORM,
+            MailboxClassificationORM,
+            MailboxEmailORM,
+            SenderProfileORM,
+            DomainProfileORM,
+        ):
+            (
+                self.session.query(model)
+                .filter(model.provider == provider_key)
+                .delete(synchronize_session=False)
+            )
+
+        run_rows = (
+            self.session.query(TriageRunORM)
+            .filter(TriageRunORM.provider == provider_key)
+            .all()
+        )
+        for row in run_rows:
+            self.session.delete(row)
+
+        if normalized_owner_email:
+            checkpoint_row = self.session.get(
+                UserProviderCheckpointORM,
+                (normalized_owner_email, provider),
+            )
+            if checkpoint_row is not None:
+                self.session.delete(checkpoint_row)
+            (
+                self.session.query(UserProviderSyncStateORM)
+                .filter(
+                    UserProviderSyncStateORM.owner_email == normalized_owner_email,
+                    UserProviderSyncStateORM.provider == provider,
+                )
+                .delete(synchronize_session=False)
+            )
+        else:
+            checkpoint_row = self.session.get(ProviderCheckpointORM, provider)
+            if checkpoint_row is not None:
+                self.session.delete(checkpoint_row)
+            (
+                self.session.query(ProviderSyncStateORM)
+                .filter(ProviderSyncStateORM.provider == provider)
+                .delete(synchronize_session=False)
+            )
+
     def list_provider_connections(
         self,
         providers: Optional[list[str]] = None,

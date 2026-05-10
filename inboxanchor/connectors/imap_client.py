@@ -61,6 +61,21 @@ class IMAPEmailClient(EmailProvider):
         for start in range(0, len(emails), batch_size):
             yield emails[start : start + batch_size]
 
+    def iter_all_unread_batches(
+        self,
+        *,
+        batch_size: int = 100,
+        include_body: bool = True,
+        time_range: Optional[str] = None,
+    ):
+        emails = self.list_unread(
+            limit=0,
+            include_body=include_body,
+            time_range=time_range,
+        )
+        for start in range(0, len(emails), batch_size):
+            yield emails[start : start + batch_size]
+
     def iter_mailbox_batches(
         self,
         *,

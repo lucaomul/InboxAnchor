@@ -222,9 +222,22 @@ def _mailbox_progress_target(
 
 
 def _use_industrial_unread_sync(provider: object, *, time_range: Optional[str] = None) -> bool:
-    if normalize_time_range(time_range) != ALL_TIME_RANGE:
-        return False
+    del time_range
     return callable(getattr(provider, "iter_all_unread_batches", None))
+
+
+def _unread_scan_batch_size(
+    provider: object | None,
+    *,
+    default_batch_size: int,
+    industrial_unread_mode: bool,
+) -> int:
+    if not industrial_unread_mode:
+        return min(default_batch_size, 250)
+    provider_name = str(getattr(provider, "provider_name", "") or "").lower()
+    if provider_name in {"imap", "yahoo", "outlook"}:
+        return min(default_batch_size, 250)
+    return min(default_batch_size, 100)
 
 
 def _extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
@@ -445,6 +458,16 @@ def _provider_runtime_error_message(provider_name: str, exc: Exception) -> str:
     if provider_name == "gmail":
         return f"Gmail connected, but InboxAnchor could not fetch unread mail: {message}"
     if provider_name in {"imap", "yahoo", "outlook"}:
+        if "imap login failed" in lowered or "authenticationfailed" in lowered:
+            if provider_name == "yahoo":
+                return (
+                    "Yahoo rejected the IMAP login. Reconnect Yahoo with an app password from "
+                    "Yahoo Account Security; the normal Yahoo password usually will not work here."
+                )
+            return (
+                f"{provider_name.upper()} rejected the IMAP login. Reconnect the mailbox with "
+                "the correct username and IMAP or app password."
+            )
         return (
             f"{provider_name.upper()} connected, but InboxAnchor could not fetch unread "
             f"mail: {message}"
@@ -1356,9 +1379,10 @@ def _sync_unread_working_set(
         time_range=normalized_time_range,
     )
     scan_limit = None if industrial_unread_mode else (limit_override or settings.default_scan_limit)
-    scan_batch_size = min(
-        batch_size_override or settings.default_batch_size,
-        100 if industrial_unread_mode else 250,
+    scan_batch_size = _unread_scan_batch_size(
+        provider,
+        default_batch_size=batch_size_override or settings.default_batch_size,
+        industrial_unread_mode=industrial_unread_mode,
     )
     wait_job: Optional[FrontendRunJob] = None
     job = pre_registered_job
@@ -2646,6 +2670,10 @@ def _build_ops_overview(
         connection = load_provider_connection(provider_name)
     else:
         connection = ProviderConnectionState(provider=provider_name)
+    industrial_unread_mode = _use_industrial_unread_sync(
+        getattr(service, "provider", None),
+        time_range=normalized_time_range,
+    )
     cache_stats = _load_mailbox_cache_stats(provider_name, time_range=normalized_time_range)
     sync_state = _load_mailbox_sync_state(provider_name, time_range=normalized_time_range)
     processed_total = max(
@@ -2743,7 +2771,7 @@ def _build_ops_overview(
                         f"Scans the full unread working set in "
                         f"{time_range_label(normalized_time_range).lower()}."
                     )
-                    if normalized_time_range == ALL_TIME_RANGE and provider_name == "gmail"
+                    if industrial_unread_mode
                     else (
                         f"Scans up to {settings.default_scan_limit} unread emails in "
                         f"{time_range_label(normalized_time_range).lower()}."

@@ -10,15 +10,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from inboxanchor.api.v1.routers.auth import router as auth_router
-from inboxanchor.api.v1.routers.frontend import (
-    mark_frontend_provider_dirty,
-)
-from inboxanchor.api.v1.routers.frontend import (
-    router as frontend_router,
-)
+from inboxanchor.api.v1.routers.frontend import mark_frontend_provider_dirty
+from inboxanchor.api.v1.routers.frontend import router as frontend_router
 from inboxanchor.api.v1.routers.oauth import router as oauth_router
 from inboxanchor.api.v1.routers.webhooks import router as webhook_router
 from inboxanchor.bootstrap import InboxAnchorService, list_provider_profiles
+from inboxanchor.connectors.imap_transport import (
+    IMAPAuthenticationError,
+    IMAPFolderError,
+    ImaplibTransport,
+    IMAPTransportError,
+)
 from inboxanchor.infra.auth import AuthService
 from inboxanchor.infra.database import session_scope
 from inboxanchor.infra.repository import InboxRepository
@@ -136,6 +138,79 @@ def _service_for_request(provider_name: Optional[str] = None) -> InboxAnchorServ
             owner_email=owner_email,
         )
     return InboxAnchorService(provider_name=provider_name)
+
+
+def _imap_auth_failure_message(provider: str) -> str:
+    if provider == "yahoo":
+        return (
+            "Yahoo rejected the IMAP login. Reconnect with a Yahoo app password from "
+            "Yahoo Account Security; normal Yahoo passwords usually do not work for IMAP."
+        )
+    if provider == "outlook":
+        return (
+            "Outlook rejected the IMAP login. Reconnect with the mailbox username and an "
+            "Outlook app password or provider-specific IMAP credential."
+        )
+    return (
+        "InboxAnchor could not log into the IMAP mailbox. Reconnect with the mailbox "
+        "username and the correct IMAP or app password."
+    )
+
+
+def _validate_imap_connection(
+    provider: str,
+    *,
+    state: IMAPConnectionState,
+    password: str,
+) -> None:
+    if not state.host.strip():
+        raise HTTPException(status_code=400, detail="Enter the IMAP host before connecting.")
+    if not state.username.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Enter the mailbox username before connecting the IMAP provider.",
+        )
+    if not password.strip():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Enter the mailbox password or app password before connecting the IMAP provider."
+            ),
+        )
+
+    transport = ImaplibTransport(
+        state.host,
+        state.port,
+        state.username,
+        password,
+        use_ssl=state.use_ssl,
+        mailbox=state.mailbox,
+        provider_name=provider,
+        archive_mailbox=state.archive_mailbox or None,
+        trash_mailbox=state.trash_mailbox or None,
+    )
+    try:
+        transport._connect()
+    except IMAPAuthenticationError as exc:
+        raise HTTPException(status_code=400, detail=_imap_auth_failure_message(provider)) from exc
+    except IMAPFolderError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"InboxAnchor logged into the mailbox, but could not open '{state.mailbox}'. "
+                "Check the mailbox name and try again."
+            ),
+        ) from exc
+    except IMAPTransportError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"InboxAnchor could not reach the live {provider.upper()} IMAP server. "
+                "Check the host, port, and backend network access, then try again."
+            ),
+        ) from exc
+    finally:
+        transport.close()
 
 
 def _cors_origins() -> list[str]:
@@ -272,16 +347,46 @@ def save_provider_connection(
     if provider in {"imap", "yahoo", "outlook"} and payload.imap is not None:
         with session_scope() as session:
             repository = InboxRepository(session)
+            existing_state = repository.get_provider_connection(provider)
             existing_secret = repository.get_provider_secret(provider)
+            previous_username = (
+                existing_state.imap.username.strip().lower()
+                if existing_state.imap is not None
+                else ""
+            )
+            next_username = payload.imap.username.strip().lower()
+            switching_mailbox = bool(
+                previous_username
+                and next_username
+                and previous_username != next_username
+            )
             next_password = str(existing_secret.get("password") or "")
             if payload.imap.clear_password:
                 next_password = ""
             elif payload.imap.password.strip():
                 next_password = payload.imap.password.strip()
+            elif switching_mailbox:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "You changed the IMAP mailbox username. Enter the new Yahoo or IMAP "
+                        "app password as well so InboxAnchor does not reuse the previous "
+                        "account's secret."
+                    ),
+                )
+            if payload.sync_enabled:
+                _validate_imap_connection(
+                    provider,
+                    state=imap_state,
+                    password=next_password,
+                )
             if next_password:
                 repository.save_provider_secret(provider, {"password": next_password})
             else:
                 repository.clear_provider_secret(provider)
+            disconnecting_mailbox = payload.imap.clear_password and not payload.sync_enabled
+            if switching_mailbox or disconnecting_mailbox:
+                repository.reset_provider_runtime_state(provider)
     saved = service.save_provider_connection(state)
     mark_frontend_provider_dirty(provider)
     return saved.model_dump(mode="json")

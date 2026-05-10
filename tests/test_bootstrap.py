@@ -33,6 +33,24 @@ def test_gmail_service_uses_safe_preview_provider_until_live_transport_exists():
     assert len(emails) == 3
 
 
+def test_imap_family_preview_provider_starts_empty_instead_of_demo_mail():
+    service = InboxAnchorService(provider_name="yahoo", owner_email="preview-owner@example.com")
+    service.save_provider_connection(
+        service.load_provider_connection("yahoo").model_copy(
+            update={
+                "status": "configured",
+                "sync_enabled": True,
+            }
+        )
+    )
+    service = InboxAnchorService(provider_name="yahoo", owner_email="preview-owner@example.com")
+
+    emails = service.provider.list_unread(limit=10)
+
+    assert service.provider.provider_name == "yahoo"
+    assert emails == []
+
+
 def test_yahoo_service_uses_owner_scoped_imap_credentials_when_available():
     owner_email = "imap-owner@example.com"
     with session_scope() as session:

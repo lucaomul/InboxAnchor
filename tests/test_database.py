@@ -321,6 +321,32 @@ def test_provider_secret_is_isolated_by_owner_email():
     assert second_secret == {}
 
 
+def test_reset_provider_runtime_state_clears_cached_mailbox_and_checkpoint():
+    owner_email = "reset-owner@example.com"
+    actor_token = set_current_actor_email(owner_email)
+    try:
+        seed = build_demo_emails()[0].model_copy(update={"id": "reset-mailbox-1"})
+        with session_scope() as session:
+            repository = InboxRepository(session)
+            repository.upsert_mailbox_email("yahoo", seed)
+            repository.save_sync_checkpoint("yahoo", "history-123")
+            repository.reset_provider_runtime_state("yahoo")
+
+        with session_scope() as session:
+            repository = InboxRepository(session)
+            cached = repository.get_mailbox_email("yahoo", "reset-mailbox-1")
+            checkpoint = repository.get_sync_checkpoint("yahoo")
+            sender_profiles = repository.count_sender_profiles("yahoo")
+            mailbox_count = repository.count_mailbox_emails("yahoo")
+    finally:
+        reset_current_actor_email(actor_token)
+
+    assert cached is None
+    assert checkpoint is None
+    assert sender_profiles == 0
+    assert mailbox_count == 0
+
+
 def test_mailbox_cache_isolated_by_actor_context():
     first_token = set_current_actor_email("first-cache-owner@example.com")
     try:
