@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import re
 from email.utils import parseaddr
+from typing import TYPE_CHECKING
 
 from inboxanchor.infra.text_normalizer import normalize_email_body_text
+
+if TYPE_CHECKING:
+    from inboxanchor.sender_intelligence import MessageSignals
 
 FREE_EMAIL_DOMAINS = {
     "gmail.com",
@@ -135,6 +139,18 @@ FINANCE_RECEIPT_MARKERS = {
     "refund processed",
 }
 
+PERSONAL_MARKERS = {
+    "family",
+    "birthday",
+    "trip",
+    "weekend",
+    "dinner",
+    "vacation",
+    "wedding",
+    "party",
+    "photos",
+}
+
 LEGAL_MARKERS = {
     "contract",
     "msa",
@@ -214,6 +230,17 @@ INBOXANCHOR_LABEL_PREFIXES = (
 )
 
 INBOXANCHOR_ALIAS_LABEL_PREFIX = "inboxanchor/aliases"
+
+SINGLE_INBOXANCHOR_LABELS = {
+    "needs-reply",
+    "finance",
+    "jobs",
+    "newsletter",
+    "cleanup",
+    "work",
+    "personal",
+    "security",
+}
 
 LEGACY_INBOXANCHOR_LABELS = {
     "work",
@@ -469,6 +496,196 @@ def extract_client_slug(*, sender: str, category: str) -> str | None:
     return _slug(domain.split(".")[0])
 
 
+def assign_single_label(
+    *,
+    sender: str,
+    subject: str,
+    snippet: str = "",
+    body: str = "",
+    has_attachments: bool = False,
+    signals: "MessageSignals | None" = None,
+) -> str:
+    """Return exactly one visible mailbox label from InboxAnchor's 8-label set."""
+
+    def _signal(name: str) -> bool:
+        if signals is not None:
+            return bool(getattr(signals, name, False))
+        computed = computed_signals[name]
+        return bool(computed)
+
+    computed_signals = {
+        "security": _contains_any(
+            signal_text(sender=sender, subject=subject, snippet=snippet, body=body),
+            {
+                "security alert",
+                "suspicious",
+                "new login",
+                "new sign-in",
+                "signin",
+                "sign-in",
+                "password reset",
+                "verify your account",
+                "verification code",
+                "two-factor",
+                "2fa",
+                "unusual activity",
+                "new device",
+                "recover your account",
+            },
+        ),
+        "finance_invoice": is_finance_invoice(
+            sender=sender,
+            subject=subject,
+            snippet=snippet,
+            body=body,
+        ),
+        "finance_receipt": is_finance_receipt(
+            sender=sender,
+            subject=subject,
+            snippet=snippet,
+            body=body,
+        ),
+        "reply_needed": has_reply_needed_signal(
+            sender=sender,
+            subject=subject,
+            snippet=snippet,
+            body=body,
+        ),
+        "human_like": not looks_automated_email(
+            sender=sender,
+            subject=subject,
+            snippet=snippet,
+            body=body,
+        )
+        and not is_newsletter(sender=sender, subject=subject, snippet=snippet, body=body)
+        and not is_promo(sender=sender, subject=subject, snippet=snippet, body=body)
+        and not is_job_alert(sender=sender, subject=subject, snippet=snippet, body=body),
+        "automated": looks_automated_email(
+            sender=sender,
+            subject=subject,
+            snippet=snippet,
+            body=body,
+        ),
+        "work_dev": is_work_dev_or_ai(
+            sender=sender,
+            subject=subject,
+            snippet=snippet,
+            body=body,
+        ),
+        "job_related": is_job_related(
+            sender=sender,
+            subject=subject,
+            snippet=snippet,
+            body=body,
+        ),
+        "recruiter": is_recruiter_or_interview(
+            sender=sender,
+            subject=subject,
+            snippet=snippet,
+            body=body,
+        )
+        and not looks_automated_email(
+            sender=sender,
+            subject=subject,
+            snippet=snippet,
+            body=body,
+        ),
+        "personal": _contains_any(
+            signal_text(sender=sender, subject=subject, snippet=snippet, body=body),
+            PERSONAL_MARKERS,
+        )
+        and not looks_automated_email(
+            sender=sender,
+            subject=subject,
+            snippet=snippet,
+            body=body,
+        )
+        and not is_job_related(sender=sender, subject=subject, snippet=snippet, body=body)
+        and not is_work_dev_or_ai(sender=sender, subject=subject, snippet=snippet, body=body),
+        "high_value_newsletter": is_newsletter(
+            sender=sender,
+            subject=subject,
+            snippet=snippet,
+            body=body,
+        )
+        and is_high_value_newsletter(
+            sender=sender,
+            subject=subject,
+            snippet=snippet,
+            body=body,
+        ),
+        "newsletter": is_newsletter(
+            sender=sender,
+            subject=subject,
+            snippet=snippet,
+            body=body,
+        ),
+        "social": _contains_any(
+            signal_text(sender=sender, subject=subject, snippet=snippet, body=body),
+            {
+                "instagram",
+                "facebook",
+                "messenger",
+                "twitter",
+                "x.com",
+                "tiktok",
+                "reddit",
+                "discord",
+                "youtube",
+                "pinterest",
+                "snapchat",
+                "threads",
+                "telegram",
+                "new follower",
+                "liked your",
+                "commented on",
+                "mentioned you",
+                "tagged you",
+                "profile views",
+                "new connection",
+                "new subscribers",
+            },
+        )
+        or any(
+            marker in sender_domain(sender)
+            for marker in {
+                "instagram",
+                "facebook",
+                "twitter",
+                "tiktok",
+                "reddit",
+                "discord",
+                "youtube",
+                "telegram",
+            }
+        ),
+        "spam_like": is_spam_like(
+            sender=sender,
+            subject=subject,
+            snippet=snippet,
+            body=body,
+        ),
+    }
+    del has_attachments
+
+    if _signal("security"):
+        return "security"
+    if _signal("finance_invoice") or _signal("finance_receipt"):
+        return "finance"
+    if _signal("reply_needed") and _signal("human_like") and not _signal("automated"):
+        return "needs-reply"
+    if _signal("work_dev") and not _signal("newsletter"):
+        return "work"
+    if _signal("job_related") or _signal("recruiter"):
+        return "jobs"
+    if _signal("personal") and _signal("human_like"):
+        return "personal"
+    if _signal("high_value_newsletter"):
+        return "newsletter"
+    return "cleanup"
+
+
+# DEPRECATED — use assign_single_label()
 def recommend_mailbox_labels(
     *,
     sender: str,
@@ -479,164 +696,16 @@ def recommend_mailbox_labels(
     category: str = "unknown",
     priority: str = "low",
 ) -> list[str]:
-    labels: list[str] = []
-    text = signal_text(sender=sender, subject=subject, snippet=snippet, body=body)
-    automated = looks_automated_email(sender=sender, subject=subject, snippet=snippet, body=body)
-    finance_invoice = is_finance_invoice(
-        sender=sender,
-        subject=subject,
-        snippet=snippet,
-        body=body,
-    )
-    finance_receipt = is_finance_receipt(
-        sender=sender,
-        subject=subject,
-        snippet=snippet,
-        body=body,
-    )
-    job_related = is_job_related(sender=sender, subject=subject, snippet=snippet, body=body)
-    job_alert = is_job_alert(sender=sender, subject=subject, snippet=snippet, body=body)
-    recruiter = is_recruiter_or_interview(
-        sender=sender,
-        subject=subject,
-        snippet=snippet,
-        body=body,
-    )
-    work_dev = is_work_dev_or_ai(sender=sender, subject=subject, snippet=snippet, body=body)
-    ai_topic = _contains_any(
-        text,
-        AI_TOPIC_MARKERS,
-    )
-    github_thread = _contains_any(text, {"github", "gitlab", "bitbucket"})
-    legal_contract = is_legal_contract(
-        sender=sender,
-        subject=subject,
-        snippet=snippet,
-        body=body,
-    )
-    meeting_followup = is_meeting_followup(
-        sender=sender,
-        subject=subject,
-        snippet=snippet,
-        body=body,
-    )
-    waiting = is_waiting_for_response(
-        sender=sender,
-        subject=subject,
-        snippet=snippet,
-        body=body,
-    )
-    deadline = has_deadline_pressure(sender=sender, subject=subject, snippet=snippet, body=body)
-    reply_needed = has_reply_needed_signal(
-        sender=sender,
-        subject=subject,
-        snippet=snippet,
-        body=body,
-    )
-    high_value_newsletter = is_high_value_newsletter(
-        sender=sender,
-        subject=subject,
-        snippet=snippet,
-        body=body,
-    )
-
-    if finance_invoice:
-        labels.append("finance/invoice")
-    elif finance_receipt:
-        labels.append("finance/receipt")
-    elif category == "finance":
-        labels.append("finance/general")
-
-    if legal_contract:
-        labels.append("legal/contract")
-    if meeting_followup:
-        labels.append("meetings/follow-up")
-
-    if job_related:
-        if recruiter and not automated:
-            labels.append("jobs/recruiter")
-        elif job_alert or automated:
-            labels.append("jobs/alert")
-        else:
-            labels.append("jobs/application")
-
-    if work_dev:
-        if github_thread:
-            labels.append("work/github")
-        elif ai_topic:
-            labels.append("work/ai")
-        else:
-            labels.append("work/dev")
-    elif category == "work" and not automated:
-        labels.append("work/general")
-
-    if ai_topic:
-        labels.append("topics/ai")
-
-    if category == "newsletter":
-        labels.append(
-            "newsletters/high-value" if high_value_newsletter else "newsletters/routine"
+    del category, priority
+    return [
+        assign_single_label(
+            sender=sender,
+            subject=subject,
+            snippet=snippet,
+            body=body,
+            has_attachments=has_attachments,
         )
-        if automated and not high_value_newsletter:
-            labels.append("cleanup/low-priority")
-
-    if category == "promo" or is_promo(sender=sender, subject=subject, snippet=snippet, body=body):
-        labels.append("promo/discount")
-        if automated:
-            labels.append("cleanup/low-priority")
-
-    if category == "low_priority":
-        labels.append("cleanup/low-priority")
-
-    if automated and category in {"low_priority", "newsletter", "promo"}:
-        labels.append("automation/notification")
-
-    if waiting and not automated:
-        labels.append("waiting-for-response")
-
-    if (
-        category in {"urgent", "work", "finance", "opportunity"}
-        and not automated
-        and (reply_needed or recruiter or legal_contract or meeting_followup)
-    ):
-        if priority == "critical" or deadline:
-            labels.append("needs-reply/urgent")
-        elif priority in {"high", "medium"}:
-            labels.append("needs-reply/this-week")
-
-    if priority in {"critical", "high"} and category in {
-        "work",
-        "finance",
-        "opportunity",
-        "urgent",
-    }:
-        labels.append(f"priority/{priority}")
-
-    if has_attachments and category in {"work", "finance", "opportunity", "urgent"}:
-        labels.append("attachments/present")
-
-    project_slug = extract_project_slug(
-        sender=sender,
-        subject=subject,
-        snippet=snippet,
-        body=body,
-    )
-    if project_slug and category in {"work", "opportunity", "urgent"}:
-        labels.append(f"projects/{project_slug}")
-
-    client_slug = extract_client_slug(sender=sender, category=category)
-    if client_slug and not automated and not job_related:
-        labels.append(f"clients/{client_slug}")
-
-    if not labels:
-        if category == "personal":
-            labels.append("personal/review")
-        elif category == "opportunity":
-            labels.append("jobs/recruiter" if recruiter else "jobs/application")
-        elif category == "spam_like":
-            labels.append("cleanup/low-priority")
-
-    return dedupe_labels(labels)
+    ]
 
 
 def select_inboxanchor_labels(
@@ -700,6 +769,8 @@ def _normalize_label(label: str) -> str:
 
 def _is_inboxanchor_label(label: str) -> bool:
     normalized = _normalize_label(label)
+    if normalized in SINGLE_INBOXANCHOR_LABELS:
+        return True
     if normalized in LEGACY_INBOXANCHOR_LABELS:
         return True
     return normalized.startswith(INBOXANCHOR_LABEL_PREFIXES)

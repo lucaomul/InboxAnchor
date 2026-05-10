@@ -13,7 +13,7 @@ def test_triage_engine_with_fake_emails_produces_digest_and_recommendations():
     assert result.total_emails >= 5
     assert result.digest.total_unread == result.total_emails
     assert result.recommendations
-    assert any(rec.recommended_action == "trash" for rec in result.recommendations)
+    assert any(rec.recommended_action == "archive" for rec in result.recommendations)
     assert any(rec.email_id in result.reply_drafts for rec in result.recommendations)
 
 

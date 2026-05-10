@@ -3,11 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from inboxanchor.mail_intelligence import (
-    is_high_value_newsletter,
-    looks_automated_email,
-    recommend_mailbox_labels,
-)
+from inboxanchor.mail_intelligence import assign_single_label
 from inboxanchor.models import (
     EmailClassification,
     EmailMessage,
@@ -15,6 +11,7 @@ from inboxanchor.models import (
     WorkspacePolicy,
 )
 from inboxanchor.models.email import EmailCategory, RecommendationStatus
+from inboxanchor.sender_intelligence import analyze_message_signals
 
 
 class RulesEngine:
@@ -29,31 +26,77 @@ class RulesEngine:
         now = now or datetime.now(timezone.utc)
         policy = policy or WorkspacePolicy()
         age = now - email.received_at
-        labels = (
-            recommend_mailbox_labels(
-                sender=email.sender,
-                subject=email.subject,
-                snippet=email.snippet,
-                body=email.content_for_processing(),
-                has_attachments=email.has_attachments,
-                category=classification.category,
-                priority=classification.priority,
+        body = email.content_for_processing()
+        signals = analyze_message_signals(email)
+        single_label = assign_single_label(
+            sender=email.sender,
+            subject=email.subject,
+            snippet=email.snippet,
+            body=body,
+            has_attachments=email.has_attachments,
+            signals=signals,
+        )
+        labels = [single_label] if policy.auto_label_recommendations else []
+        automated = signals.automated
+        high_value_newsletter = signals.high_value_newsletter
+
+        cleanup_guard = any(
+            (
+                email.has_attachments,
+                signals.finance_invoice,
+                signals.finance_receipt,
+                signals.security,
+                signals.reply_needed,
+                classification.category
+                in {
+                    EmailCategory.urgent,
+                    EmailCategory.work,
+                    EmailCategory.finance,
+                    EmailCategory.opportunity,
+                    EmailCategory.personal,
+                },
             )
-            if policy.auto_label_recommendations
-            else []
         )
-        automated = looks_automated_email(
-            sender=email.sender,
-            subject=email.subject,
-            snippet=email.snippet,
-            body=email.content_for_processing(),
-        )
-        high_value_newsletter = is_high_value_newsletter(
-            sender=email.sender,
-            subject=email.subject,
-            snippet=email.snippet,
-            body=email.content_for_processing(),
-        )
+
+        if (
+            single_label == "cleanup"
+            and classification.category == EmailCategory.spam_like
+            and classification.confidence >= 0.85
+            and not cleanup_guard
+        ):
+            return EmailRecommendation(
+                email_id=email.id,
+                recommended_action="archive",
+                reason="Spam-like email detected — auto-archived.",
+                confidence=classification.confidence,
+                status=RecommendationStatus.safe,
+                requires_approval=False,
+                proposed_labels=labels,
+            )
+
+        if (
+            single_label == "cleanup"
+            and classification.category
+            in {
+                EmailCategory.promo,
+                EmailCategory.low_priority,
+                EmailCategory.unknown,
+                EmailCategory.newsletter,
+            }
+            and automated
+            and classification.confidence >= 0.80
+            and not high_value_newsletter
+            and not cleanup_guard
+        ):
+            return EmailRecommendation(
+                email_id=email.id,
+                recommended_action="archive",
+                reason="Low-value automated email — auto-archived.",
+                confidence=classification.confidence,
+                status=RecommendationStatus.safe,
+                requires_approval=False,
+                proposed_labels=labels,
+            )
 
         if (
             policy.allow_newsletter_mark_read
@@ -100,7 +143,7 @@ class RulesEngine:
                 confidence=classification.confidence,
                 status=RecommendationStatus.requires_approval,
                 requires_approval=True,
-                proposed_labels=labels or ["cleanup/low-priority"],
+                proposed_labels=labels or ["cleanup"],
             )
 
         if (
