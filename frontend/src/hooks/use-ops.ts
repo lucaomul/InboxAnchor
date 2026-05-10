@@ -94,8 +94,8 @@ export function useRunMailboxBackfill() {
     mutationFn: (timeRange: MailboxTimeRange) => runMailboxBackfill(timeRange),
     onSuccess: (result) => {
       invalidate();
-      toast.success("Mailbox memory sync complete", {
-        description: `${result.cachedCount || 0} emails are now cached locally, with ${result.hydratedCount || 0} full bodies ready instantly.`,
+      toast.success("Mailbox memory sync started", {
+        description: `${result.cachedCount || 0} emails are already cached locally, and InboxAnchor will keep indexing the mailbox in the background.`,
       });
     },
     onError: (err) => toast.error(`Failed to build mailbox memory: ${err.message}`),

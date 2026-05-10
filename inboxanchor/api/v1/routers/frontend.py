@@ -61,6 +61,7 @@ FRONTEND_PROGRESS: dict[str, dict] = {}
 FRONTEND_ACTIVE_RUNS: dict[str, "FrontendRunJob"] = {}
 FRONTEND_ACTIVE_RUNS_LOCK = threading.Lock()
 MAILBOX_BACKFILL_SYNC_KIND = "mailbox_backfill"
+MAILBOX_BACKFILL_BACKGROUND_THRESHOLD = 1000
 MAILBOX_CLASSIFIER = ClassifierAgent()
 MAILBOX_PRIORITY_AGENT = PriorityAgent()
 MAILBOX_ACTION_EXTRACTOR = ActionExtractorAgent()
@@ -126,6 +127,7 @@ class FrontendMailboxBackfillRequest(BaseModel):
     include_body: bool = False
     unread_only: bool = False
     time_range: Optional[str] = None
+    background: bool = True
 
 
 class FrontendAliasGenerateRequest(BaseModel):
@@ -1899,6 +1901,81 @@ def _load_mailbox_recommendation_details(
     return details[:limit] if limit else details
 
 
+def _iter_mailbox_recommendation_details(
+    provider_name: str,
+    *,
+    unread_only: Optional[bool] = None,
+    time_range: Optional[str] = None,
+    page_size: int = 250,
+):
+    cache_stats = _load_mailbox_cache_stats(provider_name, time_range=time_range)
+    if unread_only and cache_stats["cached_unread_count"] == 0:
+        for detail in _load_mailbox_recommendation_details(
+            provider_name,
+            time_range=time_range,
+            unread_only=unread_only,
+        ):
+            yield detail
+        return
+    normalized_time_range = normalize_time_range(time_range)
+    policy = _get_workspace_settings().policy
+    offset = 0
+    while True:
+        with session_scope() as session:
+            repository = InboxRepository(session)
+            page = repository.list_mailbox_emails(
+                provider_name,
+                limit=page_size,
+                offset=offset,
+                unread_only=unread_only,
+                time_range=normalized_time_range,
+            )
+            if not page:
+                return
+            email_ids = [item["email_id"] for item in page]
+            mailbox_classifications = repository.get_mailbox_classification_map(
+                provider_name,
+                email_ids,
+            )
+            mailbox_recommendations = repository.get_mailbox_recommendation_map(
+                provider_name,
+                email_ids,
+            )
+            latest_classifications = repository.get_latest_classification_map(
+                provider_name,
+                [email_id for email_id in email_ids if email_id not in mailbox_classifications],
+            )
+            details: list[dict] = []
+            for item in page:
+                mailbox_classification = mailbox_classifications.get(item["email_id"])
+                latest_classification = latest_classifications.get(item["email_id"])
+                recommendation = mailbox_recommendations.get(item["email_id"])
+                if recommendation is None:
+                    detail, _ = _persist_mailbox_workflow_enrichment(
+                        repository,
+                        provider_name,
+                        item,
+                        mailbox_classification=mailbox_classification,
+                        latest_classification=latest_classification,
+                        policy=policy,
+                    )
+                else:
+                    detail = _mailbox_email_detail_payload(
+                        provider_name,
+                        item,
+                        mailbox_classification=mailbox_classification,
+                        latest_classification=latest_classification,
+                    )
+                    detail.update(recommendation)
+                details.append(detail)
+        details.sort(key=_mailbox_recommendation_sort_key)
+        for detail in details:
+            yield detail
+        if len(page) < page_size:
+            return
+        offset += len(page)
+
+
 def _load_mailbox_action_items(provider_name: str, email_id: str) -> list[dict]:
     with session_scope() as session:
         repository = InboxRepository(session)
@@ -2830,9 +2907,134 @@ def frontend_ops_scan(payload: FrontendProviderWorkflowRequest):
     return _build_ops_overview(provider_name, run_id, time_range=payload.time_range)
 
 
+def _start_mailbox_backfill_job(
+    provider_name: str,
+    payload: FrontendMailboxBackfillRequest,
+) -> bool:
+    normalized_time_range = normalize_time_range(payload.time_range)
+    scope_key = _scope_key(provider_name, normalized_time_range)
+    if _has_active_frontend_job(scope_key):
+        return False
+
+    with FRONTEND_ACTIVE_RUNS_LOCK:
+        if scope_key in FRONTEND_ACTIVE_RUNS:
+            return False
+        FRONTEND_ACTIVE_RUNS[scope_key] = FrontendRunJob(provider_name=provider_name)
+
+    cache_stats = _load_mailbox_cache_stats(provider_name, time_range=normalized_time_range)
+    workflow_counts = _load_mailbox_workflow_counts(
+        provider_name,
+        unread_only=_mailbox_workflow_unread_filter(payload.unread_only),
+        time_range=normalized_time_range,
+    )
+    sync_state = _load_mailbox_sync_state(provider_name, time_range=normalized_time_range) or {}
+    resume_offset = max(
+        int(sync_state.get("next_offset") or 0),
+        int(sync_state.get("processed_count") or 0),
+        cache_stats["cached_count"],
+    )
+    _update_frontend_progress(
+        provider_name,
+        {
+            "mode": "backfill",
+            "status": "running",
+            "stage": "queued",
+            "limit": payload.limit,
+            "processed_emails": resume_offset,
+            "read_count": resume_offset,
+            "action_item_count": workflow_counts["action_item_count"],
+            "recommendation_count": workflow_counts["recommendation_count"],
+            "batch_count": int(sync_state.get("batch_count") or 0),
+            "cached_count": cache_stats["cached_count"],
+            "hydrated_count": max(
+                int(sync_state.get("hydrated_count") or 0),
+                cache_stats["hydrated_count"],
+            ),
+            "oldest_cached_at": cache_stats["oldest_cached_at"],
+            "newest_cached_at": cache_stats["newest_cached_at"],
+            "latest_subject": sync_state.get("latest_subject"),
+            "resume_offset": resume_offset,
+            "remaining_count": max(payload.limit - resume_offset, 0),
+            "completed": False,
+            "run_id": _get_cached_or_latest_run_id(
+                provider_name,
+                time_range=normalized_time_range,
+            ),
+            "error": None,
+        },
+        time_range=normalized_time_range,
+    )
+
+    def _runner() -> None:
+        try:
+            frontend_ops_backfill(payload.model_copy(update={"background": False}))
+        except HTTPException:
+            return
+        except Exception as exc:
+            message = _provider_runtime_error_message(provider_name, exc)
+            _update_frontend_progress(
+                provider_name,
+                {
+                    "mode": "backfill",
+                    "status": "error",
+                    "stage": "failed",
+                    "error": message,
+                },
+                time_range=normalized_time_range,
+            )
+        finally:
+            with FRONTEND_ACTIVE_RUNS_LOCK:
+                job = FRONTEND_ACTIVE_RUNS.pop(scope_key, None)
+            if job is not None:
+                job.event.set()
+
+    threading.Thread(
+        target=_runner,
+        name=f"inboxanchor-backfill-{provider_name}-{normalized_time_range}",
+        daemon=True,
+    ).start()
+    return True
+
+
 @router.post("/ops/backfill")
 def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
     provider_name = _get_provider_name(payload.provider)
+    if payload.background and payload.limit > MAILBOX_BACKFILL_BACKGROUND_THRESHOLD:
+        normalized_time_range = normalize_time_range(payload.time_range)
+        _start_mailbox_backfill_job(provider_name, payload)
+        cache_stats = _load_mailbox_cache_stats(
+            provider_name,
+            time_range=normalized_time_range,
+        )
+        sync_state = _load_mailbox_sync_state(
+            provider_name,
+            time_range=normalized_time_range,
+        ) or {}
+        processed_total = max(
+            int(sync_state.get("processed_count") or 0),
+            cache_stats["cached_count"],
+        )
+        resume_offset = max(
+            int(sync_state.get("next_offset") or 0),
+            processed_total,
+        )
+        return {
+            "count": 0,
+            "processedTotal": processed_total,
+            "cachedCount": cache_stats["cached_count"],
+            "hydratedCount": cache_stats["hydrated_count"],
+            "resumeOffset": resume_offset,
+            "remainingCount": max(payload.limit - resume_offset, 0),
+            "completed": False,
+            "overview": _build_ops_overview(
+                provider_name,
+                _get_cached_or_latest_run_id(
+                    provider_name,
+                    time_range=normalized_time_range,
+                ),
+                time_range=normalized_time_range,
+            ),
+        }
     normalized_time_range = normalize_time_range(payload.time_range)
     sync_kind = _scope_sync_kind(normalized_time_range)
     service = _service_for_provider(provider_name)
@@ -3193,26 +3395,18 @@ def frontend_ops_backfill(payload: FrontendMailboxBackfillRequest):
 def frontend_ops_auto_label(payload: FrontendProviderWorkflowRequest):
     provider_name = payload.provider or _get_provider_name()
     _maybe_seed_mailbox_cache(provider_name, time_range=payload.time_range)
-    details = _load_mailbox_recommendation_details(
-        provider_name,
-        time_range=payload.time_range,
-        unread_only=True,
-    )
-    targets = [
-        (detail, _recommended_labels_for_email(detail))
-        for detail in details
-    ]
-    targets = [(detail, labels) for detail, labels in targets if labels]
-    applied: list[dict] = []
+    cache_stats = _load_mailbox_cache_stats(provider_name, time_range=payload.time_range)
+    applied_count = 0
+    scanned_count = 0
     _update_frontend_progress(
         provider_name,
         {
             "mode": "workflow",
             "status": "running",
             "stage": "applying_labels",
-            "limit": len(targets),
+            "limit": cache_stats["cached_unread_count"],
             "processed_emails": 0,
-            "read_count": len(details),
+            "read_count": cache_stats["cached_unread_count"],
             "labeled_count": 0,
             "archived_count": 0,
             "marked_read_count": 0,
@@ -3223,30 +3417,37 @@ def frontend_ops_auto_label(payload: FrontendProviderWorkflowRequest):
         },
         time_range=payload.time_range,
     )
-    for index, (detail, labels) in enumerate(targets, start=1):
+    for detail in _iter_mailbox_recommendation_details(
+        provider_name,
+        time_range=payload.time_range,
+        unread_only=True,
+    ):
+        scanned_count += 1
+        labels = _recommended_labels_for_email(detail)
+        if not labels:
+            continue
         classification = detail["classification"]
-        applied.append(
-            _apply_provider_action(
-                provider_name,
-                detail["email_id"],
-                "label",
-                labels,
-                reason="Applied InboxAnchor organization labels to an unread email.",
-                confidence=classification["confidence"],
-                approved_by_user=True,
-                safety_status=SafetyStatus.allowed,
-            )
+        _apply_provider_action(
+            provider_name,
+            detail["email_id"],
+            "label",
+            labels,
+            reason="Applied InboxAnchor organization labels to an unread email.",
+            confidence=classification["confidence"],
+            approved_by_user=True,
+            safety_status=SafetyStatus.allowed,
         )
+        applied_count += 1
         _update_frontend_progress(
             provider_name,
             {
                 "mode": "workflow",
                 "status": "running",
                 "stage": "applying_labels",
-                "limit": len(targets),
-                "processed_emails": index,
-                "read_count": len(details),
-                "labeled_count": index,
+                "limit": cache_stats["cached_unread_count"],
+                "processed_emails": scanned_count,
+                "read_count": cache_stats["cached_unread_count"],
+                "labeled_count": applied_count,
                 "latest_subject": detail["subject"],
                 "latest_action": "label",
             },
@@ -3268,10 +3469,10 @@ def frontend_ops_auto_label(payload: FrontendProviderWorkflowRequest):
             "mode": "workflow",
             "status": "complete",
             "stage": "labels_ready",
-            "limit": len(targets),
-            "processed_emails": len(targets),
-            "read_count": len(details),
-            "labeled_count": len(applied),
+            "limit": cache_stats["cached_unread_count"],
+            "processed_emails": scanned_count,
+            "read_count": cache_stats["cached_unread_count"],
+            "labeled_count": applied_count,
             "latest_action": "label",
             "error": None,
         },
@@ -3282,43 +3483,32 @@ def frontend_ops_auto_label(payload: FrontendProviderWorkflowRequest):
             "type": "auto_label_completed",
             "provider": provider_name,
             "run_id": refreshed_run_id,
-            "count": len(applied),
+            "count": applied_count,
         }
     )
-    return {"applied": applied, "count": len(applied), "overview": overview}
+    return {"applied": [], "count": applied_count, "overview": overview}
 
 
 @router.post("/ops/clean-labels")
 def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
     provider_name = payload.provider or _get_provider_name()
     _maybe_seed_mailbox_cache(provider_name, time_range=payload.time_range)
-    details = _load_mailbox_recommendation_details(
-        provider_name,
-        time_range=payload.time_range,
-        unread_only=True,
-    )
-    targets = [
-        (detail, _labels_to_remove_for_email(detail))
-        for detail in details
-    ]
-    targets = [(detail, labels) for detail, labels in targets if labels]
-    removed: list[dict] = []
-    removed_label_names = dedupe_labels(
-        [label for _, labels in targets for label in labels]
-    )
+    cache_stats = _load_mailbox_cache_stats(provider_name, time_range=payload.time_range)
+    scanned_count = 0
+    removed_count = 0
+    removed_label_names: list[str] = []
     provider_cleanup_labels = (
         _list_provider_cleanup_labels(provider_name) if provider_name == "gmail" else []
     )
-    cleanup_label_names = dedupe_labels(removed_label_names + provider_cleanup_labels)
     _update_frontend_progress(
         provider_name,
         {
             "mode": "workflow",
             "status": "running",
             "stage": "cleaning_labels",
-            "limit": len(cleanup_label_names) if provider_name == "gmail" else len(targets),
+            "limit": cache_stats["cached_unread_count"],
             "processed_emails": 0,
-            "read_count": len(details),
+            "read_count": cache_stats["cached_unread_count"],
             "labeled_count": 0,
             "labels_removed_count": 0,
             "archived_count": 0,
@@ -3332,6 +3522,29 @@ def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
     )
     use_global_label_delete = provider_name == "gmail"
     if use_global_label_delete:
+        for detail in _iter_mailbox_recommendation_details(
+            provider_name,
+            time_range=payload.time_range,
+            unread_only=True,
+        ):
+            scanned_count += 1
+            removed_label_names.extend(_labels_to_remove_for_email(detail))
+            _update_frontend_progress(
+                provider_name,
+                {
+                    "mode": "workflow",
+                    "status": "running",
+                    "stage": "collecting_labels",
+                    "limit": cache_stats["cached_unread_count"],
+                    "processed_emails": scanned_count,
+                    "read_count": cache_stats["cached_unread_count"],
+                    "labels_removed_count": 0,
+                    "latest_subject": detail["subject"],
+                    "latest_action": "remove_labels",
+                },
+                time_range=payload.time_range,
+            )
+        cleanup_label_names = dedupe_labels(removed_label_names + provider_cleanup_labels)
         deleted_label_names: list[str] = []
         for index, label_name in enumerate(cleanup_label_names, start=1):
             deleted = _delete_provider_labels(provider_name, [label_name])
@@ -3344,7 +3557,7 @@ def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
                     "stage": "deleting_label_definitions",
                     "limit": len(cleanup_label_names),
                     "processed_emails": index,
-                    "read_count": len(details),
+                    "read_count": cache_stats["cached_unread_count"],
                     "labels_removed_count": 0,
                     "latest_subject": label_name,
                     "latest_action": "remove_labels",
@@ -3363,6 +3576,7 @@ def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
                 else "No InboxAnchor Gmail label definitions needed pruning."
             ),
         }
+        removed_count = scanned_count
         _update_frontend_progress(
             provider_name,
             {
@@ -3371,8 +3585,8 @@ def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
                 "stage": "syncing_local_cache",
                 "limit": len(cleanup_label_names),
                 "processed_emails": deleted_labels["deletedCount"],
-                "read_count": len(details),
-                "labels_removed_count": len(targets),
+                "read_count": cache_stats["cached_unread_count"],
+                "labels_removed_count": removed_count,
                 "latest_subject": (
                     f"Deleted {deleted_labels['deletedCount']} Gmail label definitions"
                 ),
@@ -3380,26 +3594,6 @@ def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
             },
             time_range=payload.time_range,
         )
-        for detail, labels in targets:
-            classification = detail["classification"]
-            _record_label_removal_decision(
-                detail["email_id"],
-                reason=(
-                    "Deleted InboxAnchor-generated Gmail label definitions so they disappear "
-                    "from the mailbox globally."
-                ),
-                confidence=classification["confidence"],
-                approved_by_user=True,
-                safety_status=SafetyStatus.allowed,
-            )
-            removed.append(
-                {
-                    "emailId": detail["email_id"],
-                    "action": "remove_labels",
-                    "finalAction": "labels_removed",
-                    "labelsRemoved": labels,
-                }
-            )
         with session_scope() as session:
             repository = InboxRepository(session)
             run_id = repository.get_latest_run_id(provider_name)
@@ -3413,39 +3607,49 @@ def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
                 deleted_labels["deletedLabels"],
             )
     else:
-        for index, (detail, labels) in enumerate(targets, start=1):
+        removed_email_ids: list[str] = []
+        for detail in _iter_mailbox_recommendation_details(
+            provider_name,
+            time_range=payload.time_range,
+            unread_only=True,
+        ):
+            scanned_count += 1
+            labels = _labels_to_remove_for_email(detail)
+            if not labels:
+                continue
             classification = detail["classification"]
-            removed.append(
-                _remove_provider_labels(
-                    provider_name,
-                    detail["email_id"],
-                    labels,
-                    reason=(
-                        "Removed InboxAnchor-generated labels without changing the "
-                        "email itself."
-                    ),
-                    confidence=classification["confidence"],
-                    approved_by_user=True,
-                    safety_status=SafetyStatus.allowed,
-                )
+            _remove_provider_labels(
+                provider_name,
+                detail["email_id"],
+                labels,
+                reason=(
+                    "Removed InboxAnchor-generated labels without changing the "
+                    "email itself."
+                ),
+                confidence=classification["confidence"],
+                approved_by_user=True,
+                safety_status=SafetyStatus.allowed,
             )
+            removed_email_ids.append(detail["email_id"])
+            removed_label_names.extend(labels)
+            removed_count += 1
             _update_frontend_progress(
                 provider_name,
                 {
                     "mode": "workflow",
                     "status": "running",
                     "stage": "cleaning_labels",
-                    "limit": len(targets),
-                    "processed_emails": index,
-                    "read_count": len(details),
-                    "labels_removed_count": index,
+                    "limit": cache_stats["cached_unread_count"],
+                    "processed_emails": scanned_count,
+                    "read_count": cache_stats["cached_unread_count"],
+                    "labels_removed_count": removed_count,
                     "latest_subject": detail["subject"],
                     "latest_action": "remove_labels",
                 },
                 time_range=payload.time_range,
             )
+        removed_label_names = dedupe_labels(removed_label_names)
         deleted_labels = _delete_provider_labels(provider_name, removed_label_names)
-        target_email_ids = [detail["email_id"] for detail, _ in targets]
         with session_scope() as session:
             repository = InboxRepository(session)
             run_id = repository.get_latest_run_id(provider_name)
@@ -3453,12 +3657,12 @@ def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
                 repository.remove_labels_from_run_emails(
                     run_id,
                     removed_label_names,
-                    email_ids=target_email_ids,
+                    email_ids=removed_email_ids,
                 )
             repository.remove_labels_from_mailbox(
                 provider_name,
                 removed_label_names,
-                email_ids=target_email_ids,
+                email_ids=removed_email_ids,
             )
 
     refreshed_run_id = _get_cached_or_latest_run_id(
@@ -3476,10 +3680,10 @@ def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
             "mode": "workflow",
             "status": "complete",
             "stage": "labels_reset",
-            "limit": len(targets),
-            "processed_emails": len(targets),
-            "read_count": len(details),
-            "labels_removed_count": len(removed),
+            "limit": cache_stats["cached_unread_count"],
+            "processed_emails": scanned_count,
+            "read_count": cache_stats["cached_unread_count"],
+            "labels_removed_count": removed_count,
             "latest_subject": (
                 f"Deleted {deleted_labels['deletedCount']} label definitions"
                 if deleted_labels["deletedCount"]
@@ -3495,13 +3699,13 @@ def frontend_ops_clean_labels(payload: FrontendProviderWorkflowRequest):
             "type": "label_cleanup_completed",
             "provider": provider_name,
             "run_id": refreshed_run_id,
-            "count": len(removed),
+            "count": removed_count,
             "deleted_labels": deleted_labels["deletedCount"],
         }
     )
     return {
-        "applied": removed,
-        "count": len(removed),
+        "applied": [],
+        "count": removed_count,
         "deletedLabelCount": deleted_labels["deletedCount"],
         "deletedLabels": deleted_labels["deletedLabels"],
         "overview": overview,
@@ -3517,18 +3721,16 @@ def frontend_ops_safe_cleanup(payload: FrontendProviderWorkflowRequest):
         {},
     )
     blocked = FRONTEND_BLOCK_REGISTRY.setdefault(provider_name, set())
-    details = _load_mailbox_recommendation_details(
-        provider_name,
-        time_range=payload.time_range,
-        unread_only=True,
-    )
-    detail_map = {detail["email_id"]: detail for detail in details}
-    safe_targets = [
-        _frontend_recommendation_payload(detail, blocked=detail["email_id"] in blocked)
-        for detail in details
-    ]
-    safe_targets = [item for item in safe_targets if item["status"] == "safe"]
-    applied: list[dict] = []
+    cache_stats = _load_mailbox_cache_stats(provider_name, time_range=payload.time_range)
+    with session_scope() as session:
+        repository = InboxRepository(session)
+        recommendation_stats = repository.get_mailbox_recommendation_stats(
+            provider_name,
+            unread_only=True,
+            time_range=normalize_time_range(payload.time_range),
+        )
+    safe_target_count = int(recommendation_stats["safe_count"])
+    applied_count = 0
     labeled_count = int(existing_progress.get("labeled_count", 0))
     archived_count = 0
     marked_read_count = 0
@@ -3539,9 +3741,9 @@ def frontend_ops_safe_cleanup(payload: FrontendProviderWorkflowRequest):
             "mode": "workflow",
             "status": "running",
             "stage": "safe_cleanup",
-            "limit": len(safe_targets),
+            "limit": safe_target_count,
             "processed_emails": 0,
-            "read_count": len(details),
+            "read_count": cache_stats["cached_unread_count"],
             "labeled_count": labeled_count,
             "archived_count": 0,
             "marked_read_count": 0,
@@ -3552,19 +3754,28 @@ def frontend_ops_safe_cleanup(payload: FrontendProviderWorkflowRequest):
         },
         time_range=payload.time_range,
     )
-    for index, recommendation in enumerate(safe_targets, start=1):
-        applied.append(
-            _apply_provider_action(
-                provider_name,
-                recommendation["emailId"],
-                recommendation["recommendedAction"],
-                recommendation["proposedLabels"],
-                reason=recommendation["reason"],
-                confidence=recommendation["confidence"],
-                approved_by_user=True,
-                safety_status=SafetyStatus.allowed,
-            )
+    for detail in _iter_mailbox_recommendation_details(
+        provider_name,
+        time_range=payload.time_range,
+        unread_only=True,
+    ):
+        recommendation = _frontend_recommendation_payload(
+            detail,
+            blocked=detail["email_id"] in blocked,
         )
+        if recommendation["status"] != "safe":
+            continue
+        _apply_provider_action(
+            provider_name,
+            recommendation["emailId"],
+            recommendation["recommendedAction"],
+            recommendation["proposedLabels"],
+            reason=recommendation["reason"],
+            confidence=recommendation["confidence"],
+            approved_by_user=True,
+            safety_status=SafetyStatus.allowed,
+        )
+        applied_count += 1
         if recommendation["proposedLabels"]:
             labeled_count += 1
         if recommendation["recommendedAction"] == "archive":
@@ -3579,19 +3790,15 @@ def frontend_ops_safe_cleanup(payload: FrontendProviderWorkflowRequest):
                 "mode": "workflow",
                 "status": "running",
                 "stage": "safe_cleanup",
-                "limit": len(safe_targets),
-                "processed_emails": index,
-                "read_count": len(details),
+                "limit": safe_target_count,
+                "processed_emails": applied_count,
+                "read_count": cache_stats["cached_unread_count"],
                 "labeled_count": labeled_count,
                 "archived_count": archived_count,
                 "marked_read_count": marked_read_count,
                 "trashed_count": trashed_count,
-                "latest_subject": (
-                    detail_map[recommendation["emailId"]].get("subject")
-                    or detail_map[recommendation["emailId"]]
-                    .get("email", {})
-                    .get("subject")
-                ),
+                "latest_subject": detail.get("subject")
+                or detail.get("email", {}).get("subject"),
                 "latest_action": recommendation["recommendedAction"],
             },
             time_range=payload.time_range,
@@ -3612,9 +3819,9 @@ def frontend_ops_safe_cleanup(payload: FrontendProviderWorkflowRequest):
             "mode": "workflow",
             "status": "complete",
             "stage": "cleanup_ready",
-            "limit": len(safe_targets),
-            "processed_emails": len(safe_targets),
-            "read_count": len(details),
+            "limit": safe_target_count,
+            "processed_emails": applied_count,
+            "read_count": cache_stats["cached_unread_count"],
             "labeled_count": labeled_count,
             "archived_count": archived_count,
             "marked_read_count": marked_read_count,
@@ -3629,10 +3836,10 @@ def frontend_ops_safe_cleanup(payload: FrontendProviderWorkflowRequest):
             "type": "safe_cleanup_completed",
             "provider": provider_name,
             "run_id": refreshed_run_id,
-            "count": len(applied),
+            "count": applied_count,
         }
     )
-    return {"applied": applied, "count": len(applied), "overview": overview}
+    return {"applied": [], "count": applied_count, "overview": overview}
 
 
 @router.post("/ops/full-anchor")
